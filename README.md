@@ -74,6 +74,66 @@ The last phase determines the minimum cost sequences of the given robot position
 - rbPos_toUse (as there can be used multiple algorithms for the SCP of the robot positions, it has to be decided with which SCP solution of robot positions to work in this phase)
 - outputPath (located at the end of the code, there the output will be saved)
 
+## PHASE 6 (export adapter)
+### Description
+Optional output adapter for ROBOGUIDE (FANUC) feasibility checks. It does **not** run inverse kinematics and does not modify PHASES 1..5: it reads a viewpoint set (`VPs_greedy`) from a PHASE 2/3/4/5 output file and writes the viewpoints as Cartesian positions, so that reachability, joint limits and collision checks are left to the FANUC controller inside ROBOGUIDE. The UR5e joint angles are discarded, therefore PHASES 3..5 are not needed for this route.
+
+Three files are written to `00_Output Collection`, all named after the program: the FANUC ASCII program (`<prog-name>.LS`), the frame contract plus self-check numbers (`<prog-name>_frame.json`) and a flat table (`<prog-name>_points.csv`).
+
+The `.LS` is named after the program, and the program name inside the file is the same string, because FANUC refuses an ASCII upload whose file name is not a valid program name - a file name containing a space fails with `Invalid name in /PROG section`. `--prog-name` (default `PH6SCAN`) therefore accepts only a letter followed by up to 15 characters from `A-Z`, `0-9` and `_`, and the program is written as `<prog-name>.LS`. Do not rename the file to anything with a space in it.
+
+Two contracts must be respected on the ROBOGUIDE side (both are repeated inside `PH6_frame*.json`):
+- **Frame**: origin at the object voxel-bounding-box minimum corner, axes identical to the algorithm world axes (right handed, Z up), unit millimetres, `p_mm = (voxel_index - pad_voxels) * gridsize_mm`. The UFRAME is therefore a pure translation. The file also reports how far that origin sits above the algorithm floor plane (`z = 0`), in case a floor referenced origin is preferred. Passing the CAD coordinates of that corner via `--origin-mm` shifts the whole export, so the emitted numbers are true CAD coordinates.
+- **TCP**: the exported pose is the algorithm VP pose, i.e. a point `s_size_length` (150 mm for the modelled sensor) behind the sensor front face on the optical axis, with local +Z pointing from the sensor towards the part. The UTOOL must be defined to match that point.
+
+The arm configuration (`CONFIG`) cannot be derived from a Cartesian pose, so a default (`'N U T, 0, 0, 0'`) is written for every point. Points with multiple solutions may have to be re-solved in ROBOGUIDE.
+
+### Input and configuration
+- `--input` (PHASE 2/3/4/5 output file, default: newest `PH2 output *.json`)
+- `--vps-key` (viewpoint set to export, default `VPs_greedy`)
+- `--origin-mm` (`x,y,z` in CAD coordinates of the part bounding-box minimum corner, default `0,0,0`)
+- `--place` (`x,y,z,w,p,r`: pose of the CAD frame inside ROBOGUIDE; emits world coordinates and uses UFRAME 0)
+- `--uframe` (default `1`, or `0` when `--place` is given)
+- `--rot-weight` (millimetres per degree, adds orientation change to the ordering cost, default 0)
+- `--selftest` (validate the W/P/R conversion and number formatting, then exit)
+
+```bash
+uv run PHASE_6_Export_Roboguide.py --input "00_Output Collection/PH2 output <timestamp>.json"
+```
+
+# Preparing the station models (IGES -> mesh)
+
+PHASE_1 voxelises *triangle meshes* through trimesh, which cannot read IGES (nor native NX `.prt`). `IGES_to_STL.py` meshes IGES assemblies through OpenCASCADE and writes binary STL, decimating large results on request. It also prints the IGES Global section (original file name, producer, units), because the file names handed over are not necessarily the names the models were exported with - the printed internal name and the per-model geometry summary are what identify them.
+
+The default `--backend ocp` talks to OpenCASCADE directly (via `cadquery-ocp`) and meshes the imported shape **without healing it**, which is what makes it work on these exports: `--backend gmsh` attempts to weld the faces into a valid shell first and aborts with `Could not fix wire in surface N`, because a PolyWorks assembly export has thousands of trimmed surfaces with slightly inconsistent wires. Meshing needs no valid shell, so faces that still fail are counted and skipped rather than aborting the conversion. `auto` tries ocp first and falls back to gmsh.
+
+It runs in its own environment and deliberately leaves the pinned pipeline environment alone:
+
+```bash
+uv run --no-project --python 3.11 \
+    --with cadquery-ocp --with gmsh --with trimesh \
+    --with fast-simplification --with numpy --with matplotlib \
+    python IGES_to_STL.py --input-dir <folder with .igs> \
+    --preview --report <folder with .igs>/mesh/report.json
+```
+
+Meshes are written to `<input-dir>/mesh` unless `--out-dir` is given; `--keep-ratio` (default `0.1`) sets how many faces survive decimation and `--decimate-above` (default `200000`) the face count above which a mesh is decimated at all. `--deflection-mm` (default `1.0`) controls the chordal tolerance of the ocp backend. Coordinates are passed through unchanged, so an IGES in millimetres yields an STL in millimetres. `report.json` records, per model, the IGES header, the bounding box in the shared CAD frame, the triangle counts before and after decimation, and how many faces meshed.
+
+To make the algorithm world frame *identical* to the CAD frame, neutralise the transform PHASE_1 applies to the object mesh: set `obj_mesh_scale` such that the scaled mesh is in metres (`0.001` for a millimetre mesh, because `tm_voxelSize = 0.01` is what makes one voxel 10 mm) and set the rotation in the object-loading block of `PHASE_1_Get_Can_VPs.py` to identity. PHASE_1 and PHASE_2 do not require the model to be Z-up; only the robot-position sampling of PHASE_3 does, and PHASE_3 is not used on the ROBOGUIDE export route.
+
+# Python environment (uv)
+
+The pipeline was developed against a frozen 2022 package set (`numpy 1.23.1`, `scipy 1.8.1`, `trimesh 3.12.7`, `mujoco 2.2.0`, `ortools 9.4.1874`, ...). Those releases only ship wheels up to Python 3.10, therefore `.python-version` pins `3.10` and `requires-python` is restricted to `>=3.10,<3.11`.
+
+```bash
+uv sync                                # create .venv and install the locked versions
+uv run PHASE_1_Get_Can_VPs.py          # run a phase inside the environment
+```
+
+`uv sync` downloads Python 3.10 automatically if it is not installed yet.
+
+Every phase reads its input from and writes its output to the `00_Output Collection` folder of the working directory, so run the scripts from the repository root. The input file names are hard-coded at the top of each phase: point them at the output file of the previous phase (`PHASE_2`, for example, reads the `PH1 output <timestamp>.json` written by `PHASE_1`).
+
 # Python packages
 | Package | Version 
 | :-------- | ------|
