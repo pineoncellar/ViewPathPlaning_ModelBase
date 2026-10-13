@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Pipeline results are written here; keep the folder itself so the phases can run.
+00_Output Collection/*
+
+docs/*
