@@ -39,7 +39,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-import trimesh
 from scipy.spatial import cKDTree
 
 from .geometry import sample_surface_seeded
@@ -187,11 +186,3 @@ def split_sheet(part, *, band_deg: float = 70.0, knn: int = 24, seed_ratio: floa
         oriented_fraction=float(oriented.mean()), faces=face_count,
         total_area_mm2=total_area,
     )
-
-
-def face_submesh(part, mask) -> trimesh.Trimesh:
-    """The geometry of one face, as a mesh of its own."""
-    selected = np.flatnonzero(np.asarray(mask, dtype=bool))
-    if len(selected) == 0:
-        raise ValueError("the mask selects no faces")
-    return part.submesh([selected], append=True)

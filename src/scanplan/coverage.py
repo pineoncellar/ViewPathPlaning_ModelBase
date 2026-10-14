@@ -89,10 +89,6 @@ class CoverageResult:
             return 0.0
         return float(100.0 * self.area_mm2[self.pool_reach()].sum() / self.target_area_mm2)
 
-    def covered_area_mm2(self, mask) -> float:
-        """Area of the samples `mask` selects."""
-        return float(self.area_mm2[np.asarray(mask, dtype=bool)].sum())
-
 
 def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
              model: ScannerModel, cfg: PlannerConfig, *,
