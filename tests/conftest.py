@@ -52,7 +52,7 @@ def mesh_from_triangles(triangles, welded=True):
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
-def box(x0, x1, y0, y1, z0, z1):
+def box_triangles(x0, x1, y0, y1, z0, z1):
     """Twelve triangles of an axis-aligned box, normals outward."""
     corner = {
         (0, 0, 0): (x0, y0, z0), (1, 0, 0): (x1, y0, z0),
@@ -68,15 +68,45 @@ def box(x0, x1, y0, y1, z0, z1):
         (corner[0, 0, 0], corner[0, 1, 0], corner[0, 1, 1], corner[0, 0, 1], (-1, 0, 0)),
         (corner[1, 0, 0], corner[1, 1, 0], corner[1, 1, 1], corner[1, 0, 1], (1, 0, 0)),
     ]
-    return mesh_from_triangles([triangle for q in quads for triangle in quad(*q)])
+    return [triangle for q in quads for triangle in quad(*q)]
 
 
-def folded_strip_triangles(thickness=THICKNESS_MM, width=PLATE_WIDTH_MM):
+def box(x0, x1, y0, y1, z0, z1):
+    """An axis-aligned box mesh, normals outward."""
+    return mesh_from_triangles(box_triangles(x0, x1, y0, y1, z0, z1))
+
+
+def has_unmerged_vertices(mesh) -> bool:
+    """True when no two triangles share a vertex, which is how CAD tessellations arrive.
+
+    Tested by counting vertices rather than by splitting into components: `split()`
+    reaches for networkx, which is not a dependency of this project.
+    """
+    return len(mesh.vertices) == 3 * len(mesh.faces)
+
+
+def crossed_plates():
+    """Two thin plates crossing at a right angle, with no single through-thickness axis.
+
+    The topology the split relies on (one local sheet normal for the whole blank) does
+    not exist here, so the orientation step must flag it rather than invent an answer.
+    """
+    flat = box_triangles(0.0, 200.0, 0.0, 40.0, 0.0, THICKNESS_MM)
+    upright = box_triangles(0.0, THICKNESS_MM, 0.0, 40.0, 0.0, 200.0)
+    return mesh_from_triangles(flat + upright)
+
+
+def folded_strip_triangles(thickness=THICKNESS_MM, width=PLATE_WIDTH_MM, spans=6, bands=4):
     """A thin plate folded once by 30 deg, with 3 mm-wide sheared rims all round.
 
     Three segments: flat, a 30 deg ramp, then flat again at the higher level. The
     side walls that the fold creates belong to a face of the blank; the rim faces
     (the cut cross-section) do not.
+
+    The two blank faces are tessellated into a fine grid when `spans`/`bands` are
+    raised, while the rims stay coarse. That is what a real CAD tessellation looks
+    like, and it matters: a mesh whose rims carry a third of the triangles makes the
+    paired-distances distribution say the material is 60 mm thick.
     """
     angle = np.deg2rad(30.0)
     directions = [np.array([1.0, 0.0]), np.array([np.cos(angle), np.sin(angle)]),
@@ -99,28 +129,51 @@ def folded_strip_triangles(thickness=THICKNESS_MM, width=PLATE_WIDTH_MM):
 
     y0, y1 = -width / 2.0, width / 2.0
 
-    def point(node, side, y):
-        x, z = nodes[node] + side * node_normals[node] * (thickness / 2.0)
-        return (x, y, z)
+    def surface_point(node_a, node_b, normal_a, normal_b, side, along, across):
+        node = node_a + (node_b - node_a) * along
+        normal = normal_a + (normal_b - normal_a) * along
+        normal = normal / np.linalg.norm(normal)
+        x, z = node + side * normal * (thickness / 2.0)
+        return (x, y0 + (y1 - y0) * across, z)
+
+    def rim_point(node, normal, side, across):
+        x, z = node + side * normal * (thickness / 2.0)
+        return (x, y0 + (y1 - y0) * across, z)
 
     triangles = []
-    for i, _direction in enumerate(directions):
-        normal = np.array([segment_normals[i][0], 0.0, segment_normals[i][1]])
+    for i in range(len(directions)):
+        normal = segment_normals[i]
+        normal_3d = np.array([normal[0], 0.0, normal[1]])
         for side in (+1, -1):
-            triangles += quad(point(i, side, y0), point(i + 1, side, y0),
-                              point(i + 1, side, y1), point(i, side, y1),
-                              normal * side)
+            for span in range(spans):
+                along_0, along_1 = span / spans, (span + 1) / spans
+                for band in range(bands):
+                    across_0, across_1 = band / bands, (band + 1) / bands
+                    corners = [
+                        surface_point(nodes[i], nodes[i + 1], node_normals[i], node_normals[i + 1],
+                                      side, along, across)
+                        for along, across in ((along_0, across_0), (along_1, across_0),
+                                              (along_1, across_1), (along_0, across_1))
+                    ]
+                    triangles += quad(*corners, normal_3d * side)
         for y, outward in ((y0, (0, -1, 0)), (y1, (0, 1, 0))):
-            triangles += quad(point(i, +1, y), point(i + 1, +1, y),
-                              point(i + 1, -1, y), point(i, -1, y), outward)
+            triangles += quad(rim_point(nodes[i], node_normals[i], +1, (y - y0) / (y1 - y0)),
+                              rim_point(nodes[i + 1], node_normals[i + 1], +1, (y - y0) / (y1 - y0)),
+                              rim_point(nodes[i + 1], node_normals[i + 1], -1, (y - y0) / (y1 - y0)),
+                              rim_point(nodes[i], node_normals[i], -1, (y - y0) / (y1 - y0)),
+                              outward)
 
     start = np.array([directions[0][0], 0.0, directions[0][1]])
     end = np.array([directions[-1][0], 0.0, directions[-1][1]])
-    triangles += quad(point(0, +1, y0), point(0, -1, y0),
-                      point(0, -1, y1), point(0, +1, y1), -start)
+    triangles += quad(rim_point(nodes[0], node_normals[0], +1, 0.0),
+                      rim_point(nodes[0], node_normals[0], -1, 0.0),
+                      rim_point(nodes[0], node_normals[0], -1, 1.0),
+                      rim_point(nodes[0], node_normals[0], +1, 1.0), -start)
     last = len(nodes) - 1
-    triangles += quad(point(last, +1, y0), point(last, -1, y0),
-                      point(last, -1, y1), point(last, +1, y1), end)
+    triangles += quad(rim_point(nodes[last], node_normals[last], +1, 0.0),
+                      rim_point(nodes[last], node_normals[last], -1, 0.0),
+                      rim_point(nodes[last], node_normals[last], -1, 1.0),
+                      rim_point(nodes[last], node_normals[last], +1, 1.0), end)
     return triangles
 
 
