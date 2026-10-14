@@ -186,6 +186,32 @@ def test_the_interference_check_does_not_change_with_the_sampling_seed(tmp_path)
     assert verdicts == {True}
 
 
+def test_the_interpenetration_answer_does_not_move_with_the_sampling_seed(
+        station_interpenetrating):
+    # Same geometry, same answer. The coordinate is the whole point of the warning: it is
+    # what a human goes and looks at on the real cell. Measured before this was fixed, the
+    # real station's answer moved with the seed (2 points at 5.31 mm, then none at all),
+    # because the clash region is a fraction of a square millimetre and a random cloud is
+    # about 7 mm apart there.
+    answers = {(tuple(checks["deepest_part_point_inside_fixture_at"]),
+                checks["part_points_inside_fixture"],
+                checks["deepest_part_point_inside_fixture_mm"])
+               for checks in (station_interpenetrating.check_alignment(seed=seed)
+                              for seed in (5, 11, 17))}
+    assert len(answers) == 1
+
+
+def test_the_interpenetration_probe_examines_the_part_mesh_itself(
+        station_interpenetrating):
+    # A random cloud alone leaves holes wider than the clash regions it is meant to find:
+    # on the real station it reported 2 points at 5.31 mm for one seed and nothing at all
+    # for another. The probe therefore walks the mesh's own points as well.
+    checks = station_interpenetrating.check_alignment(seed=5)
+    vertices = np.unique(np.round(np.asarray(station_interpenetrating.part.vertices), 3),
+                         axis=0)
+    assert checks["interpenetration_probe_points"]["part"] >= len(vertices)
+
+
 def test_a_missing_model_is_reported_with_its_path(
         tmp_path, folded_plate, fixture_box, base_box):
     path = write_station_file(tmp_path, folded_plate, fixture_box, base_box)
