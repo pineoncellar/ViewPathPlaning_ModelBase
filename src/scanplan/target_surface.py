@@ -112,10 +112,24 @@ def fixture_contact_mask(points, normals, station: Station, *,
 
 
 def build_target(part, split: SheetSplit, face: str, station: Station,
-                 cfg: PlannerConfig | TargetParams, *,
+                 cfg: PlannerConfig | TargetParams, *, seed: int | None = None,
                  log: Callable[[str], None] | None = None) -> TargetSet:
-    """Sample one face of the blank, holding the clamped region out of the target."""
+    """Sample one face of the blank, holding the clamped region out of the target.
+
+    `seed` must be given when `cfg` is bare `TargetParams`, because those carry no seed and
+    surface sampling draws from the global numpy RNG - inventing one here would make the
+    result silently irreproducible.
+    """
     params = cfg.target if isinstance(cfg, PlannerConfig) else cfg
+    if isinstance(cfg, PlannerConfig):
+        resolved_seed = cfg.seed if seed is None else seed
+    elif seed is None:
+        raise ValueError(
+            "give seed= when passing bare TargetParams: nothing else supplies one, and "
+            "unseeded sampling changes the samples between runs"
+        )
+    else:
+        resolved_seed = seed
     say = log or (lambda _message: None)
     mask = split.face_mask(face)
     if not mask.any():
@@ -124,8 +138,8 @@ def build_target(part, split: SheetSplit, face: str, station: Station,
     say(f"sampling the {face} face")
     surface = face_mesh(part, mask)
     face_area = float(surface.area)
-    all_samples = sample_face(part, mask, grid_mm=params.sample_grid_mm, seed=cfg.seed,
-                              log=log)
+    all_samples = sample_face(part, mask, grid_mm=params.sample_grid_mm,
+                              seed=resolved_seed, log=log)
     distance = params.contact_mm + params.contact_margin_mm
     contact = fixture_contact_mask(all_samples.points, all_samples.normals, station,
                                   distance_mm=distance)

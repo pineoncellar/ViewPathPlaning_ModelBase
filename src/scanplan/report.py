@@ -87,7 +87,8 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
     leak_areas = np.asarray(target.samples.area_mm2)[uncovered]
     say(f"  attributing {len(leak_points)} uncovered samples")
     leak_reasons = attribute_uncovered(leak_points, leak_normals, coverage.poses,
-                                       station, model, config, obstacles=station.obstacles())
+                                       station, model, config, obstacles=station.obstacles(),
+                                       tracker_ok=coverage.tracker_ok)
 
     counts: dict[str, int] = {}
     for reason in leak_reasons:
@@ -131,6 +132,16 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
                              "outward side of the sheet"),
             "sampling": f"{config.target.sample_grid_mm:g} mm grid, one sample per cell, "
                         "equal area share",
+            "through_axis": [round(float(v), 6) for v in split.through_axis],
+            "face_naming_note": (
+                "`upper` and `lower` are GEOMETRIC names: they are the two sides of the "
+                "blank as the split's orientation seed happens to order them, and that seed "
+                "is not anchored to the station file. Swapping the seed swaps the names "
+                "while leaving both areas, the thickness and the orientation fraction "
+                "identical - so check `through_axis` above (which way the split calls "
+                "'up') instead of trusting the word, and prefer face='auto', which compares "
+                "both sides."
+            ),
         },
         "face": target.face,
         "target_face_mm2": round(target.face_area_mm2, 1),
@@ -153,6 +164,9 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
             "counts": [int(v) for v in histogram],
             "bin_edges_deg": [round(float(v), 3) for v in edges],
             "limit_deg": limit,
+            "population": ("every (pose, sample) pair in the candidate POOL, not only the "
+                           "pairs the delivered viewpoints cover - so it describes what the "
+                           "pool could reach, which is the ceiling the selection works from"),
             "empty_pool": bool(len(angles) == 0),
         },
         "greedy_curve": [[count, round(pct, 3)] for count, pct in selection.curve],

@@ -107,6 +107,17 @@ def test_the_two_faces_of_the_blank_do_not_share_a_sample(clamped_plate, cfg,
     assert upper.samples.points[:, 2].min() > lower.samples.points[:, 2].max()
 
 
+def test_bare_target_params_need_an_explicit_seed(clamped_plate, cfg):
+    # the advertised signature accepts TargetParams, and those carry no seed - sampling
+    # draws from the global RNG, so the seed has to be supplied rather than invented
+    with pytest.raises(ValueError, match="seed"):
+        build_target(clamped_plate.station.part, clamped_plate.split, "upper",
+                     clamped_plate.station, cfg.target)
+    target = build_target(clamped_plate.station.part, clamped_plate.split, "upper",
+                          clamped_plate.station, cfg.target, seed=3)
+    assert len(target.samples.points) > 0
+
+
 def test_only_the_upper_face_is_exempted_where_the_clamp_presses(clamped_plate, cfg,
                                                                 split_flat_plate):
     upper = build_target(clamped_plate.station.part, split_flat_plate, "upper",

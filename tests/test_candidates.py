@@ -39,10 +39,8 @@ def grid_samples(mesh, grid_mm):
 
 
 def expected_ladder_length(params):
-    """Poses one aim point yields: no roll repeat at zero tilt, every roll elsewhere."""
-    zero_tilt = 1
-    tilted = len(params.tilts_deg) - 1
-    return len(params.distances_mm) * (zero_tilt + tilted * len(params.rolls_deg))
+    """Poses one aim point yields: every distance, tilt and roll - the roll always counts."""
+    return len(params.distances_mm) * len(params.tilts_deg) * len(params.rolls_deg)
 
 
 def test_every_aim_point_gets_the_full_distance_tilt_roll_ladder(
@@ -52,7 +50,7 @@ def test_every_aim_point_gets_the_full_distance_tilt_roll_ladder(
     poses = generate(points, normals, params_placeholder, seed=0)
     assert len(aims) > 1
     assert len(poses) == len(aims) * expected_ladder_length(params_placeholder)
-    assert {round(pose.roll_deg, 1) for pose in poses} == {0.0, 90.0}
+    assert {round(pose.roll_deg, 1) for pose in poses} == set(params_placeholder.rolls_deg)
 
 
 def test_every_distance_in_the_ladder_is_used(flat_plate, params_placeholder):
@@ -64,13 +62,36 @@ def test_every_distance_in_the_ladder_is_used(flat_plate, params_placeholder):
         assert any(pytest.approx(distance, abs=0.2) == value for value in offsets), distance
 
 
-def test_roll_is_not_duplicated_at_zero_tilt(params_placeholder):
+def test_the_zero_tilt_pose_gets_both_rolls(params_placeholder):
+    # The optical axis repeats, the FOOTPRINT does not: the field of view is a rectangle,
+    # so a quarter turn about the axis covers a different set of samples. Design 4.2 lists
+    # two rolls for exactly this reason, and zero tilt is the incidence every selection
+    # prefers.
     point = np.array([[10.0, 10.0, 0.7]])
     normal = np.array([[0.0, 0.0, 1.0]])
     poses = generate(point, normal, params_placeholder, seed=0)
     head_on = [pose for pose in poses if np.allclose(pose.axis, [0.0, 0.0, -1.0])]
-    assert len(head_on) == len(params_placeholder.distances_mm)
-    assert {pose.roll_deg for pose in head_on} == {0.0}
+    assert {pose.roll_deg for pose in head_on} == set(params_placeholder.rolls_deg)
+    assert len(head_on) == (len(params_placeholder.distances_mm)
+                            * len(params_placeholder.rolls_deg))
+
+
+def test_the_two_rolls_cover_different_samples_on_a_wide_target(params_placeholder):
+    from scanplan.scanner_model import ScannerModel
+
+    model = ScannerModel(params_placeholder)
+    wide = np.array([[x, y, 0.0] for x in range(-560, 561, 20)
+                     for y in range(-460, 461, 20)], dtype=float)
+    normals = np.tile([0.0, 0.0, 1.0], (len(wide), 1))
+    head_on = [pose for pose in ladder(np.zeros(3), np.array([0.0, 0.0, 1.0]),
+                                       params_placeholder)
+               if np.allclose(pose.axis, [0.0, 0.0, -1.0])
+               and pose.position[2] == params_placeholder.standoff_mm]
+    assert len(head_on) == len(params_placeholder.rolls_deg)
+    coverage = [set(np.flatnonzero(model.geometry_mask(pose, wide, normals)).tolist())
+                for pose in head_on]
+    assert coverage[0] != coverage[1]
+    assert coverage[0] - coverage[1] and coverage[1] - coverage[0]
 
 
 def test_the_tilt_ladder_leans_both_ways_about_the_normal(params_placeholder):

@@ -217,6 +217,38 @@ def test_a_point_with_a_clear_sight_line_is_reported_as_candidate_found(clamped_
     assert reasons[0] == "candidate_found"
 
 
+def test_a_pose_the_tracker_cannot_see_names_the_tracker_not_a_candidate(
+        clamped_plate, model_placeholder, cfg):
+    # the pose can see the point perfectly; it is the tracker that rules the pose out, so
+    # reporting "a candidate was found" hides the actual cause from whoever has to act
+    point = np.array([[0.0, 0.0, 0.7]])
+    normal = np.array([[0.0, 0.0, 1.0]])
+    reasons = attribute_uncovered(point, normal, [pose_above()], clamped_plate.station,
+                                 model_placeholder, cfg, tracker_ok=np.array([False]))
+    assert reasons[0] == "blocked_by_tracker"
+
+
+def test_a_pose_the_tracker_can_see_still_reports_the_geometry(clamped_plate,
+                                                              model_placeholder, cfg):
+    point = np.array([[0.0, 0.0, 0.7]])
+    normal = np.array([[0.0, 0.0, 1.0]])
+    reasons = attribute_uncovered(point, normal, [pose_above()], clamped_plate.station,
+                                 model_placeholder, cfg, tracker_ok=np.array([True]))
+    assert reasons[0] == "candidate_found"
+
+
+def test_geometry_outranks_the_tracker_when_both_apply(clamped_plate, model_placeholder,
+                                                      cfg):
+    # under the clamp pad: even a pose the tracker can see is blocked by the fixture, and
+    # that is the more specific answer; a tracker-invisible pose must not shadow it
+    point = np.array([[70.0, 0.0, 0.7]])
+    normal = np.array([[0.0, 0.0, 1.0]])
+    poses = [pose_above(x_mm=70.0, z_mm=300.0)]
+    reasons = attribute_uncovered(point, normal, poses, clamped_plate.station,
+                                 model_placeholder, cfg, tracker_ok=np.array([False]))
+    assert reasons[0] == "blocked_by_fixture"
+
+
 def test_the_counters_record_what_was_rejected(clamped_plate, model_placeholder, cfg):
     result = evaluate(ladder_poses(), head_on_samples(60.0), clamped_plate.station,
                       model_placeholder, cfg)

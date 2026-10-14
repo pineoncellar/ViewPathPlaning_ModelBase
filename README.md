@@ -93,6 +93,12 @@ uv run scanplan ls   --viewpoints output/<零件>/viewpoints.json \
 `--tracker-sweep`（不给位姿时，报告 192 个候选摆位的差别）、`--quiet`。
 模板见 [`configs/station.example.json`](configs/station.example.json)。
 
+> **`--face upper` / `--face lower` 是几何名，不是物理名。** 哪一个面叫"上面"取决于
+> 分面时定向种子的符号，而那个符号并没有锚定到工位文件上：交换它，两个面的名字会互换，
+> 而两面面积、料厚、定向比例**全都一模一样**。报告里因此记录了 `through_axis`（分面认为
+> 的"厚度方向"）和一段说明，供人核对。**默认的 `--face auto` 不受影响**，它两面各算一次
+> 可达性、取高的那一面，这也是推荐用法。
+
 `plan` 与 `.LS` 导出**刻意分开**：ROBOGUIDE 的坐标系契约（用哪个 `UFRAME`、原点落在
 哪里）需要与现场商定，可能只要求重新导出而不必重跑规划。所以 `ls` 只读视点文件，
 **不需要数模**。
@@ -106,7 +112,7 @@ uv run scanplan ls   --viewpoints output/<零件>/viewpoints.json \
 | `viewpoints.json` | 视点集：位置 + 光轴 + 滚转 + 覆盖点数/面积 + 入射角 + `tracker_ok` + 来源 |
 | `viewpoints.csv` | 同一份数据，便于 Excel 目视 |
 | `exempt_points.csv` | 被夹持区豁免的点云（供人工核对 CAD 夹持区与实物是否一致） |
-| `unreachable_points.csv` | 漏扫点云，**每点带原因**（`blocked_by_part` / `blocked_by_fixture` / `blocked_by_base` / `never_in_view` / `only_poses_that_collide`） |
+| `unreachable_points.csv` | 漏扫点云，**每点带原因**（`blocked_by_part` / `blocked_by_fixture` / `blocked_by_base` / `blocked_by_tracker` / `never_in_view` / `only_poses_that_collide`） |
 | `coverage_report.json` | 覆盖报告：覆盖率、视点数、入射角分布、漏扫聚类、占位参数清单、以及**它没有建模什么** |
 | `summary.txt` | 上面那些数字的人读版本 |
 

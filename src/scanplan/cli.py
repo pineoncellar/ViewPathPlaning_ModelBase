@@ -75,8 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
     exporter.add_argument("--viewpoints", required=True, help="viewpoints.json")
     exporter.add_argument("--prog-name", required=True, help="FANUC program name")
     exporter.add_argument("--out", default="output", help="output directory")
-    exporter.add_argument("--place", help="pose 'x,y,z,w,p,r' of the CAD frame in ROS "
-                                         "world; switches the program to UFRAME 0")
+    exporter.add_argument("--place", help="pose 'x,y,z,w,p,r' of the CAD frame in the "
+                                         "ROBOGUIDE world; switches the program to UFRAME 0")
     exporter.add_argument("--uframe", type=int, help="UFRAME number (default 1, or 0 "
                                                     "with --place)")
     exporter.add_argument("--utool", type=int, default=1)
