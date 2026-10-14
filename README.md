@@ -171,7 +171,3 @@ licensed under Apache-2.0.*
 *While the fundamental 5-phase view-path-planning concept stems from the original
 master's thesis implementation, this repository has been comprehensively
 refactored and redesigned, and is maintained as an independent codebase.*
-
-## 许可
-
-Apache License 2.0 —— 见 [LICENSE](LICENSE)。
