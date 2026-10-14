@@ -170,7 +170,7 @@ def _coerce(annotation: Any, value: Any) -> Any:
             return tuple(_scalar(members[0], item) for item in value)
         if len(value) != len(members):
             raise ValueError(f"expected {len(members)} values, got {value!r}")
-        return tuple(_scalar(member, item) for member, item in zip(members, value))
+        return tuple(_scalar(member, item) for member, item in zip(members, value, strict=True))
     return _scalar(annotation, value)
 
 
@@ -188,11 +188,16 @@ def _validate(config: PlannerConfig) -> None:
     target = config.target
     tracker = config.tracker
 
-    for name, limits in (("range_mm", scanner.range_mm), ("distance_mm", tracker.distance_mm)):
+    for name, limits in (
+        ("range_mm", scanner.range_mm),
+        ("distance_mm", tracker.distance_mm),
+    ):
         if limits[0] > limits[1]:
             raise ValueError(f"'{name}' has its limits the wrong way round: {limits}")
     if not 0.0 < scanner.max_incidence_deg <= 90.0:
-        raise ValueError("'max_incidence_deg' must be in (0, 90] - it is an angle to the normal")
+        raise ValueError(
+            "'max_incidence_deg' must be in (0, 90] - it is an angle to the surface normal"
+        )
     if scanner.max_candidates <= 0:
         raise ValueError("'max_candidates' must be positive")
     if scanner.refine_rounds < 0:
