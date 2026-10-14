@@ -1,8 +1,11 @@
 [project]
 name = "viewpathplaning"
 version = "0.1.0"
-description = "Add your description here"
+description = "Scanner viewpoint planning for a FANUC robot + TrackScan-Sharp 49 scanner"
 readme = "README.md"
+# Pinned for the reproduction environment of the reference pipeline in reference/.
+# The new planner in src/ would run on newer versions too, but the two share one
+# environment, and the old scripts need these exact pins.
 requires-python = ">=3.10,<3.11"
 dependencies = [
     "glfw==2.5.3",
@@ -16,3 +19,42 @@ dependencies = [
     "scipy==1.8.1",
     "trimesh==3.12.7",
 ]
+
+[project.optional-dependencies]
+# Fast ray casting.  Without it trimesh falls back to a pure-Python intersector
+# that is roughly three orders of magnitude slower, which makes a real part
+# impractical to plan.  The planner works without it, just slowly, so this is an
+# extra rather than a hard dependency.
+embree = [
+    "rtree==1.0.0",
+    "embreex==4.4.0",
+    # trimesh's pyembree bridge imports pkg_resources, which setuptools stopped
+    # shipping in version 70.
+    "setuptools<70",
+]
+dev = [
+    "pytest>=7",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+scanplan = "scanplan.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scanplan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 96
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
