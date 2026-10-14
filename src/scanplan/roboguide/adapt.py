@@ -300,8 +300,8 @@ def _contract_blocks(
             "the export emits Cartesian poses only, solving the joints is ROBOGUIDE's "
             "job.",
             "Occlusion of the tracker by the robot arm is not modelled: only the "
-            "part, the fixture and the base are traced, so a pose whose arm hides the "
-            "tracker from the tracker is exported as usable.",
+            "part, the fixture and the base are traced, so a pose whose arm stands "
+            "between the tracker and the scanner is exported as usable.",
         ],
         "extents_mm": extents,
     }

@@ -17,5 +17,6 @@ Two invariants the whole package has to agree on:
    original flat blank, forming side-walls included, sheared edge excluded.
    See :mod:`scanplan.sheet_split`.
 
-SKELETON ONLY - no implementation yet.
+The pipeline is `scene -> sheet_split -> target_surface -> candidates -> coverage ->
+selection -> report`, and `scanplan.cli` drives it as two subcommands.
 """

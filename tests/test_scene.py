@@ -13,7 +13,7 @@ import json
 
 import numpy as np
 import pytest
-from conftest import write_station_file
+from conftest import box, write_station_file
 
 from scanplan.scene import load_station, load_station_description, read_transform
 
@@ -73,8 +73,25 @@ def test_alignment_records_which_axis_the_part_is_flat_in(station):
 def test_alignment_flags_interpenetration(station_interpenetrating):
     checks = station_interpenetrating.check_alignment(seed=5)
     assert checks["passed"] is False
-    assert checks["min_distance_part_to_fixture_mm"] < 1.0
-    assert any("interfer" in warning.lower() for warning in checks["warnings"])
+    assert checks["part_points_inside_fixture"] > 0
+    assert checks["deepest_part_point_inside_fixture_mm"] > 0.2
+    assert any("INSIDE the fixture" in warning for warning in checks["warnings"])
+
+
+def test_a_hairline_gap_is_reported_but_not_called_interference(
+        tmp_path, folded_plate, base_box):
+    # a stamped part resting on its supports has a gap of a few hundredths of a
+    # millimetre: real, and nothing a point cloud can call interference. The strip's
+    # underside sits at z = -0.35, so this clamp's top face leaves 0.05 mm.
+    from scanplan.scene import load_station, load_station_description
+
+    hairline = box(-60.0, 60.0, -60.0, 60.0, -60.0, -0.40)
+    path = write_station_file(tmp_path, folded_plate, hairline, base_box)
+    station_with_gap = load_station(load_station_description(path), cloud_seed=3)
+    checks = station_with_gap.check_alignment(seed=5)
+    assert 0.0 < checks["min_distance_part_to_fixture_mm"] < 0.5
+    assert checks["part_points_inside_fixture"] == 0
+    assert checks["passed"] is True
 
 
 def test_alignment_flags_a_fixture_that_dips_below_the_mounting_plane(
@@ -109,6 +126,26 @@ def test_a_typo_in_the_station_file_is_rejected(tmp_path, folded_plate, fixture_
     path.write_text(json.dumps(body), encoding="utf-8")
     with pytest.raises(ValueError, match="unknown key"):
         load_station_description(path)
+
+
+def test_a_mounting_plane_from_the_station_file_is_used(tmp_path, folded_plate, fixture_box,
+                                                        base_box):
+    # the base's own highest point is not the mounting plane on a real cell: the fixture
+    # can stand on a shelf well below it, which is why this is station data
+    path = write_station_file(tmp_path, folded_plate, fixture_box, base_box,
+                              extra={"mounting_plane_z_mm": -60.0})
+    station_from_file = load_station(load_station_description(path), cloud_seed=3)
+    checks = station_from_file.check_alignment(seed=5)
+    assert checks["mounting_plane_from_station_file"] is True
+    assert checks["mounting_plane_z_mm"] == pytest.approx(-60.0)
+
+
+def test_without_a_mounting_plane_the_base_top_is_used_and_said_so(tmp_path, folded_plate,
+                                                                  fixture_box, base_box):
+    path = write_station_file(tmp_path, folded_plate, fixture_box, base_box)
+    station_default = load_station(load_station_description(path), cloud_seed=3)
+    checks = station_default.check_alignment(seed=5)
+    assert checks["mounting_plane_from_station_file"] is False
 
 
 def test_a_missing_model_is_reported_with_its_path(
