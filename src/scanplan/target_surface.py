@@ -119,7 +119,7 @@ def build_target(part, split: SheetSplit, face: str, station: Station,
     say = log or (lambda _message: None)
     mask = split.face_mask(face)
     if not mask.any():
-        raise ValueError(f"the split found no faces for '{face}'")
+        raise ValueError(f"no target faces for '{face}': the split found none of them")
 
     say(f"sampling the {face} face")
     surface = face_mesh(part, mask)

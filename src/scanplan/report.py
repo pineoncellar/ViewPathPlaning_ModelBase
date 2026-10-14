@@ -156,6 +156,7 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
     counts: dict[str, int] = {}
     for reason in leak_reasons:
         counts[str(reason)] = counts.get(str(reason), 0) + 1
+    leak_reason_list = [str(reason) for reason in leak_reasons]
 
     angles = np.concatenate([np.degrees(np.arccos(np.clip(row, -1.0, 1.0)))
                              for row in coverage.quality]) if coverage.quality else np.zeros(0)
@@ -210,6 +211,7 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
         "uncovered_points": int(uncovered.sum()),
         "uncovered_area_mm2": round(float(leak_areas.sum()), 1),
         "uncovered_by_reason": counts,
+        "leak_reasons": leak_reason_list,
         "leak_regions": cluster_points(leak_points, leak_areas),
         "incidence_histogram": {
             "counts": [int(v) for v in histogram],
