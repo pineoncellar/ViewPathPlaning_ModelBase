@@ -99,7 +99,17 @@ def load_config(path: str | Path | None = None) -> PlannerConfig:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    with open(path, encoding="utf-8") as handle:
+    return read_json(path)
+
+
+def read_json(path: str | Path) -> Any:
+    """Read a JSON file, tolerating the UTF-8 BOM that Windows tools write.
+
+    PowerShell's `Set-Content -Encoding utf8` and several Windows editors emit a BOM, and
+    a hand-written config or station file that refuses to load because of one is a trap
+    rather than strictness.
+    """
+    with open(path, encoding="utf-8-sig") as handle:
         return json.load(handle)
 
 

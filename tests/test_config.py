@@ -41,6 +41,16 @@ def test_dataclasses_are_frozen():
         cfg.scanner.max_incidence_deg = 90.0
 
 
+def test_a_utf8_bom_is_accepted(tmp_path):
+    # Windows editors and PowerShell's `Set-Content -Encoding utf8` write a BOM, and a
+    # config file that refuses to load because of one is a trap, not a strictness
+    override = tmp_path / "bom.json"
+    override.write_bytes(b"\xef\xbb\xbf" + json.dumps(
+        {"scanner": {"max_incidence_deg": 55.0}}).encode("utf-8"))
+    cfg = load_config(override)
+    assert cfg.scanner.max_incidence_deg == 55.0
+
+
 def test_a_typo_in_a_section_name_is_rejected(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"scannner": {"max_incidence_deg": 45.0}}), encoding="utf-8")

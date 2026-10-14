@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import FACES, load_config
+from .config import FACES, load_config, read_json
 from .raycast import backend_name
 from .report import summary_lines
 from .roboguide.adapt import export as export_ls
@@ -200,7 +200,7 @@ def _run_ls(args, parser: argparse.ArgumentParser) -> int:
     if not source.exists():
         parser.error(f"viewpoint file not found: {source}")
     try:
-        viewpoints = json.loads(source.read_text(encoding="utf-8"))
+        viewpoints = read_json(source)
     except json.JSONDecodeError as error:
         parser.error(f"{source} is not valid JSON: {error}")
     if not viewpoints:

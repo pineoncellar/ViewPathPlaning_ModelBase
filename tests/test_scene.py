@@ -118,3 +118,10 @@ def test_a_missing_model_is_reported_with_its_path(
     description = load_station_description(path)
     with pytest.raises(FileNotFoundError, match="fixture"):
         load_station(description, cloud_seed=1)
+
+
+def test_a_station_file_with_a_utf8_bom_is_accepted(tmp_path, folded_plate, fixture_box,
+                                                    base_box):
+    path = write_station_file(tmp_path, folded_plate, fixture_box, base_box)
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    assert load_station_description(path).part == tmp_path / "part.stl"
