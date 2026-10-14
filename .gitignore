@@ -1,8 +1,60 @@
+# ============================================================================
+# Rule of thumb: when in doubt, ignore.  An ignored file can still be added
+# later with `git add -f`; a pushed one cannot be un-pushed.
+# ============================================================================
+
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
 
-# Pipeline results are written here; keep the folder itself so the phases can run.
-00_Output Collection/*
+# --- working directories ---------------------------------------------------
+# `input/` holds the station CAD models, `output/` holds whatever the planner
+# writes.  Their CONTENTS are ignored; the `.gitkeep` marker is not, so both
+# folders still exist after a fresh clone.  Run `scripts/check_repo_hygiene.py`
+# before committing.
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
+# The reference pipeline's output folder holds exported viewpoint coordinates
+# derived from customer geometry, so its contents stay out as well.
+**/00_Output Collection/*
 
 docs/*
+
+# ===========================================================================
+# PRIVACY / CUSTOMER DATA - nothing below this line may ever be pushed.
+# Rule of thumb: when in doubt, ignore. An ignored file can still be added
+# later with `git add -f`, a pushed one cannot be un-pushed.
+# ===========================================================================
+
+# Station models (part / fixture / base / scanner) are customer CAD. They must
+# stay OUTSIDE the repository - keep them next to it, e.g. D:\ling_cy\数模, and
+# reference them by absolute path only. The patterns below are a safety net for
+# the case that a copy lands inside the working tree.
+数模/
+mesh/
+*.igs
+*.iges
+*.prt
+*.stp
+*.step
+*.stl
+# ...the original sample meshes shipped with the upstream repo are public and
+# stay tracked; this negation only keeps them from being caught by the rule above.
+!samples/sim env/meshes/*.stl
+
+# Numerical dumps of customer geometry (point clouds, viewpoints, occupancy).
+*.npy
+*.npz
+
+# The TrackScan-49 / ROBOGUIDE viewpoint-planning work: scripts, reports, figures
+# and data all contain customer part dimensions, station layout or viewpoint
+# coordinates. Kept on disk for reference, deliberately NOT versioned.
+spike/

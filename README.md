@@ -1,5 +1,33 @@
 # Model based ViewPathPlanning
 This repository contains code to fully generate viewpoints and robot positions to completely scan the surface of a given object. The implementation uses a 6 DOF robotic arm (UR5e) mounted with a 3D Scanner (micro epsilon suface control 3D 3510-80). The aproach is divided into 5 phases, which result in a list of robot position coordinates (in voxel unit) and corresponding joint configurations, both including a sequence indicator. Output file format is JSON.
+
+## Repository layout
+
+The repository holds two things: the **new planner** and the **frozen reference pipeline**.
+
+| Path | What it is | Versioned |
+|---|---|---|
+| `src/scanplan/` | The new planner (FANUC + TrackScan-Sharp 49 scanner). Each module's docstring states its purpose and the constraints that are easy to get wrong. | yes |
+| `configs/` | Planner configuration, including the scanner parameters. | yes |
+| `tests/` | Tests. All fixtures are synthetic - no customer geometry. | yes |
+| `scripts/` | Repository tooling, including the data-hygiene check. | yes |
+| `input/` | **Station CAD models go here.** Contents are gitignored. | **no** |
+| `output/` | Planner results. Contents are gitignored. | **no** |
+| `reference/` | The frozen upstream pipeline (`PHASE_1`..`PHASE_6`, `SCP_src.py`, `IGES_to_STL.py`), kept as reference and as a regression baseline. Public code. | yes |
+| `reference/00_Output Collection/` | Output folder of the reference pipeline. Gitignored. | **no** |
+| `docs/` | Private design documents - they quote customer dimensions and coordinates. Gitignored. | **no** |
+| `samples/` | Public sample meshes and figures that ship with the upstream repository. | yes |
+
+**Customer data never gets committed.** The station CAD models and everything derived from them carry real dimensions and coordinates. `input/`, `output/`, `reference/00_Output Collection/` and `spike/` are all gitignored, and a check refuses to pass if any of it ever becomes tracked. Run it before committing:
+
+```bash
+uv run python scripts/check_repo_hygiene.py
+```
+
+Everything under `src/`, `tests/`, `configs/` and `scripts/` is intended to be public.
+
+The PHASE sections below describe the **reference** pipeline; run those with the `reference/` prefix.
+
 ## PHASE 1
 ### Description
 The first phase resulst in a list of viewpoint (VP) candidates and their corresponing visible object surface (represented as voxels). The phase includes the following steps:
@@ -78,7 +106,7 @@ The last phase determines the minimum cost sequences of the given robot position
 ### Description
 Optional output adapter for ROBOGUIDE (FANUC) feasibility checks. It does **not** run inverse kinematics and does not modify PHASES 1..5: it reads a viewpoint set (`VPs_greedy`) from a PHASE 2/3/4/5 output file and writes the viewpoints as Cartesian positions, so that reachability, joint limits and collision checks are left to the FANUC controller inside ROBOGUIDE. The UR5e joint angles are discarded, therefore PHASES 3..5 are not needed for this route.
 
-Three files are written to `00_Output Collection`, all named after the program: the FANUC ASCII program (`<prog-name>.LS`), the frame contract plus self-check numbers (`<prog-name>_frame.json`) and a flat table (`<prog-name>_points.csv`).
+Three files are written to `reference/00_Output Collection`, all named after the program: the FANUC ASCII program (`<prog-name>.LS`), the frame contract plus self-check numbers (`<prog-name>_frame.json`) and a flat table (`<prog-name>_points.csv`).
 
 The `.LS` is named after the program, and the program name inside the file is the same string, because FANUC refuses an ASCII upload whose file name is not a valid program name - a file name containing a space fails with `Invalid name in /PROG section`. `--prog-name` (default `PH6SCAN`) therefore accepts only a letter followed by up to 15 characters from `A-Z`, `0-9` and `_`, and the program is written as `<prog-name>.LS`. Do not rename the file to anything with a space in it.
 
@@ -98,7 +126,7 @@ The arm configuration (`CONFIG`) cannot be derived from a Cartesian pose, so a d
 - `--selftest` (validate the W/P/R conversion and number formatting, then exit)
 
 ```bash
-uv run PHASE_6_Export_Roboguide.py --input "00_Output Collection/PH2 output <timestamp>.json"
+uv run reference/PHASE_6_Export_Roboguide.py --input "reference/00_Output Collection/PH2 output <timestamp>.json"
 ```
 
 # Preparing the station models (IGES -> mesh)
@@ -113,13 +141,13 @@ It runs in its own environment and deliberately leaves the pinned pipeline envir
 uv run --no-project --python 3.11 \
     --with cadquery-ocp --with gmsh --with trimesh \
     --with fast-simplification --with numpy --with matplotlib \
-    python IGES_to_STL.py --input-dir <folder with .igs> \
+    python reference/IGES_to_STL.py --input-dir <folder with .igs> \
     --preview --report <folder with .igs>/mesh/report.json
 ```
 
 Meshes are written to `<input-dir>/mesh` unless `--out-dir` is given; `--keep-ratio` (default `0.1`) sets how many faces survive decimation and `--decimate-above` (default `200000`) the face count above which a mesh is decimated at all. `--deflection-mm` (default `1.0`) controls the chordal tolerance of the ocp backend. Coordinates are passed through unchanged, so an IGES in millimetres yields an STL in millimetres. `report.json` records, per model, the IGES header, the bounding box in the shared CAD frame, the triangle counts before and after decimation, and how many faces meshed.
 
-To make the algorithm world frame *identical* to the CAD frame, neutralise the transform PHASE_1 applies to the object mesh: set `obj_mesh_scale` such that the scaled mesh is in metres (`0.001` for a millimetre mesh, because `tm_voxelSize = 0.01` is what makes one voxel 10 mm) and set the rotation in the object-loading block of `PHASE_1_Get_Can_VPs.py` to identity. PHASE_1 and PHASE_2 do not require the model to be Z-up; only the robot-position sampling of PHASE_3 does, and PHASE_3 is not used on the ROBOGUIDE export route.
+To make the algorithm world frame *identical* to the CAD frame, neutralise the transform PHASE_1 applies to the object mesh: set `obj_mesh_scale` such that the scaled mesh is in metres (`0.001` for a millimetre mesh, because `tm_voxelSize = 0.01` is what makes one voxel 10 mm) and set the rotation in the object-loading block of `reference/PHASE_1_Get_Can_VPs.py` to identity. PHASE_1 and PHASE_2 do not require the model to be Z-up; only the robot-position sampling of PHASE_3 does, and PHASE_3 is not used on the ROBOGUIDE export route.
 
 # Python environment (uv)
 
@@ -127,12 +155,12 @@ The pipeline was developed against a frozen 2022 package set (`numpy 1.23.1`, `s
 
 ```bash
 uv sync                                # create .venv and install the locked versions
-uv run PHASE_1_Get_Can_VPs.py          # run a phase inside the environment
+uv run reference/PHASE_1_Get_Can_VPs.py     # run a phase inside the environment
 ```
 
 `uv sync` downloads Python 3.10 automatically if it is not installed yet.
 
-Every phase reads its input from and writes its output to the `00_Output Collection` folder of the working directory, so run the scripts from the repository root. The input file names are hard-coded at the top of each phase: point them at the output file of the previous phase (`PHASE_2`, for example, reads the `PH1 output <timestamp>.json` written by `PHASE_1`).
+Every phase reads its input from and writes its output to the `reference/00_Output Collection` folder of the working directory, so run the scripts from the repository root. The input file names are hard-coded at the top of each phase: point them at the output file of the previous phase (`PHASE_2`, for example, reads the `PH1 output <timestamp>.json` written by `PHASE_1`).
 
 # Python packages
 | Package | Version 
