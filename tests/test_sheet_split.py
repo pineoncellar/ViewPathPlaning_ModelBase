@@ -45,7 +45,8 @@ def test_forming_side_walls_are_assigned_to_a_face_rather_than_dropped(
     # the two - it is about +-1 on every stamping-following wall by design - so the angle
     # to the through-thickness axis is what tells them apart.
     axis_cosine = np.abs(folded_plate_unmerged.face_normals @ split.through_axis)
-    forming = (axis_cosine > np.cos(np.deg2rad(75.0))) & (axis_cosine < np.cos(np.deg2rad(15.0)))
+    flat_limit, wall_limit = np.cos(np.deg2rad(75.0)), np.cos(np.deg2rad(15.0))
+    forming = (axis_cosine > flat_limit) & (axis_cosine < wall_limit)
     assert forming.any(), "the fixture needs a forming wall for this test to mean anything"
     assert float((forming & (split.upper | split.lower)).sum()) / forming.sum() > 0.9
 
