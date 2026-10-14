@@ -28,6 +28,9 @@ output/*
 
 docs/*
 
+# Execution scratch (plan ledgers, review packages) - never versioned.
+.superpowers/
+
 # ===========================================================================
 # PRIVACY / CUSTOMER DATA - nothing below this line may ever be pushed.
 # Rule of thumb: when in doubt, ignore. An ignored file can still be added
