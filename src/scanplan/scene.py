@@ -276,12 +276,16 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
     # distance test cannot tell a hairline gap (which a stamped part resting on its
     # supports legitimately has) from a part buried in the fixture, because both leave a
     # small positive minimum distance.
-    buried, depth = _buried_below(fixture_points, fixture_normals, part_points,
-                                  fixture_tree, touch)
+    buried, depth, deepest_at = _buried_below(fixture_points, fixture_normals, part_points,
+                                              fixture_tree, touch)
     if buried:
         warnings.append(
             f"the part lies INSIDE the fixture at {buried} sampled points, up to "
-            f"{depth:.2f} mm deep - the frame or the transform is wrong"
+            f"{depth:.2f} mm deep (deepest at {deepest_at}) - either the frame or the "
+            "transform is wrong, or the CAD fixture is the design version rather than the "
+            "clamp actually on the cell, which design 4.3 already suspects for this part. "
+            "Confirm which against the real clamp before trusting the fixture contact "
+            "exemption."
         )
 
     return {
@@ -301,6 +305,7 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
         "mounting_plane_from_station_file": not base_plane_is_guessed,
         "part_points_inside_fixture": buried,
         "deepest_part_point_inside_fixture_mm": round(depth, 3),
+        "deepest_part_point_inside_fixture_at": deepest_at,
         "point_counts": {
             "part": int(len(part_points)),
             "fixture": int(len(fixture_points)),
@@ -351,8 +356,8 @@ def _cloud_spacing(points: np.ndarray) -> float:
 
 def _buried_below(fixture_points: np.ndarray, fixture_normals: np.ndarray,
                   part_points: np.ndarray, fixture_tree: cKDTree, touch_mm: float,
-                  neighbours: int = 8) -> tuple[int, float]:
-    """How many part samples lie behind the fixture's own surface, and how deep.
+                  neighbours: int = 8) -> tuple[int, float, list[float]]:
+    """How many part samples lie behind the fixture's own surface, how deep, and where.
 
     A part with a hairline gap has all of its nearby samples on the OUTWARD side of the
     fixture surface; a part that is buried has samples behind it. Uses the fixture's face
@@ -378,7 +383,7 @@ def _buried_below(fixture_points: np.ndarray, fixture_normals: np.ndarray,
     if fixture_points.shape != fixture_normals.shape:
         raise ValueError("fixture points and normals must come from the same sample draw")
     if len(fixture_points) == 0:
-        return 0, 0.0
+        return 0, 0.0, []
 
     count = min(neighbours, len(fixture_points))
     distance, nearest = fixture_tree.query(part_points, k=count)
@@ -386,7 +391,7 @@ def _buried_below(fixture_points: np.ndarray, fixture_normals: np.ndarray,
     distance = np.atleast_2d(distance)
     close = distance[:, 0] < max(touch_mm, _BURIED_WINDOW_MM)
     if not close.any():
-        return 0, 0.0
+        return 0, 0.0, []
 
     points = part_points[close]
     rows = nearest[close]
@@ -395,8 +400,10 @@ def _buried_below(fixture_points: np.ndarray, fixture_normals: np.ndarray,
     shallowest = depth.min(axis=1)
     buried = shallowest > _BURIED_TOL_MM
     if not buried.any():
-        return 0, 0.0
-    return int(buried.sum()), float(depth[buried].max())
+        return 0, 0.0, []
+    deepest = depth[buried].max(axis=1)
+    where = points[int(np.argmax(deepest))]
+    return int(buried.sum()), float(deepest.max()), [round(float(v), 1) for v in where]
 
 
 def _orientation_shares(mesh) -> dict[str, float]:

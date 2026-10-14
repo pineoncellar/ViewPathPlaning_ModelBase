@@ -167,9 +167,11 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
         coverage = merge(coverage,
                          evaluate(extra, target.samples, station, model, cfg,
                                   visible=gate, log=log))
-        selection = select(coverage, coverage.area_mm2, log=log)
+        offered = select(coverage, coverage.area_mm2, log=log)
+        selection = _better(selection, offered)
         say(f"  pool ceiling {ceiling_before:.2f}% -> {coverage.pool_reach_pct:.2f}%; "
-            f"{len(selection.chosen)} poses cover {selection.coverage_pct:.2f}%")
+            f"keeping {len(selection.chosen)} poses at {selection.coverage_pct:.2f}% "
+            f"(this round offered {len(offered.chosen)} at {offered.coverage_pct:.2f}%)")
         if coverage.pool_reach_pct <= ceiling_before + 1e-9:
             # Another round would re-aim at the same samples with the same ladder, so it
             # cannot do better; the residue is geometry, not candidate generation.
@@ -189,6 +191,20 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     return PlanResult(config=cfg, station=station, split=split, target=target,
                       coverage=coverage, selection=selection, viewpoints=viewpoints,
                       report=report, checks=checks)
+
+
+def _better(first: Selection, second: Selection) -> Selection:
+    """Coverage first, then fewer poses - the design's ranking of the two criteria.
+
+    Needed because the pool a later round selects over is larger, and greedy on a larger
+    pool can need MORE poses for the same coverage. That is a worse deliverable, so a round
+    that does not raise the pool's ceiling must not be allowed to re-roll the answer.
+    """
+    return second if _rank(second) > _rank(first) else first
+
+
+def _rank(selection: Selection) -> tuple[float, int]:
+    return (round(selection.coverage_pct, 6), -len(selection.chosen))
 
 
 def write_outputs(result: PlanResult, out_dir) -> dict[str, Path]:
