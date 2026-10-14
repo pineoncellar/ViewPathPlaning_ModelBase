@@ -2,6 +2,33 @@
 
 本仓库包含用于完整生成视点（Viewpoint, VP）与机器人位置（Robot Position）的代码，以完整扫描给定物体的表面。该实现使用一台 6 自由度机械臂（UR5e），其上搭载一台 3D 扫描仪（micro epsilon surface control 3D 3510-80）。整个方法分为 5 个阶段，最终得到的输出是一组机器人位置坐标（以体素为单位）及对应的关节构型，两者均带有顺序标识。输出文件格式为 JSON。
 
+## 仓库结构
+
+本仓库装两样东西：**新版规划器**与**已冻结的参考流水线**。
+
+| 路径 | 是什么 | 是否进版本控制 |
+|---|---|---|
+| `src/scanplan/` | 新版规划器（FANUC + TrackScan-Sharp 49）。各模块的 docstring 说明了它的职责、以及容易做错的地方。 | 是 |
+| `configs/` | 规划器配置，含扫描仪参数。 | 是 |
+| `tests/` | 测试。所有夹具数据都是**合成**的，不含客户几何。 | 是 |
+| `scripts/` | 仓库工具，含数据合规自检。 | 是 |
+| `input/` | **工位数模放这里。** 内容被 gitignore。 | **否** |
+| `output/` | 规划器输出。内容被 gitignore。 | **否** |
+| `reference/` | 冻结的上游流水线（`PHASE_1`～`PHASE_6`、`SCP_src.py`、`IGES_to_STL.py`），作为参考与回归基线保留。属于公开代码。 | 是 |
+| `reference/00_Output Collection/` | 参考流水线的输出目录。被 gitignore。 | **否** |
+| `docs/` | 私密设计文档——里面有客户零件尺寸与坐标。被 gitignore。 | **否** |
+| `samples/` | 上游自带的公开样例网格与图片。 | 是 |
+
+**客户数据永不入库。** 工位数模以及由它派生的一切都带真实尺寸与坐标。`input/`、`output/`、`reference/00_Output Collection/`、`spike/` 全部被 gitignore，并且有一个自检脚本会在这些东西**一旦被跟踪**时报错。提交前请先跑：
+
+```bash
+uv run python scripts/check_repo_hygiene.py
+```
+
+`src/`、`tests/`、`configs/`、`scripts/` 下的内容都是准备公开的。
+
+下文各 PHASE 章节描述的是 `reference/` 里的**参考**流水线，命令请加 `reference/` 前缀。
+
 ## 阶段 1（PHASE 1）
 ### 描述
 第一阶段生成视点（VP）候选列表及其对应的可见物体表面（以体素表示）。该阶段包含以下步骤：
@@ -80,7 +107,7 @@
 ### 描述
 可选的 ROBOGUIDE（FANUC）可行性验证导出层。它**不做逆解**，也**不修改阶段 1～5**：读取阶段 2/3/4/5 输出文件里的视点集合（`VPs_greedy`），把视点写成笛卡尔位姿，可达性、关节限位与碰撞检查交由 ROBOGUIDE 内的 FANUC 控制器判定。UR5e 的关节角被丢弃，因此这条路线不需要跑阶段 3～5。
 
-会在 `00_Output Collection` 下写出三个文件，都以程序名命名：FANUC ASCII 程序（`<程序名>.LS`）、帧契约与自检数据（`<程序名>_frame.json`）、以及便于核对的表格（`<程序名>_points.csv`）。
+会在 `reference/00_Output Collection` 下写出三个文件，都以程序名命名：FANUC ASCII 程序（`<程序名>.LS`）、帧契约与自检数据（`<程序名>_frame.json`）、以及便于核对的表格（`<程序名>_points.csv`）。
 
 `.LS` 以程序名命名，且文件内部的程序名与它完全一致——因为 FANUC 会拒绝文件名的**不是合法程序名**的 ASCII 上传：例如文件名里带空格，就会报 `Invalid name in /PROG section`。因此 `--prog-name`（默认 `PH6SCAN`）只接受"字母开头 + 最多 15 位 `A-Z`/`0-9`/`_`"，程序就写成 `<程序名>.LS`。**不要把文件重命名成带空格的名字。**
 
@@ -101,7 +128,7 @@ ROBOGUIDE 侧必须遵守两条契约（`PH6_frame*.json` 里也各写了一份�
 - `--selftest`（校验 W/P/R 换算与数字格式后退出）
 
 ```bash
-uv run PHASE_6_Export_Roboguide.py --input "00_Output Collection/PH2 output <时间戳>.json"
+uv run reference/PHASE_6_Export_Roboguide.py --input "reference/00_Output Collection/PH2 output <时间戳>.json"
 ```
 
 # 准备工位数模（IGES → 网格）
@@ -116,13 +143,13 @@ PHASE_1 通过 trimesh 对**三角网格**做体素化，而 trimesh 读不了 I
 uv run --no-project --python 3.11 \
     --with cadquery-ocp --with gmsh --with trimesh \
     --with fast-simplification --with numpy --with matplotlib \
-    python IGES_to_STL.py --input-dir <存放 .igs 的目录> \
+    python reference/IGES_to_STL.py --input-dir <存放 .igs 的目录> \
     --preview --report <存放 .igs 的目录>/mesh/report.json
 ```
 
 网格默认写到 `<input-dir>/mesh`，可用 `--out-dir` 指定；`--keep-ratio`（默认 `0.1`）控制简化后保留的面数比例，`--decimate-above`（默认 `200000`）是触发简化的面数门槛，`--deflection-mm`（默认 `1.0`）是 ocp 后端的弦高容差。坐标原样透传，所以 mm 的 IGES 出来的就是 mm 的 STL。`report.json` 会逐个模型记录：IGES 头部信息、在共同 CAD 坐标系下的包围盒、简化前后的三角面数、以及成功网格化的面数。
 
-要让**算法世界坐标系与数模坐标系完全一致**，需把 PHASE_1 对物体网格施加的变换"归零"：令 `obj_mesh_scale` 使缩放后的网格以米为单位（mm 网格取 `0.001`，因为正是 `tm_voxelSize = 0.01` 让一个体素等于 10 mm），并把 `PHASE_1_Get_Can_VPs.py` 物体加载段里的旋转矩阵改成恒等。PHASE_1 与 PHASE_2 **不要求模型 Z 朝上**，只有 PHASE_3 的机器人站位采样才依赖，而导出到 ROBOGUIDE 这条路线用不到 PHASE_3。
+要让**算法世界坐标系与数模坐标系完全一致**，需把 PHASE_1 对物体网格施加的变换"归零"：令 `obj_mesh_scale` 使缩放后的网格以米为单位（mm 网格取 `0.001`，因为正是 `tm_voxelSize = 0.01` 让一个体素等于 10 mm），并把 `reference/PHASE_1_Get_Can_VPs.py` 物体加载段里的旋转矩阵改成恒等。PHASE_1 与 PHASE_2 **不要求模型 Z 朝上**，只有 PHASE_3 的机器人站位采样才依赖，而导出到 ROBOGUIDE 这条路线用不到 PHASE_3。
 
 # Python 环境（uv）
 
@@ -130,12 +157,12 @@ uv run --no-project --python 3.11 \
 
 ```bash
 uv sync                                # 创建 .venv 并安装锁定版本的依赖
-uv run PHASE_1_Get_Can_VPs.py          # 在环境中运行某个阶段
+uv run reference/PHASE_1_Get_Can_VPs.py     # 在环境中运行某个阶段
 ```
 
 若本机未安装 Python 3.10，`uv sync` 会自动下载。
 
-各阶段均从当前工作目录下的 `00_Output Collection` 文件夹读取输入并写出结果，请在仓库根目录下运行脚本。每个阶段顶部的输入文件名是硬编码的：需将其指向上一阶段的输出文件（例如 `PHASE_2` 读取 `PHASE_1` 生成的 `PH1 output <时间戳>.json`）。
+各阶段均从当前工作目录下的 `reference/00_Output Collection` 文件夹读取输入并写出结果，请在仓库根目录下运行脚本。每个阶段顶部的输入文件名是硬编码的：需将其指向上一阶段的输出文件（例如 `PHASE_2` 读取 `PHASE_1` 生成的 `PH1 output <时间戳>.json`）。
 
 # Python 依赖包
 | 包名 | 版本 |
