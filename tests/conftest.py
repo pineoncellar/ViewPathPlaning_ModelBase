@@ -80,7 +80,7 @@ def folded_strip_triangles(thickness=THICKNESS_MM, width=PLATE_WIDTH_MM):
                   np.array([1.0, 0.0])]
     lengths = [60.0, 40.0, 40.0]
     nodes = [np.zeros(2)]
-    for direction, length in zip(directions, lengths):
+    for direction, length in zip(directions, lengths, strict=True):
         nodes.append(nodes[-1] + direction * length)
 
     segment_normals = [np.array([-d[1], d[0]]) for d in directions]
@@ -101,7 +101,7 @@ def folded_strip_triangles(thickness=THICKNESS_MM, width=PLATE_WIDTH_MM):
         return (x, y, z)
 
     triangles = []
-    for i, direction in enumerate(directions):
+    for i, _direction in enumerate(directions):
         normal = np.array([segment_normals[i][0], 0.0, segment_normals[i][1]])
         for side in (+1, -1):
             triangles += quad(point(i, side, y0), point(i + 1, side, y0),
@@ -113,7 +113,8 @@ def folded_strip_triangles(thickness=THICKNESS_MM, width=PLATE_WIDTH_MM):
 
     start = np.array([directions[0][0], 0.0, directions[0][1]])
     end = np.array([directions[-1][0], 0.0, directions[-1][1]])
-    triangles += quad(point(0, +1, y0), point(0, -1, y0), point(0, -1, y1), point(0, +1, y1), -start)
+    triangles += quad(point(0, +1, y0), point(0, -1, y0),
+                      point(0, -1, y1), point(0, +1, y1), -start)
     last = len(nodes) - 1
     triangles += quad(point(last, +1, y0), point(last, -1, y0),
                       point(last, -1, y1), point(last, +1, y1), end)
