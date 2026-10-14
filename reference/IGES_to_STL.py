@@ -18,7 +18,7 @@ pipeline environment (``pyproject.toml``):
     uv run --no-project --python 3.11 \
         --with cadquery-ocp --with gmsh --with trimesh \
         --with fast-simplification --with numpy --with matplotlib \
-        python IGES_to_STL.py --input-dir "D:\\ling_cy\\数模" --preview
+        python IGES_to_STL.py --input-dir "<folder with .igs>" --preview
 
 Coordinates are passed through unchanged. The workshop IGES files are in
 millimetres, so the STL is in millimetres as well; PHASE_1 then needs
