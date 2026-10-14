@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Station template: the three models plus the rigid transform that puts the part",
+    "and the fixture back into the base frame when the CAD handover lost the assembly",
+    "placement (the models were exported one by one, each at its own origin).",
+    "",
+    "Copy this file into input/ next to the models and fill in the real paths and",
+    "numbers. A real station file carries customer coordinates, so it belongs under",
+    "input/ (git-ignored) and must never be committed.",
+    "",
+    "transform_part and transform_fixture are applied to the PART and the FIXTURE",
+    "together, NEVER to the base, which defines the station frame. Both must be rigid:",
+    "orthonormal rotation, determinant +1, last row 0,0,0,1. A wrong transform shifts",
+    "every later number and still looks plausible, which is why load_station runs the",
+    "alignment self-checks before anything else uses the meshes.",
+    "",
+    "tracker_position_mm and tracker_aim_mm are the tracker's real pose once the site",
+    "provides it. null means unknown: the planner then sweeps plausible placements and",
+    "reports the sensitivity rather than inventing a single pose."
+  ],
+  "part": "part.stl",
+  "fixture": "fixture.stl",
+  "base": "base.stl",
+  "transform_part": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+  "transform_fixture": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+  "tracker_position_mm": null,
+  "tracker_aim_mm": null,
+  "note": ""
+}
