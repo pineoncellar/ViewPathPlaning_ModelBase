@@ -7,6 +7,9 @@ have to be runnable from a fresh clone.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import trimesh
@@ -129,14 +132,89 @@ def flat_plate():
 
 @pytest.fixture(scope="session")
 def fixture_box():
-    """A 120 x 120 x 60 mm box whose top face sits 5 mm under the plate (z = -5)."""
-    return box(-60.0, 60.0, -60.0, 60.0, -65.0, -5.0)
+    """A 120 x 120 x 55 mm box standing on the base: top face at z = -5, feet at z = -60."""
+    return box(-60.0, 60.0, -60.0, 60.0, -60.0, -5.0)
 
 
 @pytest.fixture(scope="session")
 def base_box():
-    """A 400 x 400 x 20 mm base, top face at z = -60."""
+    """A 400 x 400 x 20 mm base, mounting plane (its top face) at z = -60."""
     return box(-200.0, 200.0, -200.0, 200.0, -80.0, -60.0)
+
+
+def write_station_file(directory, part, fixture, base, *, transform_part=None,
+                       transform_fixture=None, tracker_position_mm=None,
+                       tracker_aim_mm=None, note="", extra=None):
+    """Write the three meshes plus a station file next to them, and return its path.
+
+    The mesh paths are relative on purpose: a station file is meant to be copied
+    around with its models, and a real one lives under `input/` because it holds
+    customer coordinates.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    names = {}
+    for name, mesh in (("part", part), ("fixture", fixture), ("base", base)):
+        path = directory / f"{name}.stl"
+        mesh.export(path)
+        names[name] = path.name
+
+    identity = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+    body = {
+        "part": names["part"],
+        "fixture": names["fixture"],
+        "base": names["base"],
+        "transform_part": transform_part or identity,
+        "transform_fixture": transform_fixture or identity,
+        "tracker_position_mm": tracker_position_mm,
+        "tracker_aim_mm": tracker_aim_mm,
+        "note": note,
+    }
+    if extra:
+        body.update(extra)
+    description = directory / "station.json"
+    description.write_text(json.dumps(body, indent=2), encoding="utf-8")
+    return description
+
+
+@pytest.fixture(scope="session")
+def station_description_path(tmp_path_factory, folded_plate, fixture_box, base_box):
+    """A station file on disk, in a directory of its own, with the three meshes beside it."""
+    directory = tmp_path_factory.mktemp("station")
+    return write_station_file(directory, folded_plate, fixture_box, base_box)
+
+
+@pytest.fixture(scope="session")
+def station(station_description_path):
+    """The loaded station every later task plans against."""
+    from scanplan.scene import load_station, load_station_description
+
+    description = load_station_description(station_description_path)
+    return load_station(description, cloud_seed=3)
+
+
+@pytest.fixture(scope="session")
+def station_interpenetrating(tmp_path_factory, folded_plate, fixture_box, base_box):
+    """The same station with the part driven 5 mm down into the clamped region."""
+    from scanplan.scene import load_station, load_station_description
+
+    directory = tmp_path_factory.mktemp("station-sunk")
+    sunk = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, -5.0], [0, 0, 0, 1]]
+    path = write_station_file(directory, folded_plate, fixture_box, base_box,
+                              transform_part=sunk)
+    return load_station(load_station_description(path), cloud_seed=3)
+
+
+@pytest.fixture(scope="session")
+def station_fixture_sunk_into_base(tmp_path_factory, folded_plate, fixture_box, base_box):
+    """A station whose fixture is driven 20 mm into the base - the frame is wrong."""
+    from scanplan.scene import load_station, load_station_description
+
+    directory = tmp_path_factory.mktemp("station-fixture-sunk")
+    sunk = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, -20.0], [0, 0, 0, 1]]
+    path = write_station_file(directory, folded_plate, fixture_box, base_box,
+                              transform_fixture=sunk)
+    return load_station(load_station_description(path), cloud_seed=3)
 
 
 @pytest.fixture(scope="session")
