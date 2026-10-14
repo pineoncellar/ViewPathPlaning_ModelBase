@@ -27,6 +27,8 @@ FORBIDDEN_SUBSTRINGS = (
     "output/",
     "00_Output Collection/",
     "spike/",
+    # design notes quote customer dimensions, so they must not be tracked either
+    "docs/",
 )
 
 FORBIDDEN_SUFFIXES = (
@@ -35,6 +37,10 @@ FORBIDDEN_SUFFIXES = (
 
 #: The upstream repository ships public sample meshes; those are legitimate.
 ALLOWED_STL_PREFIXES = ("samples/",)
+
+#: Files tracked on purpose inside an otherwise ignored directory. They only
+#: exist so the working directories survive a fresh clone and hold no data.
+ALLOWED_DATA_DIR_MARKERS = (".gitkeep",)
 
 
 def tracked_files() -> list[str]:
@@ -47,6 +53,8 @@ def tracked_files() -> list[str]:
 def violations(paths: list[str]) -> list[str]:
     bad = []
     for path in paths:
+        if path.endswith(ALLOWED_DATA_DIR_MARKERS):
+            continue
         low = path.lower()
         if any(sub in path for sub in FORBIDDEN_SUBSTRINGS):
             bad.append(f"{path}  (inside a data directory)")
