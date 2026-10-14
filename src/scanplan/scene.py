@@ -15,14 +15,16 @@ footprint inside the base.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import trimesh
 from scipy.spatial import cKDTree
 
 from .geometry import sample_surface_seeded
+from .raycast import RayCaster
 
 IDENTITY_4X4 = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
                 (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
@@ -68,6 +70,22 @@ class Station:
     base_cloud_mm: np.ndarray
     fixture_tree: cKDTree
     base_tree: cKDTree
+    _obstacles: dict[str, Any] | None = field(default=None, init=False, repr=False,
+                                              compare=False)
+
+    def obstacles(self) -> dict[str, RayCaster]:
+        """Ray casters for the three meshes, built on first use and kept.
+
+        All three block sight lines, so the coverage stage needs them together, and
+        building an intersector per call would dominate a real part's runtime.
+        """
+        if self._obstacles is None:
+            self._obstacles = {
+                "part": RayCaster(self.part),
+                "fixture": RayCaster(self.fixture),
+                "base": RayCaster(self.base),
+            }
+        return self._obstacles
 
     def clearance_mm(self, points) -> np.ndarray:
         """Distance from each point to the nearest fixture or base sample."""
