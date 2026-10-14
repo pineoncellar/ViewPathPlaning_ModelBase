@@ -16,8 +16,19 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from scanplan.pipeline import plan, write_outputs
+from scanplan.pipeline import _better, plan, write_outputs
+from scanplan.selection import Selection
 from scanplan.tracker import Tracker, part_centroid
+
+
+def choice(coverage_pct, poses):
+    """A `Selection` with a known coverage and pose count, for the ranking rule."""
+    target_area = 100.0
+    return Selection(chosen=list(range(poses)), greedy=list(range(poses)), repair=[],
+                     covered=np.ones(1, dtype=bool), curve=[],
+                     coverage_area_mm2=target_area * coverage_pct / 100.0,
+                     target_area_mm2=target_area,
+                     sources=np.array(["greedy"] * poses, dtype=object))
 
 
 @pytest.fixture(scope="session")
@@ -98,6 +109,36 @@ def test_the_refine_loop_aims_at_the_uncovered_samples(clamped_plate, cfg):
     assert counters["refine_rounds"] == 1
     assert counters["refine_candidates"] > 0
     assert len(result.coverage.poses) > len(result.report["viewpoint_records"])
+
+
+def test_more_coverage_wins_and_a_tie_goes_to_the_fewer_poses():
+    # the loop selects over a pool that grows each round, and greedy on a larger pool can
+    # need more poses for the same coverage - which the design ranks as a worse result
+    more = choice(99.0, 20)
+    fewer_at_the_same_coverage = choice(99.0, 5)
+    less_coverage = choice(98.0, 2)
+    assert _better(more, less_coverage) is more
+    assert _better(less_coverage, more) is more
+    assert _better(more, fewer_at_the_same_coverage) is fewer_at_the_same_coverage
+    assert _better(more, more) is more
+
+
+def test_a_refinement_round_that_gains_nothing_leaves_the_viewpoint_set_alone(
+        clamped_plate, cfg):
+    # on this station the leak sits under the clamp, so refinement cannot raise the pool's
+    # ceiling. Re-selecting over the enlarged pool then only re-rolls the same answer, and
+    # greedy on more candidates can need MORE poses for the same coverage - which the design
+    # ranks as a worse result (coverage first, then viewpoint count).
+    coarse = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=0))
+    refined = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=1))
+    without = plan(clamped_plate.station, coarse, face="upper")
+    with_round = plan(clamped_plate.station, refined, face="upper")
+    assert with_round.report["counters"]["refine_rounds"] == 1
+    assert with_round.report["counters"]["refine_candidates"] > 0
+    assert len(with_round.viewpoints) == len(without.viewpoints)
+    assert [tuple(viewpoint.position) for viewpoint in with_round.viewpoints] \
+        == [tuple(viewpoint.position) for viewpoint in without.viewpoints]
+    assert with_round.selection.coverage_pct == without.selection.coverage_pct
 
 
 def test_refinement_does_not_lower_the_coverage(clamped_plate, cfg):
