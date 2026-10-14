@@ -39,7 +39,7 @@ from .scene import Station
 from .target_surface import SampleSet
 
 REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by_base",
-           "only_poses_that_collide", "candidate_found")
+           "blocked_by_tracker", "only_poses_that_collide", "candidate_found")
 _COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_no_points", "rays")
 
 
@@ -173,12 +173,20 @@ def merge(first: CoverageResult, second: CoverageResult) -> CoverageResult:
 
 def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
                         station: Station, model: ScannerModel, cfg: PlannerConfig,
-                        *, obstacles: dict | None = None) -> np.ndarray:
+                        *, obstacles: dict | None = None,
+                        tracker_ok=None) -> np.ndarray:
     """Say why each uncovered sample is uncovered, one reason per sample.
 
-    `only_poses_that_collide` is kept separate from `blocked_by_*`: it means the part
-    is reachable in principle but the scanner body has nowhere to stand, which is a
-    layout question, not an occlusion one.
+    `only_poses_that_collide` is kept separate from `blocked_by_*`: it means the part is
+    reachable in principle but the scanner body has nowhere to stand, which is a layout
+    question, not an occlusion one.
+
+    `tracker_ok` is the per-pose tracker verdict from :func:`evaluate`. Passing it matters:
+    a pose the tracker cannot see covers nothing, so without it a sample that only
+    tracker-rejected poses could reach would be reported as `candidate_found`, which names
+    the wrong cause and hides a mounting problem behind an algorithm one. Poses the tracker
+    CAN see are answered first, and the ray is traced even for the others, so a genuine
+    occlusion still outranks the tracker as the more specific explanation.
     """
     points = np.asarray(leak_points, dtype=float).reshape(-1, 3)
     normals = np.asarray(leak_normals, dtype=float).reshape(-1, 3)
@@ -197,8 +205,17 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
         else np.zeros((0, 3))
     clearances = (station.clearance_mm(base_positions) if len(base_positions)
                   else np.zeros(0))
+    if tracker_ok is None:
+        visible = np.ones(len(poses), dtype=bool)
+    else:
+        visible = np.asarray(tracker_ok, dtype=bool)
+        if len(visible) != len(poses):
+            raise ValueError("one tracker verdict per pose is required")
+    # answer from the poses the tracker can actually see first, so their verdicts win
+    order = np.argsort(~visible, kind="stable")
 
-    for index, pose in enumerate(poses):
+    for index in order:
+        pose = poses[index]
         if resolved.all():
             break
         candidates = pending[~resolved[pending]]
@@ -220,8 +237,10 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
         nearest, names, _ = nearest_across(casters, origins, directions)
         blocked = nearest < distance - cfg.occlusion_tol_mm
         for local, target in enumerate(index_set):
-            reasons[target] = (f"blocked_by_{names[local]}" if blocked[local]
-                               else "candidate_found")
+            if blocked[local]:
+                reasons[target] = f"blocked_by_{names[local]}"
+            else:
+                reasons[target] = "candidate_found" if visible[index] else "blocked_by_tracker"
             resolved[target] = True
 
     reasons[~resolved & only_colliding] = "only_poses_that_collide"

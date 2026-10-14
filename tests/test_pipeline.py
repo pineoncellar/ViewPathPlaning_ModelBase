@@ -122,6 +122,29 @@ def test_a_tracker_gate_never_raises_the_coverage(clamped_plate, quick_cfg):
     assert all(viewpoint.tracker_ok for viewpoint in with_tracker.viewpoints)
 
 
+def test_a_tracker_that_sees_nothing_names_the_tracker_as_the_reason(clamped_plate,
+                                                                    quick_cfg):
+    # planning with a tracker whose range excludes every pose must not report the misses
+    # as "a candidate was found": the mounting is the cause and the report has to say so
+    tracker = Tracker(position=part_centroid(clamped_plate.station.part)
+                      + np.array([0.0, 0.0, 5.0]),
+                      aim=part_centroid(clamped_plate.station.part),
+                      params=quick_cfg.tracker)
+    result = plan(clamped_plate.station, quick_cfg, face="upper", tracker=tracker)
+    reasons = result.report["uncovered_by_reason"]
+    assert reasons, "every sample should be uncovered when no pose passes the tracker"
+    assert "blocked_by_tracker" in reasons
+    assert "candidate_found" not in reasons
+    assert all(viewpoint.tracker_ok for viewpoint in result.viewpoints)
+
+
+def test_every_reported_reason_is_one_the_footprint_vocabulary_defines(clamped_plate,
+                                                                      quick_cfg):
+    from scanplan.coverage import REASONS
+    result = plan(clamped_plate.station, quick_cfg, face="upper")
+    assert set(result.report["uncovered_by_reason"]) <= set(REASONS)
+
+
 def test_write_outputs_produces_every_documented_file(clamped_plate, quick_cfg, tmp_path):
     paths = write_outputs(plan(clamped_plate.station, quick_cfg, face="upper"), tmp_path)
     for name in ("viewpoints.json", "viewpoints.csv", "exempt_points.csv",

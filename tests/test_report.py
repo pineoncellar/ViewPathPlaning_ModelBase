@@ -129,6 +129,17 @@ def test_the_definition_block_records_the_topological_rule(planned):
     assert "distance" in definition["contact_rule"]
 
 
+def test_the_report_records_a_witness_of_which_face_was_chosen(planned):
+    # `upper`/`lower` name geometric sides, and which side gets which name depends on the
+    # split's orientation seed - which nothing anchors to the station. The report has to
+    # carry enough for a reviewer to check the choice rather than trust the word.
+    definition = planned["report"]["definition"]
+    assert len(definition["through_axis"]) == 3
+    assert abs(float(np.linalg.norm(definition["through_axis"])) - 1.0) < 1e-6
+    assert definition["face_naming_note"]
+    assert "geometric" in definition["face_naming_note"].lower()
+
+
 def test_the_exempted_region_is_reported_with_its_area(planned):
     exempt = planned["report"]["exempt"]
     assert exempt["points"] == len(planned["target"].exempt.points)

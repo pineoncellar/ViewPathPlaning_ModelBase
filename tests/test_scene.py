@@ -148,6 +148,44 @@ def test_without_a_mounting_plane_the_base_top_is_used_and_said_so(tmp_path, fol
     assert checks["mounting_plane_from_station_file"] is False
 
 
+def test_a_part_straddling_the_fixture_top_face_is_reported_as_buried(tmp_path):
+    # A fixture this size is what exposes the sampling mismatch: the station's own cloud
+    # and the check's cloud are drawn at different sizes, so a check that indexes one
+    # cloud's normals with the other's rows reads unrelated normals and reports noise.
+    big_fixture = box(-200.0, 200.0, -200.0, 200.0, -100.0, 0.0)     # 0.48 m2
+    straddling = box(-100.0, 100.0, -100.0, 100.0, -2.5, 2.5)        # 2.5 mm inside
+    base = box(-400.0, 400.0, -400.0, 400.0, -160.0, -100.0)
+    path = write_station_file(tmp_path, straddling, big_fixture, base)
+    station_buried = load_station(load_station_description(path), cloud_seed=3)
+    checks = station_buried.check_alignment(seed=5)
+    assert checks["part_points_inside_fixture"] > 0
+    assert checks["deepest_part_point_inside_fixture_mm"] > 1.0
+    assert checks["passed"] is False
+
+
+def test_a_hairline_gap_on_a_large_fixture_is_not_called_interference(tmp_path):
+    big_fixture = box(-200.0, 200.0, -200.0, 200.0, -100.0, 0.0)
+    hovering = box(-100.0, 100.0, -100.0, 100.0, 0.3, 5.3)           # 0.3 mm clear
+    base = box(-400.0, 400.0, -400.0, 400.0, -160.0, -100.0)
+    path = write_station_file(tmp_path, hovering, big_fixture, base)
+    station_hovering = load_station(load_station_description(path), cloud_seed=3)
+    checks = station_hovering.check_alignment(seed=5)
+    assert checks["part_points_inside_fixture"] == 0
+    assert checks["passed"] is True
+
+
+def test_the_interference_check_does_not_change_with_the_sampling_seed(tmp_path):
+    # the verdict has to be a property of the geometry, not of the draw
+    big_fixture = box(-200.0, 200.0, -200.0, 200.0, -100.0, 0.0)
+    straddling = box(-100.0, 100.0, -100.0, 100.0, -2.5, 2.5)
+    base = box(-400.0, 400.0, -400.0, 400.0, -160.0, -100.0)
+    path = write_station_file(tmp_path, straddling, big_fixture, base)
+    station_seeded = load_station(load_station_description(path), cloud_seed=11)
+    verdicts = {station_seeded.check_alignment(seed=seed)["part_points_inside_fixture"] > 0
+                for seed in (1, 5, 17)}
+    assert verdicts == {True}
+
+
 def test_a_missing_model_is_reported_with_its_path(
         tmp_path, folded_plate, fixture_box, base_box):
     path = write_station_file(tmp_path, folded_plate, fixture_box, base_box)

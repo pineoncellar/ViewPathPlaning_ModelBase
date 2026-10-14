@@ -36,6 +36,11 @@ _COS30 = float(np.cos(np.deg2rad(30.0)))
 # How far behind the fixture's surface a part sample has to be before it counts as buried
 # rather than as cloud-level noise about a touching contact.
 _BURIED_TOL_MM = 0.2
+# How far from the fixture surface a part sample is still worth testing. This is a fixed
+# window, NOT the cloud spacing: a part sitting correctly is within a few tenths of a
+# millimetre of its supports, so a spacing-sized window only ever sees the surface layer
+# and a part buried several millimetres deeper goes unexamined.
+_BURIED_WINDOW_MM = 10.0
 
 
 @dataclass(frozen=True)
@@ -210,7 +215,7 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
     point clouds cannot resolve a separation finer than their own spacing.
     """
     part_points, _ = _cloud(station.part, samples, seed)
-    fixture_points, _ = _cloud(station.fixture, samples, seed + 1)
+    fixture_points, fixture_normals = _cloud(station.fixture, samples, seed + 1)
     base_points, _ = _cloud(station.base, samples, seed + 2)
 
     base_plane = (float(station.base.bounds[1][2]) if base_plane_mm is None
@@ -271,7 +276,8 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
     # distance test cannot tell a hairline gap (which a stamped part resting on its
     # supports legitimately has) from a part buried in the fixture, because both leave a
     # small positive minimum distance.
-    buried, depth = _buried_below(station, fixture_points, part_points, fixture_tree, touch)
+    buried, depth = _buried_below(fixture_points, fixture_normals, part_points,
+                                  fixture_tree, touch)
     if buried:
         warnings.append(
             f"the part lies INSIDE the fixture at {buried} sampled points, up to "
@@ -343,8 +349,8 @@ def _cloud_spacing(points: np.ndarray) -> float:
     return float(np.median(distances))
 
 
-def _buried_below(station: Station, fixture_points: np.ndarray, part_points: np.ndarray,
-                  fixture_tree: cKDTree, touch_mm: float,
+def _buried_below(fixture_points: np.ndarray, fixture_normals: np.ndarray,
+                  part_points: np.ndarray, fixture_tree: cKDTree, touch_mm: float,
                   neighbours: int = 8) -> tuple[int, float]:
     """How many part samples lie behind the fixture's own surface, and how deep.
 
@@ -357,21 +363,35 @@ def _buried_below(station: Station, fixture_points: np.ndarray, part_points: np.
     closest one: near a convex edge the nearest sample can sit on the perpendicular wall,
     and a point legitimately above the top face is then "behind" that wall's plane. Taking
     the minimum over the nearest few samples removes that ambiguity.
+
+    Points and normals MUST come from the same draw. Indexing one cloud's normals with
+    another cloud's rows reads unrelated normals and turns this test into noise, which is
+    exactly the failure the array lengths cannot reveal - so it is refused outright.
+
+    Two things this cannot see, both worth knowing before trusting it: a part sitting
+    wholly inside the fixture volume is not "behind a nearby surface" and goes unflagged,
+    and a fixture mesh whose winding is inverted flips every normal, so a healthy contact
+    reads as deeply buried.
     """
-    if len(station.fixture_cloud_normals_mm) != len(fixture_points):
+    fixture_points = np.asarray(fixture_points, dtype=float)
+    fixture_normals = np.asarray(fixture_normals, dtype=float)
+    if fixture_points.shape != fixture_normals.shape:
+        raise ValueError("fixture points and normals must come from the same sample draw")
+    if len(fixture_points) == 0:
         return 0, 0.0
-    count = min(neighbours, max(1, len(fixture_points)))
+
+    count = min(neighbours, len(fixture_points))
     distance, nearest = fixture_tree.query(part_points, k=count)
     nearest = np.atleast_2d(nearest)
     distance = np.atleast_2d(distance)
-    close = distance[:, 0] < max(touch_mm, 0.25)
+    close = distance[:, 0] < max(touch_mm, _BURIED_WINDOW_MM)
     if not close.any():
         return 0, 0.0
 
     points = part_points[close]
     rows = nearest[close]
     offset = points[:, None, :] - fixture_points[rows]
-    depth = -(offset * station.fixture_cloud_normals_mm[rows]).sum(axis=2)
+    depth = -(offset * fixture_normals[rows]).sum(axis=2)
     shallowest = depth.min(axis=1)
     buried = shallowest > _BURIED_TOL_MM
     if not buried.any():

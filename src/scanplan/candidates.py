@@ -47,11 +47,11 @@ def aim_indices(points, grid_mm: float) -> np.ndarray:
 def ladder(point, normal, params: ScannerParams) -> list[ScannerPose]:
     """The poses aimed at one surface point: every distance, tilt and roll.
 
-    The roll is skipped where the tilt is zero, because rolling about the optical axis
-    only turns the rectangular footprint - at zero tilt the two rolls differ by a
-    quarter turn of the same pose's footprint, which the selection stage cannot use
-    and which would double the pool for nothing. Away from zero tilt the tilt itself
-    is what turns the footprint, so both rolls are kept.
+    Every tilt gets every roll, including zero tilt. The roll does NOT change the optical
+    axis, but the field of view is a rectangle (600 x 500 mm at the standoff), so a quarter
+    turn about that axis covers a different set of samples - and zero tilt is the pose with
+    the best incidence, i.e. exactly the one a selection prefers. Design 4.2 lists two
+    rolls for this reason.
     """
     point = np.asarray(point, dtype=float).reshape(3)
     normal = np.asarray(normal, dtype=float).reshape(3)
@@ -65,14 +65,11 @@ def ladder(point, normal, params: ScannerParams) -> list[ScannerPose]:
         for tilt_deg in params.tilts_deg:
             if tilt_deg == 0.0:
                 axis = inward
-                rolls = params.rolls_deg[:1]
             elif tilt_deg > 0.0:
                 axis = tilt_axis(inward, first_tangent, tilt_deg)
-                rolls = params.rolls_deg
             else:
                 axis = tilt_axis(inward, second_tangent, -tilt_deg)
-                rolls = params.rolls_deg
-            for roll_deg in rolls:
+            for roll_deg in params.rolls_deg:
                 poses.append(ScannerPose(position=position.copy(), axis=axis.copy(),
                                          roll_deg=float(roll_deg)))
     return poses
