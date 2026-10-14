@@ -145,14 +145,14 @@ def split_sheet(part, *, band_deg: float = 70.0, knn: int = 24, seed_ratio: floa
     projection = sheet_normal @ axis
     oriented = np.abs(projection) > seed_ratio
     sheet_normal[oriented] = np.sign(projection[oriented])[:, None] * sheet_normal[oriented]
-    similar = np.abs((sheet_normal[neighbours] * sheet_normal[:, None, :]).sum(axis=2)) > prop_sim
+    similar = np.abs(
+        (sheet_normal[neighbours] * sheet_normal[:, None, :]).sum(axis=2)) > prop_sim
     say(f"  seeds: {int(oriented.sum())} faces ({100.0 * oriented.mean():.1f}%) "
         f"with |m . axis| > {seed_ratio}")
 
-    rounds = 0
-    for rounds in range(1, _MAX_PROPAGATION_ROUNDS + 1):
-        if oriented.all():
-            break
+    rounds_used = 0
+    while rounds_used < _MAX_PROPAGATION_ROUNDS and not oriented.all():
+        rounds_used += 1
         votes = (sheet_normal[neighbours] * sheet_normal[:, None, :]).sum(axis=2)
         usable = similar & oriented[neighbours]
         tally = np.where(usable, np.sign(votes), 0.0).sum(axis=1)
@@ -162,7 +162,7 @@ def split_sheet(part, *, band_deg: float = 70.0, knn: int = 24, seed_ratio: floa
         sheet_normal[fresh] = np.sign(tally[fresh])[:, None] * sheet_normal[fresh]
         oriented |= fresh
     say(f"  propagation: {int(oriented.sum())} / {face_count} faces oriented "
-        f"({100.0 * oriented.mean():.1f}%) in {rounds} rounds")
+        f"({100.0 * oriented.mean():.1f}%) in {rounds_used} rounds")
 
     # 4. the split itself
     cosnm = (normals * sheet_normal).sum(axis=1)

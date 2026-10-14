@@ -140,6 +140,13 @@ def folded_strip_triangles(thickness=THICKNESS_MM, width=PLATE_WIDTH_MM, spans=6
         x, z = node + side * normal * (thickness / 2.0)
         return (x, y0 + (y1 - y0) * across, z)
 
+    def rim_quad(i, across):
+        return quad(rim_point(nodes[i], node_normals[i], +1, across),
+                    rim_point(nodes[i + 1], node_normals[i + 1], +1, across),
+                    rim_point(nodes[i + 1], node_normals[i + 1], -1, across),
+                    rim_point(nodes[i], node_normals[i], -1, across),
+                    (0.0, 1.0, 0.0) if across > 0.5 else (0.0, -1.0, 0.0))
+
     triangles = []
     for i in range(len(directions)):
         normal = segment_normals[i]
@@ -150,18 +157,14 @@ def folded_strip_triangles(thickness=THICKNESS_MM, width=PLATE_WIDTH_MM, spans=6
                 for band in range(bands):
                     across_0, across_1 = band / bands, (band + 1) / bands
                     corners = [
-                        surface_point(nodes[i], nodes[i + 1], node_normals[i], node_normals[i + 1],
-                                      side, along, across)
+                        surface_point(nodes[i], nodes[i + 1], node_normals[i],
+                                      node_normals[i + 1], side, along, across)
                         for along, across in ((along_0, across_0), (along_1, across_0),
                                               (along_1, across_1), (along_0, across_1))
                     ]
                     triangles += quad(*corners, normal_3d * side)
-        for y, outward in ((y0, (0, -1, 0)), (y1, (0, 1, 0))):
-            triangles += quad(rim_point(nodes[i], node_normals[i], +1, (y - y0) / (y1 - y0)),
-                              rim_point(nodes[i + 1], node_normals[i + 1], +1, (y - y0) / (y1 - y0)),
-                              rim_point(nodes[i + 1], node_normals[i + 1], -1, (y - y0) / (y1 - y0)),
-                              rim_point(nodes[i], node_normals[i], -1, (y - y0) / (y1 - y0)),
-                              outward)
+        triangles += rim_quad(i, 0.0)
+        triangles += rim_quad(i, 1.0)
 
     start = np.array([directions[0][0], 0.0, directions[0][1]])
     end = np.array([directions[-1][0], 0.0, directions[-1][1]])

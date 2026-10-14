@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-
 from conftest import crossed_plates, has_unmerged_vertices
+
 from scanplan.sheet_split import split_sheet
 
 
@@ -37,7 +37,8 @@ def test_every_face_lands_in_exactly_one_set(folded_plate_unmerged):
     assert not (split.band & (split.upper | split.lower)).any()
 
 
-def test_forming_side_walls_are_assigned_to_a_face_rather_than_dropped(folded_plate_unmerged):
+def test_forming_side_walls_are_assigned_to_a_face_rather_than_dropped(
+        folded_plate_unmerged):
     split = split_sheet(folded_plate_unmerged, seed=1)
     # A forming wall follows the stamping (its normal is far from the global
     # through-thickness axis) without being a cut cross-section. `cosnm` cannot separate
