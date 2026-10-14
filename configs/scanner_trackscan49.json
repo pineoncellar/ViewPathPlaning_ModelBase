@@ -1,0 +1,44 @@
+{
+  "_comment": [
+    "PLACEHOLDER scanner parameters. None of these has been measured on the real",
+    "device; they come from the public datasheet plus the geometric meaning of",
+    "'standoff' and 'depth of field'. Replace them with measured values before",
+    "treating any coverage figure as a prediction.",
+    "max_incidence_deg is the most sensitive number in the whole planner."
+  ],
+
+  "scanner": {
+    "standoff_mm": 300.0,
+    "range_mm": [120.0, 480.0],
+    "fov_at_standoff_mm": [600.0, 500.0],
+    "fov_cap_mm": [600.0, 500.0],
+    "max_incidence_deg": 45.0,
+    "body_sphere_r_mm": 45.0,
+    "body_clearance_mm": 0.0,
+    "distances_mm": [250.0, 300.0, 380.0],
+    "tilts_deg": [0.0, 30.0, -30.0],
+    "rolls_deg": [0.0, 90.0],
+    "aim_grid_mm": 100.0,
+    "max_candidates": 4000
+  },
+
+  "target": {
+    "sample_grid_mm": 3.0,
+    "contact_mm": 3.0,
+    "contact_margin_mm": 5.0,
+    "face": "auto",
+    "band_deg": 70.0,
+    "knn": 24
+  },
+
+  "tracker": {
+    "half_angle_deg": 30.0,
+    "distance_mm": [300.0, 6000.0],
+    "aim_at": "part_centroid",
+    "markers_omnidirectional": true,
+    "model_robot_occlusion": false
+  },
+
+  "occlusion_tol_mm": 2.0,
+  "seed": 7
+}
