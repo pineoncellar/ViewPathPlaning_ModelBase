@@ -19,7 +19,16 @@
     "tilts_deg": [0.0, 30.0, -30.0],
     "rolls_deg": [0.0, 90.0],
     "aim_grid_mm": 100.0,
-    "max_candidates": 4000
+    "max_candidates": 4000,
+
+    "_comment_refine": [
+      "DESIGN, not measured (spec 6.4): the coarse-to-fine pass. After the first",
+      "set-cover run, the still-uncovered region is re-aimed on a finer grid than",
+      "the target surface was sampled at, because the measured viewpoint count is",
+      "limited by candidate generation and not by the selection algorithm."
+    ],
+    "refine_rounds": 2,
+    "refine_aim_grid_mm": 25.0
   },
 
   "target": {
