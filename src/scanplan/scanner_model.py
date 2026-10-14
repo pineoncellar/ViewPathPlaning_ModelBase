@@ -147,8 +147,3 @@ def measure_mask(model: ScannerModel, pose: ScannerPose, points, normals, obstac
     blocked = nearest < distance - occlusion_tol_mm
     candidates[index[blocked]] = False
     return candidates
-
-
-def body_clearance_mask(model: ScannerModel, clearance_mm) -> np.ndarray:
-    """Condition 5 for a vector of already-computed clearances."""
-    return np.asarray(clearance_mm, dtype=float) > model.body_limit_mm

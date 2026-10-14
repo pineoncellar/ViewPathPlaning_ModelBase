@@ -32,7 +32,7 @@ import numpy as np
 import trimesh
 
 from .config import PlannerConfig, TargetParams
-from .geometry import grid_cells, grid_dedupe, sample_surface_seeded
+from .geometry import grid_dedupe, sample_surface_seeded
 from .scene import Station
 from .sheet_split import SheetSplit
 
@@ -176,8 +176,3 @@ def contact_summary(target: TargetSet) -> dict[str, Any]:
         "center": [round(float(v), 1) for v in points.mean(axis=0)],
         "size_mm": [round(float(v), 1) for v in (points.max(axis=0) - points.min(axis=0))],
     }
-
-
-def grid_cell_count(points, grid_mm: float) -> int:
-    """How many distinct grid cells a point set occupies - a sampling self-check."""
-    return int(len(np.unique(grid_cells(points, grid_mm), axis=0)))
