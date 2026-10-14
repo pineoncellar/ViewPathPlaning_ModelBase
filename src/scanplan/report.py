@@ -17,17 +17,16 @@ Must also state what it does NOT include:
 Output as a machine-readable JSON plus the human-readable summary; the figures
 go in a sibling directory.
 
-This module also owns the viewpoint record, because the report and the export both
-have to agree on the same field names - the export contract (spec 7.3.2) is a
-convention about THIS record, and `pipeline` re-exports the class from here so
-there is one definition of it.
+This module also owns the report's own vocabulary: the definition block, the leak
+clustering and the summary. The viewpoint record itself lives in
+:mod:`scanplan.viewpoints` and is re-exported here, so the JSON keys and the export
+contract have exactly one definition.
 """
 
 from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -39,76 +38,13 @@ from .scanner_model import ScannerModel
 from .scene import Station
 from .selection import Selection
 from .sheet_split import SheetSplit
-from .target_surface import SampleSet, TargetSet, contact_summary
+from .target_surface import TargetSet, contact_summary
 from .tracker import Tracker
+from .viewpoints import Viewpoint, viewpoints_from_selection  # noqa: F401  (re-export)
 
 _EXEMPT_REASON = "fixture_contact"
 _INCIDENCE_BINS = 10
 _CLUSTER_LIMIT = 12
-
-
-@dataclass(frozen=True)
-class Viewpoint:
-    """One scanner pose as it is delivered: position, optical axis, roll, and its yield.
-
-    `position` is the scanner's measurement reference point in the station CAD frame,
-    `axis` points from the scanner towards the part (the scanner's local +Z), and
-    `roll_deg` turns the rectangular footprint about that axis. That is the frame
-    contract the ROBOGUIDE UTOOL has to reproduce.
-    """
-
-    id: int
-    position: np.ndarray
-    axis: np.ndarray
-    roll_deg: float
-    n_points: int
-    area_mm2: float
-    mean_incidence_deg: float
-    max_incidence_deg: float
-    tracker_ok: bool
-    source: str
-
-    def as_dict(self) -> dict:
-        """A plain JSON-ready mapping with the documented field names."""
-        return {
-            "id": int(self.id),
-            "position": [round(float(v), 4) for v in self.position],
-            "axis": [round(float(v), 9) for v in self.axis],
-            "roll_deg": float(self.roll_deg),
-            "n_points": int(self.n_points),
-            "area_mm2": round(float(self.area_mm2), 3),
-            "mean_incidence_deg": round(float(self.mean_incidence_deg), 3),
-            "max_incidence_deg": round(float(self.max_incidence_deg), 3),
-            "tracker_ok": bool(self.tracker_ok),
-            "source": str(self.source),
-        }
-
-
-def viewpoints_from_selection(selection: Selection, coverage: CoverageResult,
-                              samples: SampleSet) -> list[Viewpoint]:
-    """Turn the chosen poses into the delivered records, with their yield."""
-    areas = np.asarray(samples.area_mm2, dtype=float)
-    records: list[Viewpoint] = []
-    for order, index in enumerate(selection.chosen):
-        covered = coverage.sets[index]
-        if len(covered) == 0:
-            continue
-        cosines = coverage.quality[index]
-        angles = np.degrees(np.arccos(np.clip(cosines, -1.0, 1.0)))
-        pose = coverage.poses[index]
-        records.append(Viewpoint(
-            id=order,
-            position=np.asarray(pose.position, dtype=float),
-            axis=np.asarray(pose.axis, dtype=float),
-            roll_deg=float(pose.roll_deg),
-            n_points=int(len(covered)),
-            area_mm2=float(areas[covered].sum()),
-            mean_incidence_deg=float(angles.mean()),
-            max_incidence_deg=float(angles.max()),
-            tracker_ok=bool(coverage.tracker_ok[index]),
-            source=str(selection.sources[order]),
-        ))
-    return records
 
 
 def cluster_points(points, area_mm2, *, cell_mm: float = 30.0,

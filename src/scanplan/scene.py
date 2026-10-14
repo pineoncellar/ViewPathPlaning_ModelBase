@@ -30,9 +30,12 @@ IDENTITY_4X4 = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
                 (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
 _MODEL_KEYS = ("part", "fixture", "base")
 _OPTIONAL_KEYS = ("transform_part", "transform_fixture", "tracker_position_mm",
-                  "tracker_aim_mm", "note")
+                  "tracker_aim_mm", "mounting_plane_z_mm", "note")
 _RIGID_TOL = 1e-6
 _COS30 = float(np.cos(np.deg2rad(30.0)))
+# How far behind the fixture's surface a part sample has to be before it counts as buried
+# rather than as cloud-level noise about a touching contact.
+_BURIED_TOL_MM = 0.2
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class StationDescription:
     transform_fixture: tuple[tuple[float, ...], ...] = IDENTITY_4X4
     tracker_position_mm: tuple[float, float, float] | None = None
     tracker_aim_mm: tuple[float, float, float] | None = None
+    mounting_plane_z_mm: float | None = None
     note: str = ""
     source: Path | None = None
 
@@ -70,6 +74,7 @@ class Station:
     base_cloud_mm: np.ndarray
     fixture_tree: cKDTree
     base_tree: cKDTree
+    fixture_cloud_normals_mm: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
     _obstacles: dict[str, Any] | None = field(default=None, init=False, repr=False,
                                               compare=False)
 
@@ -108,7 +113,14 @@ class Station:
                         self.base_cloud_mm[base_index])
 
     def check_alignment(self, **kwargs) -> dict:
-        """The self-checks of :func:`check_alignment`, bound to this station."""
+        """The self-checks of :func:`check_alignment`, bound to this station.
+
+        The mounting plane defaults to what the station file names, because the base's
+        own highest point is not it: a real base is a structure several hundred
+        millimetres tall, and the fixture can sit on a shelf well below its top.
+        """
+        if kwargs.get("base_plane_mm") is None and self.description.mounting_plane_z_mm:
+            kwargs["base_plane_mm"] = self.description.mounting_plane_z_mm
         return check_alignment(self, **kwargs)
 
 
@@ -157,6 +169,8 @@ def load_station_description(path: str | Path) -> StationDescription:
         transform_fixture=transforms["transform_fixture"],
         tracker_position_mm=_triple(body.get("tracker_position_mm")),
         tracker_aim_mm=_triple(body.get("tracker_aim_mm")),
+        mounting_plane_z_mm=(None if body.get("mounting_plane_z_mm") is None
+                             else float(body["mounting_plane_z_mm"])),
         note=str(body.get("note", "")),
         source=path,
     )
@@ -172,14 +186,15 @@ def load_station(description: StationDescription, *, cloud_seed: int,
                               read_transform(description.transform_fixture))
     base = _load_mesh(description.base, "base")
 
-    fixture_cloud = sample_surface_seeded(
-        fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)[0]
+    fixture_cloud, fixture_normals_cloud = sample_surface_seeded(
+        fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)
     base_cloud = sample_surface_seeded(
         base, _cloud_points(base, base_cloud_points), cloud_seed + 1)[0]
     return Station(
         part=part, fixture=fixture, base=base, description=description,
         fixture_cloud_mm=fixture_cloud, base_cloud_mm=base_cloud,
         fixture_tree=cKDTree(fixture_cloud), base_tree=cKDTree(base_cloud),
+        fixture_cloud_normals_mm=fixture_normals_cloud,
     )
 
 
@@ -200,6 +215,7 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
 
     base_plane = (float(station.base.bounds[1][2]) if base_plane_mm is None
                   else float(base_plane_mm))
+    base_plane_is_guessed = base_plane_mm is None
 
     fixture_tree = cKDTree(fixture_points)
     base_tree = cKDTree(base_points)
@@ -233,9 +249,12 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
 
     warnings = []
     if below:
+        hint = ("the station file names no mounting plane, so the base's own highest "
+                "point was used, which is not necessarily where the fixture sits"
+                if base_plane_is_guessed else "the station file's mounting plane is "
+                "probably too low")
         warnings.append(
-            f"the fixture dips below the mounting plane ({below} sampled points) - "
-            "the mounting plane is probably too low"
+            f"the fixture dips below the mounting plane ({below} sampled points) - {hint}"
         )
     if body_to_base < 0.25:
         warnings.append(
@@ -246,10 +265,17 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
         warnings.append("the fixture bounding box is not fully inside the base footprint")
     if part_to_base < plane_tol_mm:
         warnings.append(f"the part comes within {part_to_base:.2f} mm of the base")
-    if part_to_fixture < max(0.25, touch):
+
+    # Interpenetration, decided the only way that works on point clouds: a surface that
+    # passes THROUGH another puts samples on the far side of that other surface. A plain
+    # distance test cannot tell a hairline gap (which a stamped part resting on its
+    # supports legitimately has) from a part buried in the fixture, because both leave a
+    # small positive minimum distance.
+    buried, depth = _buried_below(station, fixture_points, part_points, fixture_tree, touch)
+    if buried:
         warnings.append(
-            f"the part and the fixture come within {part_to_fixture:.2f} mm of each "
-            f"other, below the {touch:.2f} mm the clouds can resolve - possible interference"
+            f"the part lies INSIDE the fixture at {buried} sampled points, up to "
+            f"{depth:.2f} mm deep - the frame or the transform is wrong"
         )
 
     return {
@@ -266,6 +292,9 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
         "fixture_footprint_fits_on_base": inside,
         "touch_tolerance_mm": round(touch, 3),
         "mounting_plane_z_mm": round(base_plane, 3),
+        "mounting_plane_from_station_file": not base_plane_is_guessed,
+        "part_points_inside_fixture": buried,
+        "deepest_part_point_inside_fixture_mm": round(depth, 3),
         "point_counts": {
             "part": int(len(part_points)),
             "fixture": int(len(fixture_points)),
@@ -312,6 +341,42 @@ def _cloud_spacing(points: np.ndarray) -> float:
         return 0.0
     distances = cKDTree(points).query(points, k=2)[0][:, 1]
     return float(np.median(distances))
+
+
+def _buried_below(station: Station, fixture_points: np.ndarray, part_points: np.ndarray,
+                  fixture_tree: cKDTree, touch_mm: float,
+                  neighbours: int = 8) -> tuple[int, float]:
+    """How many part samples lie behind the fixture's own surface, and how deep.
+
+    A part with a hairline gap has all of its nearby samples on the OUTWARD side of the
+    fixture surface; a part that is buried has samples behind it. Uses the fixture's face
+    normals, so it needs no containment query - which on a CAD patchwork mesh is both slow
+    and unreliable.
+
+    The test asks whether a sample is behind EVERY nearby surface, not merely the single
+    closest one: near a convex edge the nearest sample can sit on the perpendicular wall,
+    and a point legitimately above the top face is then "behind" that wall's plane. Taking
+    the minimum over the nearest few samples removes that ambiguity.
+    """
+    if len(station.fixture_cloud_normals_mm) != len(fixture_points):
+        return 0, 0.0
+    count = min(neighbours, max(1, len(fixture_points)))
+    distance, nearest = fixture_tree.query(part_points, k=count)
+    nearest = np.atleast_2d(nearest)
+    distance = np.atleast_2d(distance)
+    close = distance[:, 0] < max(touch_mm, 0.25)
+    if not close.any():
+        return 0, 0.0
+
+    points = part_points[close]
+    rows = nearest[close]
+    offset = points[:, None, :] - fixture_points[rows]
+    depth = -(offset * station.fixture_cloud_normals_mm[rows]).sum(axis=2)
+    shallowest = depth.min(axis=1)
+    buried = shallowest > _BURIED_TOL_MM
+    if not buried.any():
+        return 0, 0.0
+    return int(buried.sum()), float(depth[buried].max())
 
 
 def _orientation_shares(mesh) -> dict[str, float]:
