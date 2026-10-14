@@ -14,7 +14,6 @@ footprint inside the base.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,6 +22,7 @@ import numpy as np
 import trimesh
 from scipy.spatial import cKDTree
 
+from .config import read_json
 from .geometry import sample_surface_seeded
 from .raycast import RayCaster
 
@@ -132,8 +132,7 @@ def read_transform(values) -> np.ndarray:
 def load_station_description(path: str | Path) -> StationDescription:
     """Read a station file. Model paths resolve against the file, not the CWD."""
     path = Path(path).resolve()
-    with open(path, encoding="utf-8") as handle:
-        body = json.load(handle)
+    body = read_json(path)
 
     unknown = sorted(k for k in body if k not in _MODEL_KEYS + _OPTIONAL_KEYS
                      and not k.startswith("_"))
