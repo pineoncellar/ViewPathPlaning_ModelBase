@@ -1,0 +1,15 @@
+# Line endings.
+#
+# Normalise to LF inside the repository and check every text file out with LF on
+# every platform.  This tree mixes the two flavours - part of it was authored on
+# Windows - so without an explicit policy a file reports as fully rewritten
+# (every line "changed") the moment the working copy is touched and core.autocrlf
+# differs from the machine that committed it.
+* text=auto eol=lf
+
+# Images are binary: never normalise them, and keep them out of diffs.
+*.png binary
+
+# *.stl is deliberately not listed above.  text=auto already recognises the
+# binary meshes by their NUL bytes, and samples/sim env/meshes/03_cogwheel.stl is
+# an ASCII STL that belongs under the eol policy like any other text file.
