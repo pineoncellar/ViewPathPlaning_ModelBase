@@ -9,10 +9,15 @@ Planned shape (subcommands):
     scanplan ls   --viewpoints output/<part>/viewpoints.json
                   --prog-name PART01 --out output/<part>/
 
-`plan` and the `.LS` export are separate on purpose: the ROBOGUIDE frame
-contract (which UFRAME, and where its origin sits) is agreed with the workshop
-and may need re-exporting without re-running the planner - so `ls` reads the
-viewpoint file and never touches the meshes.
+    scanplan view --viewpoints output/<part>/viewpoints.json
+                  --station input/<station>.json --out output/<part>/
+
+`plan` and the exports are separate on purpose: the ROBOGUIDE frame contract
+(which UFRAME, and where its origin sits) is agreed with the workshop and may
+need re-exporting without re-running the planner - so `ls` reads the viewpoint
+file and never touches the meshes. `view` is the same idea for the picture: it
+re-renders the 3D view from an existing viewpoint file, so a reviewer can look
+again without paying for a plan.
 """
 
 from __future__ import annotations
@@ -24,11 +29,17 @@ from pathlib import Path
 
 import numpy as np
 
+from scanview import DEFAULT_MAX_FACES, VIEWER_FILE_NAME, render_run
+
 from .config import FACES, load_config, read_json
 from .raycast import backend_name
 from .report import summary_lines
 from .roboguide.adapt import export as export_ls
-from .scene import StationDescription, load_station, load_station_description
+from .scene import (
+    StationDescription,
+    load_station,
+    load_station_description,
+)
 from .tracker import (
     Tracker,
     part_centroid,
@@ -39,14 +50,16 @@ from .tracker import (
 
 
 def main(argv: list[str] | None = None) -> int:
-    """`scanplan plan` and `scanplan ls`."""
+    """`scanplan plan`, `scanplan ls` and `scanplan view`."""
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "plan":
         return _run_plan(args, parser)
     if args.command == "ls":
         return _run_ls(args, parser)
-    parser.error("a subcommand is required: plan or ls")
+    if args.command == "view":
+        return _run_view(args, parser)
+    parser.error("a subcommand is required: plan, ls or view")
     return 2
 
 
@@ -68,6 +81,10 @@ def _build_parser() -> argparse.ArgumentParser:
     planner.add_argument("--tracker-sweep", action="store_true",
                          help="report the spread over the 192 candidate placements")
     planner.add_argument("--out", default="output", help="output directory")
+    planner.add_argument("--no-3d", action="store_true",
+                         help="skip the 3D view (the rest of the outputs are unaffected)")
+    planner.add_argument("--max-faces", type=int, default=DEFAULT_MAX_FACES,
+                         help="display budget per model in the 3D view")
     planner.add_argument("--quiet", action="store_true", help="only the summary")
 
     exporter = subparsers.add_parser(
@@ -83,6 +100,18 @@ def _build_parser() -> argparse.ArgumentParser:
     exporter.add_argument("--motion", default="J", choices=["J", "L"],
                           help="J is the permissive default for a reachability review")
     exporter.add_argument("--speed", default="100%")
+
+    viewer = subparsers.add_parser(
+        "view", help="write a self-contained 3D view of the station and its viewpoints")
+    viewer.add_argument("--viewpoints", required=True, help="viewpoints.json")
+    viewer.add_argument("--station", help="station JSON (paths, transforms, tracker)")
+    viewer.add_argument("--part", help="part mesh, if no --station is given")
+    viewer.add_argument("--fixture", help="fixture mesh, if no --station is given")
+    viewer.add_argument("--base", help="base mesh, if no --station is given")
+    viewer.add_argument("--config", help="configuration override (JSON), for the FOV cone")
+    viewer.add_argument("--max-faces", type=int, default=DEFAULT_MAX_FACES,
+                        help="display budget per model (models above it are decimated)")
+    viewer.add_argument("--out", default="output", help="output directory")
     return parser
 
 
@@ -114,11 +143,15 @@ def _run_plan(args, parser: argparse.ArgumentParser) -> int:
         parser.error(str(error))
         return 2
 
-    paths = write_outputs(result, args.out)
+    paths = write_outputs(result, args.out, write_3d=not args.no_3d,
+                          max_faces=args.max_faces)
     print()
     print("\n".join(summary_lines(result.report)))
     print()
     print(f"wrote {len(paths)} files to {Path(args.out).resolve()}")
+    if VIEWER_FILE_NAME in paths:
+        print(f"3D view: open {paths[VIEWER_FILE_NAME].resolve()} in a browser "
+              "(no network needed)")
     print("next: scanplan ls --viewpoints viewpoints.json --prog-name <NAME> --out <dir>")
     return 0
 
@@ -193,6 +226,22 @@ def _report_tracker_sweep(station, cfg, say) -> None:
     say("  a badly placed tracker costs coverage rather than blocking the work, so this "
         "is a mounting requirement: look ALONG the part's thin axis, not square on to "
         "its large faces (design 6.7.4)")
+
+
+def _run_view(args, parser: argparse.ArgumentParser) -> int:
+    # Everything the page needs -- station loading, the sample sidecar, the tracker
+    # pose -- lives in `scanview.render_run`; the CLI only maps flags onto it.
+    try:
+        path = render_run(args.viewpoints, args.out, config=args.config,
+                          station=args.station, part=args.part, fixture=args.fixture,
+                          base=args.base, max_faces=args.max_faces)
+    except (ValueError, OSError, KeyError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+        return 2
+
+    print(f"wrote {path.resolve()}")
+    print("open it in a browser: it needs no network and no Python")
+    return 0
 
 
 def _run_ls(args, parser: argparse.ArgumentParser) -> int:

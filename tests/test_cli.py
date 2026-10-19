@@ -70,6 +70,7 @@ def test_plan_writes_the_outputs_and_returns_zero(cli_station, tmp_path):
     assert code == 0
     assert (tmp_path / "viewpoints.json").exists()
     assert (tmp_path / "coverage_report.json").exists()
+    assert (tmp_path / "viewpoints_3d.html").exists()
     assert (tmp_path / "summary.txt").read_text(encoding="utf-8")
 
 
@@ -105,6 +106,22 @@ def test_ls_accepts_a_placement_and_switches_to_uframe_zero(tmp_path, viewpoints
     assert main(["ls", "--viewpoints", str(viewpoints_json), "--prog-name", "PLACED",
                  "--place", "0,0,0,0,0,0", "--out", str(tmp_path)]) == 0
     assert "UFRAME_NUM=0" in (tmp_path / "PLACED.LS").read_text(encoding="utf-8")
+
+
+def test_view_rerenders_an_existing_run_without_planning(cli_station, viewpoints_json,
+                                                         tmp_path):
+    code = main(["view", "--viewpoints", str(viewpoints_json),
+                 "--station", str(cli_station / "station.json"), "--out", str(tmp_path)])
+    assert code == 0
+    page = (tmp_path / "viewpoints_3d.html").read_text(encoding="utf-8")
+    assert 'id="scene-data"' in page
+    assert "http://" not in page and "https://" not in page
+
+
+def test_view_needs_a_viewpoint_file(tmp_path):
+    with pytest.raises(SystemExit) as caught:
+        main(["view", "--viewpoints", str(tmp_path / "nope.json"), "--out", str(tmp_path)])
+    assert caught.value.code == 2
 
 
 def test_a_bad_program_name_is_a_usage_error(tmp_path, viewpoints_json, capsys):

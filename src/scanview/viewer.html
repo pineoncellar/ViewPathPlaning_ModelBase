@@ -1,0 +1,1016 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0f14;
+    color: #e6edf3; font-family: "Segoe UI", "Microsoft YaHei", -apple-system, sans-serif; }
+  #view { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  #view.dragging { cursor: grabbing; }
+  .panel { position: absolute; background: rgba(20, 26, 34, .88); border: 1px solid #2b3440;
+    border-radius: 9px; box-shadow: 0 6px 24px rgba(0, 0, 0, .35); font-size: 12px; }
+  #hud { top: 14px; left: 14px; padding: 11px 13px; min-width: 210px; max-width: 330px; }
+  #hud h1 { margin: 0 0 8px; font-size: 13px; font-weight: 600; letter-spacing: .2px; }
+  #stats { display: grid; grid-template-columns: auto auto; gap: 2px 18px; }
+  #stats span { color: #8b98a8; }
+  #stats b { justify-self: end; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #tools { top: 14px; right: 14px; padding: 10px 12px; width: 184px; }
+  #tools h2 { margin: 0 0 6px; font-size: 11px; font-weight: 600; color: #8b98a8;
+    text-transform: uppercase; letter-spacing: .6px; }
+  #tools label { display: flex; align-items: center; gap: 7px; padding: 2px 0;
+    color: #c9d3de; cursor: pointer; user-select: none; }
+  #tools input { accent-color: #3b82f6; margin: 0; }
+  #tools select { margin-left: auto; background: #1c2530; color: #c9d3de; border: 1px solid #2b3440;
+    border-radius: 5px; font-family: inherit; font-size: 11px; padding: 1px 3px; }
+  #tools .note { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2b3440;
+    color: #78838f; line-height: 1.6; font-size: 11px; }
+  .btnrow { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px;
+    padding-top: 9px; border-top: 1px solid #2b3440; }
+  button { background: #1c2530; color: #c9d3de; border: 1px solid #2b3440; border-radius: 6px;
+    padding: 4px 9px; font-size: 11px; font-family: inherit; cursor: pointer; }
+  button:hover { background: #263241; color: #fff; }
+  #info { right: 14px; bottom: 14px; width: 306px; padding: 11px 13px; display: none; }
+  #info h2 { margin: 0 0 7px; font-size: 12px; color: #6cb6ff; }
+  #info table { width: 100%; border-collapse: collapse; }
+  #info td { padding: 1px 0; color: #8b98a8; vertical-align: top; }
+  #info td:last-child { text-align: right; color: #e6edf3;
+    font-variant-numeric: tabular-nums; }
+  #info .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px;
+    padding-top: 8px; border-top: 1px solid #2b3440; }
+  #info .chips button { padding: 2px 7px; }
+  #info .note { color: #78838f; line-height: 1.6; margin-top: 6px; }
+  #legend { left: 14px; bottom: 14px; padding: 8px 12px; color: #97a3b2; line-height: 1.8; }
+  .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+    margin-right: 6px; vertical-align: -1px; }
+  #hint { left: 50%; bottom: 14px; transform: translateX(-50%); padding: 5px 13px;
+    color: #7c8794; white-space: nowrap; }
+  #error { position: absolute; inset: 0; display: none; place-items: center; padding: 40px;
+    text-align: center; line-height: 1.7; color: #e3b341; font-size: 13px; }
+  @media (max-width: 760px) {
+    #legend, #hint { display: none; }
+    #tools { width: 150px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="error"></div>
+
+<div id="hud" class="panel">
+  <h1 id="title"></h1>
+  <div id="stats"></div>
+</div>
+
+<div id="tools" class="panel">
+  <h2>显示</h2>
+  <label><input type="checkbox" id="show-part" checked> 零件</label>
+  <label><input type="checkbox" id="show-fixture" checked> 夹具</label>
+  <label><input type="checkbox" id="show-base" checked> 底座</label>
+  <label><input type="checkbox" id="show-viewpoints" checked> 视点位置</label>
+  <label>视场锥
+    <select id="fov-mode">
+      <option value="selected">仅选中</option>
+      <option value="all">全部</option>
+      <option value="off">关闭</option>
+    </select>
+  </label>
+  <label>采样点
+    <select id="sample-mode">
+      <option value="all">全部</option>
+      <option value="selected">仅选中视点</option>
+      <option value="uncovered">仅未覆盖</option>
+      <option value="off">关闭</option>
+    </select>
+  </label>
+  <div class="note">单击一个视点（绿/橙方块）看它的视场：参考点 → 光轴 → 工作距离处的矩形视场。
+    单击零件上的采样点，可以看哪些视点能扫到它。</div>
+  <div class="btnrow">
+    <button id="btn-fit">适配</button>
+    <button id="btn-iso">等轴</button>
+    <button id="btn-top">俯视</button>
+    <button id="btn-front">前视</button>
+  </div>
+</div>
+
+<div id="info" class="panel">
+  <h2 id="info-title"></h2>
+  <table id="info-body"></table>
+  <div id="info-extra"></div>
+</div>
+
+<div id="legend" class="panel">
+  <div><span class="sw" style="background:#88a8c8"></span>零件</div>
+  <div><span class="sw" style="background:#c2ae86"></span>夹具 / 底座</div>
+  <div><span class="sw" style="background:#2ecf74"></span>视点（跟踪器可见）</div>
+  <div><span class="sw" style="background:#f0a03a"></span>视点（跟踪器不可见）</div>
+  <div><span class="sw" style="background:#f07ae8"></span>当前选中视点及其视场</div>
+  <div><span class="sw" style="background:#8fa3a0"></span>全部视点的视场矩形</div>
+  <div><span class="sw" style="background:#2ecf74"></span>已覆盖采样</div>
+  <div><span class="sw" style="background:#e5484d"></span>未覆盖采样</div>
+  <div><span class="sw" style="background:#4ddcf0"></span>选中视点扫到的采样 / 能扫到所选采样的视点</div>
+</div>
+
+<div id="hint" class="panel">左键拖动旋转 · 滚轮缩放 · 右键或 Shift 拖动平移 · 单击视点看它的视场锥</div>
+
+<script id="scene-data" type="application/json">__SCENE_JSON__</script>
+<script>
+(function () {
+  "use strict";
+
+  var DATA = JSON.parse(document.getElementById("scene-data").textContent);
+  var canvas = document.getElementById("view");
+  var gl = canvas.getContext("webgl", { antialias: true, alpha: false })
+        || canvas.getContext("experimental-webgl", { antialias: true, alpha: false });
+
+  function fail(message) {
+    var box = document.getElementById("error");
+    box.textContent = message;
+    box.style.display = "grid";
+    canvas.style.display = "none";
+    document.getElementById("hud").style.display = "none";
+  }
+
+  if (!gl) {
+    fail("这个浏览器没有可用的 WebGL，无法显示 3D 视图。请用较新的 Chrome、Edge 或 Firefox 打开本文件。");
+    return;
+  }
+
+  var FOV = 45 * Math.PI / 180;
+  var COLORS = {
+    part: [0.53, 0.66, 0.78],
+    fixture: [0.76, 0.68, 0.52],
+    base: [0.40, 0.43, 0.48],
+    viewpointOk: [0.18, 0.81, 0.45],
+    viewpointBad: [0.94, 0.63, 0.23],
+    selected: [0.94, 0.48, 0.91],
+    footprintAll: [0.56, 0.64, 0.63],
+    sampleSelected: [0.30, 0.86, 1.00],
+    samplePicked: [1.00, 0.86, 0.30],
+    covered: [0.18, 0.78, 0.44],
+    uncovered: [0.90, 0.28, 0.30],
+    tracker: [0.30, 0.60, 1.00]
+  };
+
+  /* ---------- buffers ---------- */
+
+  var uintIndices = gl.getExtension("OES_element_index_uint");
+
+  function decode(base64, Type) {
+    var raw = atob(base64);
+    var bytes = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    return new Type(bytes.buffer);
+  }
+
+  function upload(target, data) {
+    var handle = gl.createBuffer();
+    gl.bindBuffer(target, handle);
+    gl.bufferData(target, data, gl.STATIC_DRAW);
+    return handle;
+  }
+
+  function toFloats(values) {
+    return new Float32Array(values);
+  }
+
+  var needsUint = Object.keys(DATA.meshes).some(function (name) {
+    return DATA.meshes[name].indexType === "uint32";
+  });
+  if (needsUint && !uintIndices) {
+    fail("这个浏览器不支持 32 位顶点索引，模型太大无法显示。请用较新的 Chrome、Edge 或 Firefox 打开。");
+    return;
+  }
+
+  var meshes = {};
+  Object.keys(DATA.meshes).forEach(function (name) {
+    var record = DATA.meshes[name];
+    meshes[name] = {
+      pos: upload(gl.ARRAY_BUFFER, decode(record.pos, Float32Array)),
+      nrm: upload(gl.ARRAY_BUFFER, decode(record.nrm, Int8Array)),
+      idx: upload(gl.ELEMENT_ARRAY_BUFFER,
+                  decode(record.idx, record.indexType === "uint32" ? Uint32Array : Uint16Array)),
+      count: record.faces * 3,
+      type: record.indexType === "uint32" ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT
+    };
+  });
+
+  var MESH_STYLE = {
+    part: { color: COLORS.part, toggle: "show-part" },
+    fixture: { color: COLORS.fixture, toggle: "show-fixture" },
+    base: { color: COLORS.base, toggle: "show-base" }
+  };
+  var MESH_ORDER = ["base", "fixture", "part"];
+
+  var VP = DATA.viewpoints || [];
+  var vpSegments = [];
+  var footprints = [];
+  var okPoints = [], badPoints = [];
+
+  function pushSegment(out, a, b) {
+    out.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+  }
+
+  VP.forEach(function (v) {
+    var segments = [];
+    pushSegment(segments, v.position, v.aim);
+    var corners = v.corners || [];
+    for (var i = 0; i < corners.length; i++) {
+      pushSegment(segments, v.aim, corners[i]);
+      // The footprint outline is kept separately as well: with a hundred poses on
+      // screen, the rectangles alone stay readable while the full cones do not.
+      pushSegment(footprints, corners[i], corners[(i + 1) % corners.length]);
+    }
+    for (var j = 0; j < corners.length; j++) {
+      pushSegment(segments, corners[j], corners[(j + 1) % corners.length]);
+    }
+    vpSegments.push(new Float32Array(segments));
+    var points = v.tracker_ok ? okPoints : badPoints;
+    points.push(v.position[0], v.position[1], v.position[2]);
+  });
+
+  var footprintBuffer = upload(gl.ARRAY_BUFFER, toFloats(footprints));
+  var okPointBuffer = upload(gl.ARRAY_BUFFER, toFloats(okPoints));
+  var badPointBuffer = upload(gl.ARRAY_BUFFER, toFloats(badPoints));
+  var selectedBuffer = gl.createBuffer();
+  var selectedPointBuffer = gl.createBuffer();
+  var selectedQuadBuffer = gl.createBuffer();
+
+  var target = DATA.target || null;
+  var samplePositions = null, sampleCount = 0;
+  var sampleCovered = null, sampleMask = null, sampleStride = 0;
+  var coveredIdx = [], uncoveredIdx = [], selectedSampleIdx = [];
+  var coveredBuffer = null, uncoveredBuffer = null;
+  var selectedSamplesBuffer = gl.createBuffer();
+  var pickedSample = -1;
+  var pickedSampleBuffer = gl.createBuffer();
+  var viewersBuffer = gl.createBuffer();
+  var viewerColumns = [];
+
+  function positionsOf(indices) {
+    var out = new Float32Array(indices.length * 3);
+    for (var k = 0; k < indices.length; k++) {
+      var i = indices[k] * 3;
+      out[k * 3] = samplePositions[i];
+      out[k * 3 + 1] = samplePositions[i + 1];
+      out[k * 3 + 2] = samplePositions[i + 2];
+    }
+    return out;
+  }
+
+  if (target && target.points) {
+    samplePositions = decode(target.points, Float32Array);
+    sampleCount = Math.floor(samplePositions.length / 3);
+    sampleCovered = decode(target.covered, Uint8Array);
+    if (target.mask && target.stride) {
+      sampleMask = decode(target.mask, Uint8Array);
+      sampleStride = target.stride;
+    }
+    for (var s = 0; s < sampleCount; s++) {
+      (sampleCovered[s] ? coveredIdx : uncoveredIdx).push(s);
+    }
+    if (coveredIdx.length) {
+      coveredBuffer = upload(gl.ARRAY_BUFFER, positionsOf(coveredIdx));
+    }
+    if (uncoveredIdx.length) {
+      uncoveredBuffer = upload(gl.ARRAY_BUFFER, positionsOf(uncoveredIdx));
+    }
+  }
+
+  var tracker = DATA.tracker;
+  var trackerLineBuffer = null, trackerPointBuffer = null;
+  if (tracker && tracker.position) {
+    var tseg = [];
+    if (tracker.aim) {
+      pushSegment(tseg, tracker.position, tracker.aim);
+      trackerLineBuffer = upload(gl.ARRAY_BUFFER, toFloats(tseg));
+    }
+    trackerPointBuffer = upload(gl.ARRAY_BUFFER, toFloats(tracker.position));
+  }
+
+  function sampleViewers(index) {
+    var out = [];
+    if (!sampleMask || sampleStride <= 0 || index < 0) return out;
+    var row = index * sampleStride;
+    for (var column = 0; column < VP.length; column++) {
+      if (sampleMask[row + (column >> 3)] & (1 << (column & 7))) out.push(column);
+    }
+    return out;
+  }
+
+  function rebuildSelectedSamples() {
+    selectedSampleIdx = [];
+    if (!sampleMask || selected < 0) return;
+    var byte = selected >> 3, bit = 1 << (selected & 7);
+    for (var i = 0; i < sampleCount; i++) {
+      if (sampleMask[i * sampleStride + byte] & bit) selectedSampleIdx.push(i);
+    }
+    if (selectedSampleIdx.length) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, selectedSamplesBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, positionsOf(selectedSampleIdx), gl.STATIC_DRAW);
+    }
+  }
+
+  function highlightSample(index) {
+    pickedSample = index;
+    viewerColumns = sampleViewers(index);
+    if (index >= 0) {
+      var p = index * 3;
+      gl.bindBuffer(gl.ARRAY_BUFFER, pickedSampleBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER,
+                    new Float32Array([samplePositions[p], samplePositions[p + 1],
+                                      samplePositions[p + 2]]), gl.STATIC_DRAW);
+    }
+    if (viewerColumns.length) {
+      var points = [];
+      viewerColumns.forEach(function (column) {
+        var v = VP[column];
+        points.push(v.position[0], v.position[1], v.position[2]);
+      });
+      gl.bindBuffer(gl.ARRAY_BUFFER, viewersBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, toFloats(points), gl.STATIC_DRAW);
+    }
+  }
+
+  /* ---------- shaders ---------- */
+
+  function compile(type, source) {
+    var shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || "着色器编译失败");
+    }
+    return shader;
+  }
+
+  function link(vertexSource, fragmentSource) {
+    var program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexSource));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragmentSource));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || "着色器链接失败");
+    }
+    return program;
+  }
+
+  var meshProgram, flatProgram;
+  try {
+    meshProgram = link([
+      "attribute vec3 aPos;",
+      "attribute vec3 aNrm;",
+      "uniform mat4 uProj;",
+      "uniform mat4 uView;",
+      "uniform mat3 uNormal;",
+      "varying vec3 vNrm;",
+      "void main() {",
+      "  vNrm = uNormal * aNrm;",
+      "  gl_Position = uProj * (uView * vec4(aPos, 1.0));",
+      "}"
+    ].join("\n"), [
+      "precision mediump float;",
+      "varying vec3 vNrm;",
+      "uniform vec3 uColor;",
+      "void main() {",
+      "  vec3 n = normalize(vNrm);",
+      "  if (!gl_FrontFacing) n = -n;",
+      "  vec3 light = normalize(vec3(0.35, 0.55, 1.0));",
+      "  float diffuse = max(dot(n, light), 0.0);",
+      "  float rim = pow(1.0 - abs(n.z), 2.0) * 0.16;",
+      "  gl_FragColor = vec4(uColor * (0.34 + 0.66 * diffuse) + vec3(rim), 1.0);",
+      "}"
+    ].join("\n"));
+
+    flatProgram = link([
+      "attribute vec3 aPos;",
+      "uniform mat4 uProj;",
+      "uniform mat4 uView;",
+      "uniform float uSize;",
+      "uniform float uShift;",
+      "void main() {",
+      "  vec4 view = uView * vec4(aPos, 1.0);",
+      "  view.z += uShift;",
+      "  gl_Position = uProj * view;",
+      "  gl_PointSize = uSize;",
+      "}"
+    ].join("\n"), [
+      "precision mediump float;",
+      "uniform vec3 uColor;",
+      "uniform float uAlpha;",
+      "void main() { gl_FragColor = vec4(uColor, uAlpha); }"
+    ].join("\n"));
+  } catch (error) {
+    fail("无法初始化 3D 渲染器：" + error.message);
+    return;
+  }
+
+  var meshLoc = {
+    pos: gl.getAttribLocation(meshProgram, "aPos"),
+    nrm: gl.getAttribLocation(meshProgram, "aNrm"),
+    proj: gl.getUniformLocation(meshProgram, "uProj"),
+    view: gl.getUniformLocation(meshProgram, "uView"),
+    normal: gl.getUniformLocation(meshProgram, "uNormal"),
+    color: gl.getUniformLocation(meshProgram, "uColor")
+  };
+  var flatLoc = {
+    pos: gl.getAttribLocation(flatProgram, "aPos"),
+    proj: gl.getUniformLocation(flatProgram, "uProj"),
+    view: gl.getUniformLocation(flatProgram, "uView"),
+    size: gl.getUniformLocation(flatProgram, "uSize"),
+    shift: gl.getUniformLocation(flatProgram, "uShift"),
+    color: gl.getUniformLocation(flatProgram, "uColor"),
+    alpha: gl.getUniformLocation(flatProgram, "uAlpha")
+  };
+
+  /* ---------- camera ---------- */
+
+  var FIT = DATA.fit;
+  var center = FIT.center.slice();
+  var radius = Math.max(FIT.radius, 1);
+  var distance = radius * 2.6;
+  var yaw = -Math.PI / 3;
+  var pitch = Math.PI / 6;
+  var yawHome = yaw, pitchHome = pitch, distanceHome = distance, centerHome = center.slice();
+  var selected = -1;
+  var drag = null;
+  var framePending = false;
+  var framesDrawn = 0;
+  var lastHover = 0;
+
+  function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+  function add(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+  function scale(a, s) { return [a[0] * s, a[1] * s, a[2] * s]; }
+  function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+  function cross(a, b) {
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]];
+  }
+  function unit(a) {
+    var n = Math.hypot(a[0], a[1], a[2]) || 1;
+    return [a[0] / n, a[1] / n, a[2] / n];
+  }
+  function clamp(value, low, high) { return Math.min(Math.max(value, low), high); }
+
+  function camera() {
+    var cp = Math.cos(pitch);
+    var eye = [
+      center[0] + distance * cp * Math.cos(yaw),
+      center[1] + distance * cp * Math.sin(yaw),
+      center[2] + distance * Math.sin(pitch)
+    ];
+    var forward = unit(sub(center, eye));
+    var right = unit(cross(forward, [0, 0, 1]));
+    var up = cross(right, forward);
+    return { eye: eye, forward: forward, right: right, up: up };
+  }
+
+  function lookAt(eye, target, up) {
+    var z = unit(sub(eye, target));
+    var x = unit(cross(up, z));
+    var y = cross(z, x);
+    return new Float32Array([
+      x[0], y[0], z[0], 0,
+      x[1], y[1], z[1], 0,
+      x[2], y[2], z[2], 0,
+      -dot(x, eye), -dot(y, eye), -dot(z, eye), 1
+    ]);
+  }
+
+  function perspective(fovy, aspect, near, far) {
+    var f = 1 / Math.tan(fovy / 2);
+    var nf = 1 / (near - far);
+    return new Float32Array([
+      f / aspect, 0, 0, 0,
+      0, f, 0, 0,
+      0, 0, (far + near) * nf, -1,
+      0, 0, 2 * far * near * nf, 0
+    ]);
+  }
+
+  /* ---------- drawing ---------- */
+
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    var height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    return dpr;
+  }
+
+  function drawMesh(name, style) {
+    var mesh = meshes[name];
+    if (!mesh || !style) return;
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.pos);
+    gl.vertexAttribPointer(meshLoc.pos, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.nrm);
+    gl.vertexAttribPointer(meshLoc.nrm, 3, gl.BYTE, true, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.idx);
+    gl.uniform3fv(meshLoc.color, style);
+    gl.drawElements(gl.TRIANGLES, mesh.count, mesh.type, 0);
+  }
+
+  function drawFlat(buffer, mode, count, color, size, shift, alpha) {
+    if (!buffer || count <= 0) return;
+    if (alpha === undefined) alpha = 1.0;
+    if (alpha < 1.0) {
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    } else {
+      gl.disable(gl.BLEND);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.vertexAttribPointer(flatLoc.pos, 3, gl.FLOAT, false, 0, 0);
+    gl.uniform3fv(flatLoc.color, color);
+    gl.uniform1f(flatLoc.size, size);
+    gl.uniform1f(flatLoc.shift, shift);
+    gl.uniform1f(flatLoc.alpha, alpha);
+    gl.drawArrays(mode, 0, count);
+  }
+
+  function render() {
+    framesDrawn += 1;
+    var dpr = resize();
+    var cam = camera();
+    var view = lookAt(cam.eye, center, [0, 0, 1]);
+    var near = Math.max(distance * 0.002, 0.05);
+    var far = Math.max(distance + radius * 8, radius * 12);
+    var projection = perspective(FOV, canvas.width / Math.max(canvas.height, 1), near, far);
+    var normalMatrix = new Float32Array([
+      view[0], view[1], view[2],
+      view[4], view[5], view[6],
+      view[8], view[9], view[10]
+    ]);
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0.043, 0.059, 0.078, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.disable(gl.CULL_FACE);
+    gl.disable(gl.BLEND);
+
+    gl.useProgram(meshProgram);
+    gl.uniformMatrix4fv(meshLoc.proj, false, projection);
+    gl.uniformMatrix4fv(meshLoc.view, false, view);
+    gl.uniformMatrix3fv(meshLoc.normal, false, normalMatrix);
+    gl.enableVertexAttribArray(meshLoc.pos);
+    gl.enableVertexAttribArray(meshLoc.nrm);
+    MESH_ORDER.forEach(function (name) {
+      var checkbox = document.getElementById(MESH_STYLE[name].toggle);
+      if (checkbox && checkbox.checked) drawMesh(name, MESH_STYLE[name].color);
+    });
+
+    gl.useProgram(flatProgram);
+    gl.uniformMatrix4fv(flatLoc.proj, false, projection);
+    gl.uniformMatrix4fv(flatLoc.view, false, view);
+    gl.enableVertexAttribArray(flatLoc.pos);
+    if (meshLoc.nrm >= 0 && meshLoc.nrm !== flatLoc.pos) gl.disableVertexAttribArray(meshLoc.nrm);
+
+    var shift = radius * 0.004;
+    var pointSize = Math.max(3, Math.round(4 * dpr));
+    var viewpointSize = Math.max(6, Math.round(8 * dpr));
+
+    var sampleMode = document.getElementById("sample-mode").value;
+    if (target) {
+      if (sampleMode === "all") {
+        drawFlat(coveredBuffer, gl.POINTS, coveredIdx.length, COLORS.covered, pointSize, shift);
+        drawFlat(uncoveredBuffer, gl.POINTS, uncoveredIdx.length, COLORS.uncovered,
+                 pointSize * 1.25, shift);
+      } else if (sampleMode === "uncovered") {
+        drawFlat(uncoveredBuffer, gl.POINTS, uncoveredIdx.length, COLORS.uncovered,
+                 pointSize * 1.25, shift);
+      } else if (sampleMode === "selected") {
+        drawFlat(selectedSamplesBuffer, gl.POINTS, selectedSampleIdx.length,
+                 COLORS.sampleSelected, pointSize * 1.2, shift);
+      }
+    }
+
+    var fovMode = document.getElementById("fov-mode").value;
+    if (fovMode === "all") {
+      drawFlat(footprintBuffer, gl.LINES, footprints.length / 3, COLORS.footprintAll,
+               1, shift * 2, 0.3);
+    }
+
+    if (document.getElementById("show-viewpoints").checked) {
+      drawFlat(okPointBuffer, gl.POINTS, okPoints.length / 3, COLORS.viewpointOk,
+               viewpointSize, shift * 3);
+      drawFlat(badPointBuffer, gl.POINTS, badPoints.length / 3, COLORS.viewpointBad,
+               viewpointSize, shift * 3);
+    }
+
+    if (tracker) {
+      if (trackerLineBuffer) {
+        drawFlat(trackerLineBuffer, gl.LINES, 2, COLORS.tracker, 1, shift * 2);
+      }
+      drawFlat(trackerPointBuffer, gl.POINTS, 1, COLORS.tracker, viewpointSize * 1.6, shift * 3);
+    }
+
+    if (selected >= 0 && vpSegments[selected] && fovMode !== "off") {
+      // The selected cone is drawn without depth testing, so it stays legible even
+      // when the scanner sits behind the fixture or under the part.
+      gl.disable(gl.DEPTH_TEST);
+      drawFlat(selectedQuadBuffer, gl.TRIANGLES, 6, COLORS.selected, 1, 0, 0.18);
+      drawFlat(selectedBuffer, gl.LINES, vpSegments[selected].length / 3, COLORS.selected,
+               1, 0, 0.95);
+      drawFlat(selectedPointBuffer, gl.POINTS, 1, COLORS.selected, viewpointSize * 1.4, 0);
+      gl.enable(gl.DEPTH_TEST);
+    }
+
+    if (pickedSample >= 0) {
+      gl.disable(gl.DEPTH_TEST);
+      if (viewerColumns.length) {
+        drawFlat(viewersBuffer, gl.POINTS, viewerColumns.length, COLORS.sampleSelected,
+                 viewpointSize * 1.3, 0);
+      }
+      drawFlat(pickedSampleBuffer, gl.POINTS, 1, COLORS.samplePicked, pointSize * 2.2, 0);
+      gl.enable(gl.DEPTH_TEST);
+    }
+  }
+
+  // `framePending` must start false: it is set here and cleared by the frame that
+  // consumes it, so a stale `true` makes every redraw request a no-op - which looks
+  // exactly like a frozen page that only repaints on the next direct `render()`.
+  function requestRender() {
+    if (framePending) return;
+    framePending = true;
+    requestAnimationFrame(function () {
+      framePending = false;
+      render();
+    });
+  }
+
+  /* ---------- interaction ---------- */
+
+  function projectionHelper() {
+    var cam = camera();
+    var tanHalf = Math.tan(FOV / 2);
+    var aspect = canvas.width / Math.max(canvas.height, 1);
+    return function (x, y, z) {
+      var dx = x - cam.eye[0], dy = y - cam.eye[1], dz = z - cam.eye[2];
+      var depth = dx * cam.forward[0] + dy * cam.forward[1] + dz * cam.forward[2];
+      if (depth <= 1e-6) return null;
+      var right = dx * cam.right[0] + dy * cam.right[1] + dz * cam.right[2];
+      var up = dx * cam.up[0] + dy * cam.up[1] + dz * cam.up[2];
+      return { x: (right / depth) / (tanHalf * aspect), y: (up / depth) / tanHalf,
+               depth: depth };
+    };
+  }
+
+  function cursorNdc(event) {
+    var rect = canvas.getBoundingClientRect();
+    return {
+      x: ((event.clientX - rect.left) / Math.max(rect.width, 1)) * 2 - 1,
+      y: -(((event.clientY - rect.top) / Math.max(rect.height, 1)) * 2 - 1)
+    };
+  }
+
+  function pixelLimit(pixels) {
+    var value = (pixels * 2) / Math.max(canvas.width, 1);
+    return value * value;
+  }
+
+  // Both picks work in screen space and report the depth of the winner, because the
+  // choice between them is not "which kind is more important" but "which one is nearer":
+  // a pose BEHIND the part must not steal a click on the part's surface.
+  function pickViewpoint(cursor, project) {
+    var limit = pixelLimit(14);
+    var best = -1, bestDepth = Infinity;
+    for (var i = 0; i < VP.length; i++) {
+      var p = VP[i].position;
+      var hit = project(p[0], p[1], p[2]);
+      if (!hit) continue;
+      var dx = hit.x - cursor.x, dy = hit.y - cursor.y;
+      if (dx * dx + dy * dy > limit) continue;
+      if (hit.depth < bestDepth) { bestDepth = hit.depth; best = i; }
+    }
+    return { index: best, depth: bestDepth };
+  }
+
+  function pickSample(cursor, project) {
+    var lists;
+    var mode = document.getElementById("sample-mode").value;
+    if (!samplePositions || mode === "off") lists = [];
+    else if (mode === "all") lists = [coveredIdx, uncoveredIdx];
+    else if (mode === "uncovered") lists = [uncoveredIdx];
+    else lists = [selectedSampleIdx];
+
+    var limit = pixelLimit(10);
+    var best = -1, bestDepth = Infinity;
+    for (var l = 0; l < lists.length; l++) {
+      var list = lists[l];
+      for (var k = 0; k < list.length; k++) {
+        var i = list[k] * 3;
+        var hit = project(samplePositions[i], samplePositions[i + 1], samplePositions[i + 2]);
+        if (!hit) continue;
+        var dx = hit.x - cursor.x, dy = hit.y - cursor.y;
+        if (dx * dx + dy * dy > limit) continue;
+        if (hit.depth < bestDepth) { bestDepth = hit.depth; best = list[k]; }
+      }
+    }
+    return { index: best, depth: bestDepth };
+  }
+
+  function pick(event) {
+    var cursor = cursorNdc(event);
+    var project = projectionHelper();
+    var viewpoint = pickViewpoint(cursor, project);
+    var sample = pickSample(cursor, project);
+    if (viewpoint.index >= 0
+        && (sample.index < 0 || viewpoint.depth <= sample.depth)) {
+      return { kind: "viewpoint", index: viewpoint.index };
+    }
+    if (sample.index >= 0) return { kind: "sample", index: sample.index };
+    return { kind: "none", index: -1 };
+  }
+
+  function formatNumber(value, digits) {
+    if (value === null || value === undefined) return "-";
+    return Number(value).toFixed(digits);
+  }
+
+  function fillRows(rows) {
+    var body = document.getElementById("info-body");
+    body.innerHTML = "";
+    document.getElementById("info-extra").innerHTML = "";
+    rows.forEach(function (row) {
+      var tr = document.createElement("tr");
+      var key = document.createElement("td");
+      key.textContent = row[0];
+      var value = document.createElement("td");
+      value.textContent = row[1];
+      tr.appendChild(key);
+      tr.appendChild(value);
+      body.appendChild(tr);
+    });
+  }
+
+  function showInfo(index) {
+    var panel = document.getElementById("info");
+    if (index < 0) { panel.style.display = "none"; return; }
+    var v = VP[index];
+    document.getElementById("info-title").textContent = "视点 " + v.id;
+    fillRows([
+      ["位置 / mm", v.position.map(function (n) { return formatNumber(n, 1); }).join(", ")],
+      ["光轴", v.axis.map(function (n) { return formatNumber(n, 3); }).join(", ")],
+      ["滚转", formatNumber(v.roll_deg, 1) + "°"],
+      ["覆盖点数", Number(v.n_points || 0).toLocaleString()],
+      ["覆盖面积", formatNumber(v.area_mm2, 1) + " mm²"],
+      ["入射角 均值", formatNumber(v.mean_incidence_deg, 2) + "°"],
+      ["入射角 最大", formatNumber(v.max_incidence_deg, 2) + "°"],
+      ["跟踪器可见", v.tracker_ok ? "是" : "否"],
+      ["来源", v.source || "-"]
+    ]);
+    panel.style.display = "block";
+  }
+
+  function showSampleInfo(index) {
+    var panel = document.getElementById("info");
+    var p = index * 3;
+    var covered = sampleCovered[index] === 1;
+    var viewers = sampleViewers(index);
+    document.getElementById("info-title").textContent = "采样点";
+    fillRows([
+      ["位置 / mm", [samplePositions[p], samplePositions[p + 1], samplePositions[p + 2]]
+        .map(function (n) { return formatNumber(n, 1); }).join(", ")],
+      ["状态", covered ? "已覆盖" : "未覆盖"],
+      ["可见视点数", sampleMask ? String(viewers.length) : "无覆盖关系数据"]
+    ]);
+
+    var body = document.getElementById("info-extra");
+    if (!sampleMask) {
+      var note = document.createElement("div");
+      note.className = "note";
+      note.textContent = "这一页缺少逐采样点的覆盖关系（target_samples.npz），重跑 plan 即可带上。";
+      body.appendChild(note);
+    } else if (!viewers.length) {
+      var none = document.createElement("div");
+      none.className = "note";
+      none.textContent = "交付的视点集里没有视点能扫到这个点。";
+      body.appendChild(none);
+    } else {
+      var chips = document.createElement("div");
+      chips.className = "chips";
+      viewers.forEach(function (column) {
+        var button = document.createElement("button");
+        button.textContent = "视点 " + VP[column].id;
+        button.addEventListener("click", function () { select(column); });
+        chips.appendChild(button);
+      });
+      body.appendChild(chips);
+    }
+    panel.style.display = "block";
+  }
+
+  function clearSample() {
+    pickedSample = -1;
+    viewerColumns = [];
+  }
+
+  function select(index) {
+    selected = index;
+    clearSample();
+    if (index >= 0) {
+      var v = VP[index];
+      gl.bindBuffer(gl.ARRAY_BUFFER, selectedBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, vpSegments[index], gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, selectedPointBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(v.position), gl.STATIC_DRAW);
+      var corners = v.corners || [];
+      if (corners.length >= 4) {
+        var quad = [];
+        for (var t = 1; t < corners.length - 1; t++) {
+          quad.push(corners[0][0], corners[0][1], corners[0][2],
+                    corners[t][0], corners[t][1], corners[t][2],
+                    corners[t + 1][0], corners[t + 1][1], corners[t + 1][2]);
+        }
+        gl.bindBuffer(gl.ARRAY_BUFFER, selectedQuadBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, toFloats(quad), gl.STATIC_DRAW);
+      }
+    }
+    rebuildSelectedSamples();
+    showInfo(index);
+    requestRender();
+  }
+
+  function selectSample(index) {
+    if (index < 0) {
+      clearSample();
+      showInfo(selected);
+      requestRender();
+      return;
+    }
+    highlightSample(index);
+    showSampleInfo(index);
+    requestRender();
+  }
+
+  function panBy(dx, dy) {
+    var cam = camera();
+    var perPixel = 2 * distance * Math.tan(FOV / 2) / Math.max(canvas.clientHeight, 1);
+    center = add(center, add(scale(cam.right, -dx * perPixel), scale(cam.up, dy * perPixel)));
+  }
+
+  canvas.addEventListener("contextmenu", function (event) { event.preventDefault(); });
+
+  canvas.addEventListener("pointerdown", function (event) {
+    canvas.setPointerCapture(event.pointerId);
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY,
+             button: event.button, shift: event.shiftKey, moved: false };
+    canvas.classList.add("dragging");
+  });
+
+  canvas.addEventListener("pointermove", function (event) {
+    if (!drag || event.pointerId !== drag.id) {
+      // Hover picking walks every visible sample, so it is throttled: a pointermove
+      // fires far more often than a cursor change is worth.
+      var now = performance.now();
+      if (now - lastHover > 70) {
+        lastHover = now;
+        canvas.style.cursor = pick(event).kind === "none" ? "grab" : "pointer";
+      }
+      return;
+    }
+    var dx = event.clientX - drag.x;
+    var dy = event.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    if (drag.button === 0 && !drag.shift) {
+      // Grab-and-turn: the model follows the pointer. Dragging up tips the near face
+      // upward, which means the camera has to go DOWN - so `pitch` moves with `dy`,
+      // not against it.
+      yaw -= dx * 0.008;
+      pitch = clamp(pitch + dy * 0.008, -1.52, 1.52);
+    } else {
+      panBy(dx, dy);
+    }
+    drag.x = event.clientX;
+    drag.y = event.clientY;
+    requestRender();
+  });
+
+  canvas.addEventListener("pointerup", function (event) {
+    if (!drag) return;
+    var wasDrag = drag.moved;
+    var button = drag.button;
+    drag = null;
+    canvas.classList.remove("dragging");
+    if (wasDrag || button !== 0) return;
+    var hit = pick(event);
+    if (hit.kind === "viewpoint") select(hit.index);
+    else if (hit.kind === "sample") selectSample(hit.index);
+    else {
+      select(-1);
+    }
+  });
+
+  canvas.addEventListener("pointercancel", function () {
+    drag = null;
+    canvas.classList.remove("dragging");
+  });
+
+  canvas.addEventListener("wheel", function (event) {
+    event.preventDefault();
+    distance = clamp(distance * Math.exp(event.deltaY * 0.0012), radius * 0.03, radius * 40);
+    requestRender();
+  }, { passive: false });
+
+  window.addEventListener("resize", requestRender);
+
+  function setView(newYaw, newPitch) {
+    yaw = newYaw;
+    pitch = newPitch;
+    requestRender();
+  }
+
+  document.getElementById("btn-fit").addEventListener("click", function () {
+    center = centerHome.slice();
+    distance = distanceHome;
+    yaw = yawHome;
+    pitch = pitchHome;
+    requestRender();
+  });
+  document.getElementById("btn-iso").addEventListener("click", function () {
+    setView(-Math.PI / 3, Math.PI / 6);
+  });
+  document.getElementById("btn-top").addEventListener("click", function () {
+    setView(-Math.PI / 2, 1.5);
+  });
+  document.getElementById("btn-front").addEventListener("click", function () {
+    setView(-Math.PI / 2, 0);
+  });
+
+  var toggles = document.querySelectorAll("#tools input[type=checkbox]");
+  for (var t = 0; t < toggles.length; t++) {
+    toggles[t].addEventListener("change", requestRender);
+  }
+  document.getElementById("fov-mode").addEventListener("change", function () {
+    if (this.value === "selected" && selected < 0 && VP.length) select(0);
+    else requestRender();
+  });
+  document.getElementById("sample-mode").addEventListener("change", function () {
+    if (this.value === "selected") {
+      if (selected < 0 && VP.length) select(0);
+      else rebuildSelectedSamples();
+    }
+    requestRender();
+  });
+  if (!sampleMask) {
+    var option = document.querySelector('#sample-mode option[value="selected"]');
+    if (option) {
+      option.disabled = true;
+      option.textContent = "仅选中视点（缺覆盖关系）";
+    }
+  }
+
+  /* ---------- head-up text ---------- */
+
+  document.getElementById("title").textContent = DATA.title;
+  var stats = document.getElementById("stats");
+  function addStat(label, value) {
+    var key = document.createElement("span");
+    key.textContent = label;
+    var strong = document.createElement("b");
+    strong.textContent = value;
+    stats.appendChild(key);
+    stats.appendChild(strong);
+  }
+  addStat("视点", String(VP.length));
+  if (DATA.stats && DATA.stats.face) addStat("目标面", DATA.stats.face);
+  if (DATA.stats && typeof DATA.stats.coverage_pct === "number") {
+    addStat("覆盖率", DATA.stats.coverage_pct.toFixed(2) + "%");
+  }
+  if (target) {
+    var total = (target.coveredCount || 0) + (target.uncoveredCount || 0);
+    addStat("目标采样", Number(target.coveredCount || 0).toLocaleString()
+                        + " / " + total.toLocaleString());
+  }
+  addStat("坐标系", DATA.units + " · " + DATA.frame);
+
+  window.scanplanView = { data: DATA, select: select, render: render,
+                          frames: function () { return framesDrawn; },
+                          pickAt: function (x, y) {
+                            return pick({ clientX: x, clientY: y });
+                          },
+                          sampleAt: function (index) {
+                            return { picked: pickedSample, viewers: viewerColumns.slice(),
+                                     info: document.getElementById("info-title").textContent };
+                          },
+                          state: function () {
+                            return { distance: distance, radius: radius,
+                                     center: center.slice(), yaw: yaw, pitch: pitch };
+                          } };
+
+  // Open on the first pose, so the field-of-view geometry is visible immediately
+  // instead of the page starting with no cone at all.
+  if (VP.length && document.getElementById("fov-mode").value !== "off") select(0);
+  render();
+})();
+</script>
+</body>
+</html>

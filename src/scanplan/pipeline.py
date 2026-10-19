@@ -33,6 +33,8 @@ from pathlib import Path
 
 import numpy as np
 
+from scanview import DEFAULT_MAX_FACES, write_run_outputs
+
 from .candidates import generate, refine
 from .config import PlannerConfig
 from .coverage import CoverageResult, evaluate, merge
@@ -71,6 +73,7 @@ class PlanResult:
     report: dict
     checks: dict
     face_candidates: dict[str, float] = field(default_factory=dict)
+    tracker: Tracker | None = None
 
 
 def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
@@ -190,7 +193,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     report["counters"] = counters
     return PlanResult(config=cfg, station=station, split=split, target=target,
                       coverage=coverage, selection=selection, viewpoints=viewpoints,
-                      report=report, checks=checks)
+                      report=report, checks=checks, tracker=tracker)
 
 
 def _better(first: Selection, second: Selection) -> Selection:
@@ -207,8 +210,9 @@ def _rank(selection: Selection) -> tuple[float, int]:
     return (round(selection.coverage_pct, 6), -len(selection.chosen))
 
 
-def write_outputs(result: PlanResult, out_dir) -> dict[str, Path]:
-    """Write the viewpoint set, both point clouds and the report, and return the paths."""
+def write_outputs(result: PlanResult, out_dir, *, write_3d: bool = True,
+                  max_faces: int = DEFAULT_MAX_FACES) -> dict[str, Path]:
+    """Write the viewpoint set, both point clouds, the report and the 3D view."""
     folder = Path(out_dir)
     folder.mkdir(parents=True, exist_ok=True)
     uncovered = ~result.selection.covered
@@ -229,6 +233,23 @@ def write_outputs(result: PlanResult, out_dir) -> dict[str, Path]:
         "coverage_report.json": write_report(folder, result.report),
         "summary.txt": _write_summary(folder, result.report),
     }
+    if write_3d:
+        paths.update(write_run_outputs(
+            folder,
+            part=result.station.part,
+            fixture=result.station.fixture,
+            base=result.station.base,
+            viewpoints=result.viewpoints,
+            target_points=samples.points,
+            target_covered=result.selection.covered,
+            coverage_sets=result.coverage.sets,
+            chosen=result.selection.chosen,
+            tracker=result.tracker,
+            scanner=result.config.scanner,
+            max_faces=max_faces,
+            stats={"face": result.report.get("face"),
+                   "coverage_pct": result.report.get("coverage_pct")},
+        ))
     return paths
 
 

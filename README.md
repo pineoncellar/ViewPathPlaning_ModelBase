@@ -22,7 +22,7 @@
 3. **生成候选视点** —— 围绕目标面生成候选位姿，逐条判定视场、量程、入射角、遮挡、
    扫描头能否放得下、以及跟踪器是否看得见。
 4. **选取最小覆盖集** —— 在满足覆盖率前提下选出最少的视点。
-5. **导出** —— 视点集、覆盖报告，以及 FANUC `.LS` 程序与其帧契约。
+5. **导出** —— 视点集、覆盖报告、一个自包含的 3D 视图，以及 FANUC `.LS` 程序与其帧契约。
 
 ## 它明确不做
 
@@ -56,6 +56,7 @@
 | 路径 | 内容 | 是否进版本控制 |
 |---|---|---|
 | [`src/scanplan/`](src/scanplan) | 规划器。每个模块的 docstring 写明职责与坑点。 | 是 |
+| [`src/scanview/`](src/scanview) | 3D 视图：把一次规划结果写成单文件网页（含 `viewer.html` 渲染器与逐点覆盖关系）。与规划算法解耦，只读取 `scanplan` 的扫描头坐标系与视场定义。 | 是 |
 | [`configs/`](configs) | 配置，含扫描仪参数。 | 是 |
 | [`tests/`](tests) | 测试。夹具数据全部是**合成**的，不含客户几何。 | 是 |
 | [`scripts/`](scripts) | 仓库工具，含数据合规自检。 | 是 |
@@ -85,12 +86,16 @@ uv run scanplan plan --station input/<工位>.json \
 
 uv run scanplan ls   --viewpoints output/<零件>/viewpoints.json \
                      --prog-name PART01 --out output/<零件>/
+
+uv run scanplan view --viewpoints output/<零件>/viewpoints.json \
+                     --station input/<工位>.json --out output/<零件>/
 ```
 
 `--station` 给出三个数模的路径与它们的配准变换；也可以直接给
 `--part/--fixture/--base` 三个路径，此时按单位变换处理。可以加的还有
 `--config`（覆盖配置）、`--tracker x,y,z`（给出跟踪器真实位姿）、
-`--tracker-sweep`（不给位姿时，报告 192 个候选摆位的差别）、`--quiet`。
+`--tracker-sweep`（不给位姿时，报告 192 个候选摆位的差别）、`--no-3d`（不写 3D 视图）、
+`--max-faces`（3D 视图里每个模型的显示面数上限）、`--quiet`。
 模板见 [`configs/station.example.json`](configs/station.example.json)。
 
 > **`--face upper` / `--face lower` 是几何名，不是物理名。** 哪一个面叫"上面"取决于
@@ -105,7 +110,7 @@ uv run scanplan ls   --viewpoints output/<零件>/viewpoints.json \
 
 ### 交付物
 
-`plan` 在输出目录写下六个文件：
+`plan` 在输出目录写下八个文件（`--no-3d` 时六个）：
 
 | 文件 | 内容 |
 |---|---|
@@ -115,8 +120,46 @@ uv run scanplan ls   --viewpoints output/<零件>/viewpoints.json \
 | `unreachable_points.csv` | 漏扫点云，**每点带原因**（`blocked_by_part` / `blocked_by_fixture` / `blocked_by_base` / `blocked_by_tracker` / `never_in_view` / `only_poses_that_collide`） |
 | `coverage_report.json` | 覆盖报告：覆盖率、视点数、入射角分布、漏扫聚类、占位参数清单、以及**它没有建模什么** |
 | `summary.txt` | 上面那些数字的人读版本 |
+| `viewpoints_3d.html` | **单文件 3D 视图**：零件/夹具/底座 + 视点位置、光轴与视场锥 + 已覆盖/未覆盖采样 |
+| `target_samples.npz` | 采样点 + 逐点覆盖位掩码，供 3D 视图回答“哪些视点能扫到这个点”；`scanplan view` 重新渲染时读它 |
 
 `ls` 写下 `.LS` + `_points.csv` + `_frame.json`（帧契约）。
+
+### 3D 视图
+
+`viewpoints_3d.html` 是**一个文件，没有外部依赖，也不联网**：网格、采样点和视点集都以
+base64 缓冲区嵌在页面里，用页面自带的小型 WebGL 渲染器画出来。现场那台只看图纸的电脑
+只要能开浏览器就能看，引用 CDN 的页面在那里只会是一片空白。
+
+页面里可以左键拖动旋转、滚轮缩放、右键或 Shift 拖动平移，单击视点看它的坐标、入射角、
+覆盖面积与来源；右上角可以逐层关掉零件、夹具、底座、视场锥和采样点。
+
+**视场锥**默认只画选中那一个，因为一百多个视点同时铺开时上千条线会糊成一片。右上角
+的下拉框可以切换：`仅选中`（默认）、`全部`（只画各视点在工作面上的矩形，淡色）或
+`关闭`。想核对某处是否真的被扫到，就单击那里的视点方块，看它的锥落在零件的什么位置。
+
+**采样点**同样是一个下拉框：`全部`（已覆盖绿 / 未覆盖红）、`仅选中视点`（只留该位姿能
+测到的点）、`仅未覆盖`、`关闭`。**单击零件上的任一点**，右侧会给出该点的位置、是否被
+覆盖，以及**哪些视点能扫到它**——这些视点会在三维视图里高亮成青色，点列表里的编号即可
+直接切过去看它的视场。未覆盖的点会明确写“没有视点能扫到”。
+
+这一层“谁看见了谁”的关系来自 `plan` 同时写下的 `target_samples.npz`（采样点 + 逐点
+覆盖位掩码，约 1.6 MB）。`scanplan view` 会读它，所以重新渲染也能保留采样点与查询能力；
+如果旧目录里没有这个文件，页面会照常打开，只是不显示采样点。
+
+这一切都在与规划器分开的包里：[`src/scanview/`](src/scanview)——`payload.py` 负责把
+数模/采样/视点编码成页面数据，`viewer.html` 是页面自带的渲染器。它只从 `scanplan`
+取扫描头坐标系（`scanner_frame`）和视场尺寸，保证图与导出的位姿契约不会各说各话；
+`scanplan` 这侧只有两个调用点（`plan` 写页面、`view` 重渲染），算法本身不依赖它。
+
+视点的画法**与规划器共用同一套定义**：位置就是扫描头的测量参考点，视线沿光轴延伸一个
+工作距离，末端是按 `scanner_frame` + 滚转摆出的矩形视场。因此这张图不会和导出的位姿
+契约各说各话。
+
+`plan` 总是同时写出这张图；`view` 只读 `viewpoints.json` 与数模重新渲染，**不需要重跑
+规划**，用于改了配色、想换个角度看、或换台电脑放给评审看。`--max-faces` 控制每个模型
+的显示预算，超出的模型才做顶点聚类抽稀——薄板零件抽狠了会把正反两面焊在一起，所以
+默认值远高于真实零件的面数。
 
 ### 帧契约（**交付物的语义，不是细节**）
 
