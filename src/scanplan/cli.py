@@ -25,9 +25,17 @@ from pathlib import Path
 import numpy as np
 
 from .config import FACES, load_config, read_json
+from .datum_picker import pick_cad_datums
 from .raycast import backend_name
+from .registration import (
+    RigidRegistration,
+    fit_three_points,
+    load_registration,
+    parse_measured_points,
+)
 from .report import summary_lines
 from .roboguide.adapt import export as export_ls
+from .roboguide.wpr import rot_to_fanuc_wpr
 from .scene import StationDescription, load_station, load_station_description
 from .tracker import (
     Tracker,
@@ -46,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_plan(args, parser)
     if args.command == "ls":
         return _run_ls(args, parser)
+    if args.command == "pick-datums":
+        return _run_pick_datums(args, parser)
     parser.error("a subcommand is required: plan or ls")
     return 2
 
@@ -77,12 +87,47 @@ def _build_parser() -> argparse.ArgumentParser:
     exporter.add_argument("--out", default="output", help="output directory")
     exporter.add_argument("--place", help="pose 'x,y,z,w,p,r' of the CAD frame in the "
                                          "ROBOGUIDE world; switches the program to UFRAME 0")
+    exporter.add_argument(
+        "--registration",
+        help="JSON with three matching CAD and measured datum points; registers the "
+             "viewpoints to the measured part installation and runs the program under "
+             "the UFRAME the points were measured in (UFRAME 0 for robot-base points)",
+    )
+    exporter.add_argument(
+        "--max-registration-error-mm",
+        type=float,
+        default=3.0,
+        help="maximum allowed residual for any registration point (default: 3 mm)",
+    )
     exporter.add_argument("--uframe", type=int, help="UFRAME number (default 1, or 0 "
                                                     "with --place)")
     exporter.add_argument("--utool", type=int, default=1)
     exporter.add_argument("--motion", default="J", choices=["J", "L"],
                           help="J is the permissive default for a reachability review")
     exporter.add_argument("--speed", default="100%")
+
+    picker = subparsers.add_parser(
+        "pick-datums",
+        help="click three CAD datum points and pair them with field measurements",
+    )
+    picker.add_argument("--station", required=True, help="station JSON describing the part CAD")
+    picker.add_argument(
+        "--measured-points",
+        required=True,
+        help="three measured 'x,y,z' triples separated by semicolons",
+    )
+    picker.add_argument(
+        "--coordinate-system",
+        choices=["robot_base_mm", "robot_uframe_1_mm"],
+        default="robot_uframe_1_mm",
+        help="coordinate frame used to measure points (default: robot_uframe_1_mm)",
+    )
+    picker.add_argument(
+        "--guide-registration",
+        help="optional previous registration JSON whose CAD datum points are shown "
+             "as click guides; points must still be selected in the viewer",
+    )
+    picker.add_argument("--out", required=True, help="registration JSON output path")
     return parser
 
 
@@ -120,6 +165,52 @@ def _run_plan(args, parser: argparse.ArgumentParser) -> int:
     print()
     print(f"wrote {len(paths)} files to {Path(args.out).resolve()}")
     print("next: scanplan ls --viewpoints viewpoints.json --prog-name <NAME> --out <dir>")
+    return 0
+
+
+def _run_pick_datums(args, parser: argparse.ArgumentParser) -> int:
+    import trimesh
+
+    from .scene import apply_transform, load_station_description, read_transform
+
+    try:
+        measured = parse_measured_points(args.measured_points)
+        description = load_station_description(args.station)
+        reference_points = (
+            load_registration(args.guide_registration).cad_points
+            if args.guide_registration else None
+        )
+        loaded = trimesh.load(str(description.part))
+        part = loaded.dump(concatenate=True) if isinstance(loaded, trimesh.Scene) else loaded
+        part = apply_transform(part, read_transform(description.transform_part))
+        cad = pick_cad_datums(part, reference_points=reference_points)
+        registration = fit_three_points(
+            cad,
+            measured,
+            target_frame=("robot_base" if args.coordinate_system == "robot_base_mm"
+                          else "robot_uframe_1"),
+            uframe=0 if args.coordinate_system == "robot_base_mm" else 1,
+        )
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+        return 2
+
+    measured_key = args.coordinate_system
+    body = {
+        "coordinate_system": args.coordinate_system,
+        "units": "mm",
+        "point_pairs": [
+            {"cad_mm": cad_point.tolist(), measured_key: measured_point.tolist()}
+            for cad_point, measured_point in zip(cad, measured, strict=True)
+        ],
+    }
+    output = Path(args.out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(body, indent=2, ensure_ascii=False) + "\n",
+                      encoding="utf-8")
+    print(f"wrote three paired datum points to {output.resolve()}")
+    print(f"registration check: RMS {registration.rms_error_mm:.3f} mm, "
+          f"maximum {registration.max_error_mm:.3f} mm")
     return 0
 
 
@@ -206,22 +297,150 @@ def _run_ls(args, parser: argparse.ArgumentParser) -> int:
     if not viewpoints:
         parser.error(f"{source} contains no viewpoints")
 
+    registration = None
+    if args.registration:
+        if args.place:
+            parser.error("--registration cannot be combined with --place")
+        if not np.isfinite(args.max_registration_error_mm) \
+                or args.max_registration_error_mm <= 0.0:
+            parser.error("--max-registration-error-mm must be a positive finite number")
+        try:
+            registration = load_registration(args.registration)
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+            parser.error(f"cannot read registration: {error}")
+        if args.uframe not in (None, registration.uframe):
+            parser.error(
+                f"registration measurements use {registration.target_frame}; "
+                f"the matching FANUC frame is UFRAME {registration.uframe}"
+            )
+        if registration.max_error_mm > args.max_registration_error_mm:
+            parser.error(
+                f"registration max point error is {registration.max_error_mm:.3f} mm, "
+                f"exceeding the {args.max_registration_error_mm:.3f} mm limit; "
+                "check point correspondence and measurement coordinates"
+            )
+
+    place = args.place
+    if registration is not None:
+        wpr = rot_to_fanuc_wpr(registration.rotation)
+        place = ",".join(
+            f"{value:.10g}" for value in (*registration.translation, *wpr)
+        )
+
     try:
         contract = export_ls(viewpoints, args.out, prog_name=args.prog_name,
-                             place=args.place, uframe=args.uframe, utool=args.utool,
+                             place=place,
+                             uframe=(registration.uframe if registration is not None
+                                     else args.uframe),
+                             utool=args.utool,
                              motion=args.motion, speed=args.speed)
     except ValueError as error:
         parser.error(str(error))
         return 2
 
+    if registration is not None:
+        _write_registration_outputs(args.out, contract, registration, args.registration)
+
     print(f"wrote {args.prog_name}.LS, {args.prog_name}_points.csv and "
           f"{args.prog_name}_frame.json to {Path(args.out).resolve()}")
+    if registration is not None:
+        print(f"registered CAD path to {registration.frame_label} using three datum "
+              f"points (max error {registration.max_error_mm:.3f} mm)")
+        print(f"registration report: {Path(args.out).resolve() / 'registration_report.json'}")
     print(f"UFRAME {contract['uframe_utool']['uframe']}, "
           f"UTOOL {contract['uframe_utool']['utool']}")
     print("before reading anything into reachability: confirm in ROBOGUIDE that the "
           "points land ON THE PART. A wrong frame contract moves every point by a "
           "constant and nothing complains.")
     return 0
+
+
+def _write_registration_outputs(
+    out_dir: str | Path,
+    contract: dict,
+    registration: RigidRegistration,
+    source: str | Path,
+) -> None:
+    """Record the calibration used to express the exported path in the measured frame."""
+    frame = registration.frame_label
+    measured_key = f"{registration.target_frame}_mm"
+    report = {
+        "method": "least-squares proper rigid transform from three paired datum points",
+        "source_frame": "CAD frame used by viewpoints.json",
+        "target_frame": f"{registration.frame_label} coordinates "
+                        f"(UFRAME {registration.uframe}), millimetres",
+        "source_file": str(Path(source).resolve()),
+        "rotation_cad_to_target_frame": registration.rotation.tolist(),
+        "translation_cad_origin_in_target_frame_mm": registration.translation.tolist(),
+        "rms_error_mm": registration.rms_error_mm,
+        "max_error_mm": registration.max_error_mm,
+        "point_pairs": [
+            {
+                "cad_mm": cad.tolist(),
+                measured_key: measured.tolist(),
+                "residual_mm": residual.tolist(),
+                "error_mm": float(np.linalg.norm(residual)),
+            }
+            for cad, measured, residual in zip(
+                registration.cad_points,
+                registration.measured_points,
+                registration.residuals_mm,
+                strict=True,
+            )
+        ],
+        "warning": (
+            f"Confirm the measured points use {frame} coordinates and that each CAD "
+            "point matches the same physical datum before running."
+        ),
+    }
+    output = Path(out_dir)
+    (output / "registration_report.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    contract["frame"]["origin"] = (
+        f"CAD origin transformed into the {frame} coordinate frame by the "
+        "three-point registration"
+    )
+    contract["frame"]["axes"] = (
+        f"{frame} axes; all exported positions and orientations are expressed in the "
+        f"{frame} frame"
+    )
+    if registration.uframe == 0:
+        contract["uframe_utool"]["uframe_note"] = (
+            "UFRAME 0 is the robot base frame the three registration datum points were "
+            "measured in; the exported points are already expressed in that frame"
+        )
+    else:
+        contract["uframe_utool"]["uframe_note"] = (
+            f"UFRAME {registration.uframe} is the measured frame the three registration "
+            f"datum points were recorded in, NOT the CAD origin; the exported points are "
+            f"expressed in that same frame, so UFRAME {registration.uframe} must be "
+            "taught as that measured frame"
+        )
+    contract["frame"]["note"] = (
+        f"UFRAME {registration.uframe} is used. The registration transform was fitted "
+        "from the three datum-point pairs recorded in registration_report.json."
+    )
+    contract["placement"]["meaning"] = (
+        f"the fitted rigid transform from the CAD frame into robot UFRAME "
+        f"{registration.uframe}"
+    )
+    contract["placement"]["warning"] = (
+        f"the exported positions and orientations are expressed in robot UFRAME "
+        f"{registration.uframe}; confirm that this frame matches the one used to "
+        "measure the three registration datum points"
+    )
+    contract["placement"]["registration"] = {
+        "method": report["method"],
+        "source_file": report["source_file"],
+        "rms_error_mm": report["rms_error_mm"],
+        "max_error_mm": report["max_error_mm"],
+        "report": "registration_report.json",
+    }
+    frame_path = output / contract["files"]["frame_contract"]
+    frame_path.write_text(
+        json.dumps(contract, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
 
 
 if __name__ == "__main__":
