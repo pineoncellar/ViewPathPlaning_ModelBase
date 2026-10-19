@@ -41,6 +41,13 @@ _BURIED_TOL_MM = 0.2
 # millimetre of its supports, so a spacing-sized window only ever sees the surface layer
 # and a part buried several millimetres deeper goes unexamined.
 _BURIED_WINDOW_MM = 10.0
+# The interpenetration test is the one check whose answer must not depend on where a random
+# draw happened to land, and a clash region can be a fraction of a square millimetre, so it
+# walks deterministic probe points: the models' own geometry, refined to this edge length
+# where the point budget allows (a large contact area gets a coarser probe, never a slow run).
+_NODE_DECIMALS = 3
+_BURIED_MAX_EDGE_MM = 1.5
+_BURIED_PROBE_BUDGET = 150_000
 
 
 @dataclass(frozen=True)
@@ -68,7 +75,10 @@ class Station:
     """The loaded station: three meshes in one frame, plus the clearance clouds.
 
     The fixture and base clouds are sampled once here so the body-clearance test
-    is a KD-tree query and no later module has to re-sample anything.
+    is a KD-tree query and no later module has to re-sample anything. They carry no
+    normals: the one test that needs fixture normals, the buried-part check, builds
+    its own deterministic probe from the fixture mesh, so points and normals always
+    come from the same draw and cannot be paired up wrongly.
     """
 
     part: trimesh.Trimesh
@@ -79,7 +89,6 @@ class Station:
     base_cloud_mm: np.ndarray
     fixture_tree: cKDTree
     base_tree: cKDTree
-    fixture_cloud_normals_mm: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
     _obstacles: dict[str, Any] | None = field(default=None, init=False, repr=False,
                                               compare=False)
 
@@ -191,15 +200,14 @@ def load_station(description: StationDescription, *, cloud_seed: int,
                               read_transform(description.transform_fixture))
     base = _load_mesh(description.base, "base")
 
-    fixture_cloud, fixture_normals_cloud = sample_surface_seeded(
-        fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)
+    fixture_cloud = sample_surface_seeded(
+        fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)[0]
     base_cloud = sample_surface_seeded(
         base, _cloud_points(base, base_cloud_points), cloud_seed + 1)[0]
     return Station(
         part=part, fixture=fixture, base=base, description=description,
         fixture_cloud_mm=fixture_cloud, base_cloud_mm=base_cloud,
         fixture_tree=cKDTree(fixture_cloud), base_tree=cKDTree(base_cloud),
-        fixture_cloud_normals_mm=fixture_normals_cloud,
     )
 
 
@@ -214,9 +222,9 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
     touching; by default it is the fixture cloud's own resolution, because two
     point clouds cannot resolve a separation finer than their own spacing.
     """
-    part_points, _ = _cloud(station.part, samples, seed)
-    fixture_points, fixture_normals = _cloud(station.fixture, samples, seed + 1)
-    base_points, _ = _cloud(station.base, samples, seed + 2)
+    part_points = _cloud(station.part, samples, seed)
+    fixture_points = _cloud(station.fixture, samples, seed + 1)
+    base_points = _cloud(station.base, samples, seed + 2)
 
     base_plane = (float(station.base.bounds[1][2]) if base_plane_mm is None
                   else float(base_plane_mm))
@@ -275,12 +283,20 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
     # passes THROUGH another puts samples on the far side of that other surface. A plain
     # distance test cannot tell a hairline gap (which a stamped part resting on its
     # supports legitimately has) from a part buried in the fixture, because both leave a
-    # small positive minimum distance.
-    buried, depth, deepest_at = _buried_below(fixture_points, fixture_normals, part_points,
-                                              fixture_tree, touch)
+    # small positive minimum distance. The populations below are deliberately NOT the
+    # alignment clouds: see `_clash_probes` for why the verdict, the depth and the reported
+    # coordinate all have to come from the models' own geometry rather than from a draw.
+    part_probe = _clash_probes(station.part, station.fixture.triangles_center,
+                               window_mm=_BURIED_WINDOW_MM, with_vertices=True)[0]
+    part_nodes = np.unique(np.round(np.concatenate(
+        [np.asarray(station.part.vertices, dtype=float), part_probe]), _NODE_DECIMALS), axis=0)
+    buried_fixture, buried_normals = _clash_probes(station.fixture, part_nodes,
+                                                   window_mm=_BURIED_WINDOW_MM)
+    buried, depth, deepest_at = _buried_below(buried_fixture, buried_normals, part_nodes,
+                                              cKDTree(buried_fixture), touch)
     if buried:
         warnings.append(
-            f"the part lies INSIDE the fixture at {buried} sampled points, up to "
+            f"the part lies INSIDE the fixture at {buried} points of the part mesh, up to "
             f"{depth:.2f} mm deep (deepest at {deepest_at}) - either the frame or the "
             "transform is wrong, or the CAD fixture is the design version rather than the "
             "clamp actually on the cell, which design 4.3 already suspects for this part. "
@@ -306,6 +322,15 @@ def check_alignment(station: Station, *, base_plane_mm: float | None = None,
         "part_points_inside_fixture": buried,
         "deepest_part_point_inside_fixture_mm": round(depth, 3),
         "deepest_part_point_inside_fixture_at": deepest_at,
+        "interpenetration_probe_points": {
+            "part": int(len(part_nodes)),
+            "fixture": int(len(buried_fixture)),
+            "max_edge_mm": _BURIED_MAX_EDGE_MM,
+            "note": ("the interpenetration test walks probe points refined from the models "
+                     "themselves, so its verdict and its coordinate do not move with a "
+                     "sampling seed; the alignment clouds above are coarser and only feed "
+                     "the distances"),
+        },
         "point_counts": {
             "part": int(len(part_points)),
             "fixture": int(len(fixture_points)),
@@ -342,8 +367,13 @@ def _cloud_points(mesh, cap: int) -> int:
     return int(min(cap, max(10_000, int(float(mesh.area) / 4.0))))
 
 
-def _cloud(mesh, cap: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    return sample_surface_seeded(mesh, _cloud_points(mesh, cap), seed)
+def _cloud(mesh, cap: int, seed: int) -> np.ndarray:
+    """Area-weighted surface points of `mesh`, for the distance checks.
+
+    No normals: two clouds that are drawn separately can never be paired up, which is the
+    mistake this file used to make, so the population that needs normals builds them itself.
+    """
+    return sample_surface_seeded(mesh, _cloud_points(mesh, cap), seed)[0]
 
 
 def _cloud_spacing(points: np.ndarray) -> float:
@@ -352,6 +382,101 @@ def _cloud_spacing(points: np.ndarray) -> float:
         return 0.0
     distances = cKDTree(points).query(points, k=2)[0][:, 1]
     return float(np.median(distances))
+
+
+def _facet_lattice(corners, areas, normals, *, budget: int,
+                   cap: int = 33) -> tuple[np.ndarray, np.ndarray]:
+    """Interior points on facets, a triangular lattice per facet sized by its own area.
+
+    Edge-length subdivision is the wrong tool on a CAD tessellation: bisecting every edge
+    means one 1000 mm sliver costs millions of degenerate faces for a fraction of a square
+    millimetre of surface (measured: 9.3M faces on the real part, and the sliver is still
+    there afterwards). A per-facet lattice cannot do that - a sliver's own area buys it a
+    single point, and a big flat facet gets a grid fine enough to catch a clash in its
+    middle, which is the case the mesh's own vertices cannot see.
+
+    The lattice is sized so the whole population fits `budget`, and `cap` bounds any single
+    facet (a face of 2 m2 would otherwise ask for a lattice of its own).
+    """
+    empty = (np.zeros((0, 3)), np.zeros((0, 3)))
+    if len(corners) == 0 or budget <= 0:
+        return empty
+    cell = max(0.43 * _BURIED_MAX_EDGE_MM ** 2, float(areas.sum()) / float(budget))
+    counts = np.clip(np.rint(np.sqrt(np.asarray(areas, dtype=float) / cell)).astype(np.int64),
+                     1, cap)
+
+    blocks: list[np.ndarray] = []
+    paired: list[np.ndarray] = []
+    for k in np.unique(counts):
+        group = np.flatnonzero(counts == k)
+        first, second = np.meshgrid(np.arange(k + 1), np.arange(k + 1))
+        keep = (first + second) <= k
+        first = first[keep].astype(float)[None, :, None]
+        second = second[keep].astype(float)[None, :, None]
+        third = float(k) - first - second
+        triangle = corners[group]
+        blocks.append(((first * triangle[:, 0:1, :] + second * triangle[:, 1:2, :]
+                        + third * triangle[:, 2:3, :]) / float(k)).reshape(-1, 3))
+        paired.append(np.repeat(normals[group], len(keep.nonzero()[0]), axis=0))
+    return np.concatenate(blocks), np.concatenate(paired)
+
+
+def _clash_probes(mesh, other_points, *, window_mm: float, with_vertices: bool = False
+                  ) -> tuple[np.ndarray, np.ndarray]:
+    """Deterministic surface points of `mesh` wherever it comes within `window_mm`.
+
+    Returns (points, normals) with one face normal per point. Nothing here draws a random
+    number, and that is the point: a clash verdict and the coordinate it reports have to be
+    properties of the two models. Sampling was measurably not good enough - with a 40k cloud
+    (about 7 mm apart on the real station) the check reported 2 points at 5.31 mm for one
+    seed and nothing at all for another, because the clash is a fraction of a square
+    millimetre.
+
+    The population is the mesh's own points on the facets that could be in contact - which
+    cost nothing and are as fine as the tessellation is - plus interior lattice points on
+    those facets, sized by the area budget, because a clash in the middle of a large flat
+    facet has no vertex near it. The budget is what the refinement follows rather than a
+    fixed edge length, so a large contact area gets a coarser probe instead of a slow run;
+    the reported probe counts say how many points were examined.
+
+    A facet counts as near when its own radius reaches the window, not when its centroid
+    does: a huge triangle whose centroid is far away can still be the surface under a small
+    part, and selecting on centroid distance alone would drop exactly that facet.
+
+    `with_vertices` adds the mesh's own vertices, whose normal is ambiguous (several facets
+    meet there), so it is for callers that need points and no normals.
+    """
+    centroids = np.asarray(mesh.triangles_center, dtype=float)
+    empty = (np.zeros((0, 3)), np.zeros((0, 3)))
+    if len(centroids) == 0 or len(other_points) == 0:
+        return empty
+    corners = np.asarray(mesh.vertices, dtype=float)[np.asarray(mesh.faces)]
+    radius = np.linalg.norm(corners - centroids[:, None, :], axis=2).max(axis=1)
+    distance = cKDTree(np.asarray(other_points, dtype=float)).query(centroids, k=1)[0]
+    near = (distance - radius) < window_mm
+    if not near.any():
+        return empty
+
+    blocks = [centroids[near]]
+    normals = [np.asarray(mesh.face_normals, dtype=float)[near]]
+    if with_vertices:
+        blocks.append(corners[near].reshape(-1, 3))
+        normals.append(np.zeros((len(corners[near]) * 3, 3)))
+
+    selected = np.flatnonzero(near)
+    areas = np.asarray(mesh.area_faces, dtype=float)[selected]
+    face_normals = np.asarray(mesh.face_normals, dtype=float)[selected]
+    lattice, lattice_normals = _facet_lattice(
+        corners[selected], areas, face_normals,
+        budget=_BURIED_PROBE_BUDGET - sum(len(block) for block in blocks))
+    if len(lattice):
+        blocks.append(lattice)
+        normals.append(lattice_normals)
+
+    stacked = np.round(np.concatenate(blocks), _NODE_DECIMALS)
+    paired = np.concatenate(normals)
+    points, first = np.unique(stacked, axis=0, return_index=True)
+    return points, paired[first]
 
 
 def _buried_below(fixture_points: np.ndarray, fixture_normals: np.ndarray,
@@ -401,9 +526,13 @@ def _buried_below(fixture_points: np.ndarray, fixture_normals: np.ndarray,
     buried = shallowest > _BURIED_TOL_MM
     if not buried.any():
         return 0, 0.0, []
-    deepest = depth[buried].max(axis=1)
-    where = points[int(np.argmax(deepest))]
-    return int(buried.sum()), float(deepest.max()), [round(float(v), 1) for v in where]
+    # Report how far inside the part is as the distance to the fixture's own surface, not as
+    # the largest signed depth among the neighbours: that one grows with how far the
+    # neighbourhood reaches, so it moved when the probe density changed (5.23 mm against a
+    # coarse cloud, 2.61 mm against a fine one, for the same contact).
+    inside = distance[close][:, 0][buried]
+    where = points[int(np.argmax(inside))]
+    return int(buried.sum()), float(inside.max()), [round(float(v), 1) for v in where]
 
 
 def _orientation_shares(mesh) -> dict[str, float]:
