@@ -103,6 +103,63 @@ uv run scanplan ls   --viewpoints output/<零件>/viewpoints.json \
 哪里）需要与现场商定，可能只要求重新导出而不必重跑规划。所以 `ls` 只读视点文件，
 **不需要数模**。
 
+现场可用零件上的三个定位基准点，把 CAD 路径配准到测量坐标系。每个基准点必须提供一对
+坐标：CAD/视点文件坐标中的点，以及现场在机器人基坐标系或指定 `UFRAME` 中测得的点（mm）。
+如果 CAD 中的对应特征还没有坐标，可以先在数模车内侧视图中点选，再输入三组现场测量值。
+下面示例默认现场坐标来自 `UFRAME 1`；拾取命令目前支持机器人基坐标和 `UFRAME 1`：
+
+```bash
+uv run scanplan pick-datums --station input/<工位>.json \
+  --measured-points "x1,y1,z1;x2,y2,z2;x3,y3,z3" \
+  --coordinate-system robot_uframe_1_mm \
+  --out output/<零件>/registration_picked.json
+```
+
+窗口中按 P1、P2、P3 的顺序点击 CAD 上同一物理基准特征，并确保顺序与测量坐标一一对应；
+视图从车辆内侧沿 +Y 投射到模型，右键可以撤销上一个选择。若已有配准文件，可用
+`--guide-registration` 将其中的 CAD 点显示为青色参考标记；仍需在窗口中逐点点击，点击标记
+附近（30 mm 内）会吸附到原 CAD 点，其他位置则按表面射线拾取。点选完会输出配准 JSON，
+并打印拟合误差。三对点也可以直接写入 JSON：
+
+```json
+{
+  "coordinate_system": "robot_base_mm",
+  "point_pairs": [
+    {"cad_mm": [100.0, 200.0, 300.0], "robot_base_mm": [510.0, 220.0, 840.0]},
+    {"cad_mm": [200.0, 200.0, 300.0], "robot_base_mm": [510.0, 320.0, 840.0]},
+    {"cad_mm": [100.0, 280.0, 300.0], "robot_base_mm": [430.0, 220.0, 840.0]}
+  ]
+}
+```
+
+需要重用已有 CAD 点作为拾取参考时，可添加 `--guide-registration`：
+
+```bash
+uv run scanplan pick-datums --station input/<工位>.json \
+  --measured-points "x1,y1,z1;x2,y2,z2;x3,y3,z3" \
+  --coordinate-system robot_uframe_1_mm \
+  --guide-registration input/previous_registration.json \
+  --out output/<零件>/registration_picked.json
+```
+
+如果实测坐标来自 `UFRAME 1`，将坐标系统改为 `"robot_uframe_1_mm"`，并把配对字段名改为
+`robot_uframe_1_mm`；也兼容 `measured_coordinate_frame`、`cad_points_mm`、
+`measured_points_mm` 这种数组格式。直接编辑 JSON 时，配准输入支持 `UFRAME 1` 至
+`UFRAME 9`；拾取命令的 `--coordinate-system` 目前仅提供基坐标和 `UFRAME 1` 选项。
+导出会使用与实测坐标匹配的 FANUC `UFRAME`：
+
+```bash
+uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
+                   --prog-name PART01 \
+                   --registration input/part_registration.json \
+                   --out output/<零件>_现场配准/
+```
+
+默认要求三个点的最大配准残差不超过 3 mm；可按测量精度用
+`--max-registration-error-mm` 调整。输出 `registration_report.json`，记录刚体变换和各点误差。
+三个定位点必须不共线、对应同一组 CAD 特征，且现场坐标必须是机器人基坐标或与指定
+`UFRAME` 一致的坐标，不能混用。导出后仍须在 ROBOGUIDE/现场核对点位。
+
 ### 交付物
 
 `plan` 在输出目录写下六个文件：
@@ -127,8 +184,11 @@ uv run scanplan ls   --viewpoints output/<零件>/viewpoints.json \
   参考点教**。教错 → 所有点位的实际测量距离整体偏掉一个常数，仿真里看不出来，实机上
   是系统性误差。
 
-坐标系口径有两条路：把 `UFRAME 1` 教到数模原点（底座固定，只需教一次），或用
-`--place "x,y,z,w,p,r"` 把数模摆进 ROBOGUIDE 世界（此时程序用 `UFRAME 0`）。
+坐标系口径有三条路：把 `UFRAME 1` 教到数模原点（底座固定，只需教一次）；用
+`--place "x,y,z,w,p,r"` 把数模摆进 ROBOGUIDE 世界（此时程序用 `UFRAME 0`）；或提供
+`--registration`，由三个基准点把数模坐标系配准到实测坐标系——此时导出的点位已经在实测
+`UFRAME`（`UFRAME 0` 或 `UFRAME 1` 至 `UFRAME 9`）里，该 `UFRAME` 必须是**测这三个点时
+用的那个坐标系，而不是数模原点**。
 **无论哪条，都必须先在 ROBOGUIDE 里确认点位落在零件上**，再谈可达性。
 
 ### 工位数模
