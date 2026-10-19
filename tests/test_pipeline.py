@@ -189,9 +189,29 @@ def test_every_reported_reason_is_one_the_footprint_vocabulary_defines(clamped_p
 def test_write_outputs_produces_every_documented_file(clamped_plate, quick_cfg, tmp_path):
     paths = write_outputs(plan(clamped_plate.station, quick_cfg, face="upper"), tmp_path)
     for name in ("viewpoints.json", "viewpoints.csv", "exempt_points.csv",
-                 "unreachable_points.csv", "coverage_report.json", "summary.txt"):
+                 "unreachable_points.csv", "coverage_report.json", "summary.txt",
+                 "viewpoints_3d.html", "target_samples.npz"):
         assert name in paths and paths[name].exists()
     assert paths["viewpoints.json"].name == "viewpoints.json"
+
+
+def test_the_3d_view_carries_the_planned_viewpoints(clamped_plate, quick_cfg, tmp_path):
+    result = plan(clamped_plate.station, quick_cfg, face="upper")
+    paths = write_outputs(result, tmp_path)
+    page = paths["viewpoints_3d.html"].read_text(encoding="utf-8")
+    assert '"viewpoints"' in page
+    for viewpoint in result.viewpoints:
+        assert f'"id":{viewpoint.id}' in page
+    # the page must also carry the samples and who covers each of them
+    assert '"mask"' in page and '"points"' in page
+
+
+def test_the_3d_view_can_be_switched_off(clamped_plate, quick_cfg, tmp_path):
+    paths = write_outputs(plan(clamped_plate.station, quick_cfg, face="upper"), tmp_path,
+                          write_3d=False)
+    assert "viewpoints_3d.html" not in paths
+    assert not (tmp_path / "viewpoints_3d.html").exists()
+    assert not (tmp_path / "target_samples.npz").exists()
 
 
 def test_the_viewpoint_json_matches_the_export_contract(clamped_plate, quick_cfg, tmp_path):

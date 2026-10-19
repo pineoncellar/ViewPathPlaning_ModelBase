@@ -190,15 +190,25 @@ def load_station_description(path: str | Path) -> StationDescription:
     )
 
 
-def load_station(description: StationDescription, *, cloud_seed: int,
-                 fixture_cloud_points: int = 200_000,
-                 base_cloud_points: int = 200_000) -> Station:
-    """Load the three models, realign part and fixture, and sample the obstacles."""
+def load_models(description: StationDescription) -> tuple[trimesh.Trimesh, ...]:
+    """The three models in the station frame, without the clearance clouds.
+
+    Kept separate from :func:`load_station` because the 3D view needs the meshes only:
+    sampling 400k obstacle points to draw a picture would waste the bulk of its runtime.
+    """
     part = apply_transform(_load_mesh(description.part, "part"),
                            read_transform(description.transform_part))
     fixture = apply_transform(_load_mesh(description.fixture, "fixture"),
                               read_transform(description.transform_fixture))
     base = _load_mesh(description.base, "base")
+    return part, fixture, base
+
+
+def load_station(description: StationDescription, *, cloud_seed: int,
+                 fixture_cloud_points: int = 200_000,
+                 base_cloud_points: int = 200_000) -> Station:
+    """Load the three models, realign part and fixture, and sample the obstacles."""
+    part, fixture, base = load_models(description)
 
     fixture_cloud = sample_surface_seeded(
         fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)[0]
