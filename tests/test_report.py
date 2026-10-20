@@ -160,6 +160,28 @@ def test_the_incidence_histogram_spans_zero_to_the_incidence_limit(planned):
     assert sum(histogram["counts"]) > 0
 
 
+def test_the_acceptance_target_is_echoed_beside_the_achieved_figure(planned):
+    """A coverage number without the figure it was accepted against cannot be audited."""
+    report = planned["report"]
+    program = report["program"]
+    assert program["coverage_target_pct"] == planned["config"].target.coverage_target_pct
+    assert program["delivery_mode"] == planned["config"].target.delivery_mode
+    assert "target" in " ".join(summary_lines(report))
+
+
+def test_the_connector_route_mix_is_reported_only_for_a_real_path(planned):
+    report = planned["report"]
+    # no stroke stage here, so there is no path and no routes to count
+    assert "connector_levels" not in report["program"]
+    assert report["program"]["ordering"].startswith("planner order of single poses")
+
+
+def test_the_report_says_which_deliverable_it_is(planned):
+    strokes = planned["report"]["stroke_plan"]
+    assert strokes["enabled"] is False
+    assert "same result v1 produces" in strokes["note"]
+
+
 def test_the_summary_ends_with_the_caveat(planned):
     lines = summary_lines(planned["report"])
     text = "\n".join(lines)

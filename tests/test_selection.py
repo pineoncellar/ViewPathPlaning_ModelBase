@@ -62,15 +62,15 @@ def test_every_reachable_sample_is_covered_once_repair_has_run():
     assert not selection.covered[3]
 
 
-def test_an_earlier_coverage_target_hands_the_rest_to_repair():
-    # stopping as soon as the target is met leaves reachable points to the repair pass,
-    # which is the only thing that can make repair non-empty
+def test_a_met_coverage_target_hands_nothing_to_repair():
+    # The target is the acceptance figure, so the leftover reachable sample is a hole the
+    # workshop patches by hand. Repairing it would add one pose per leftover sample - the
+    # exact tail the target exists to cut off.
     cov = fake_coverage(sets=[np.array([0, 1]), np.array([2])], n_targets=3)
     selection = select(cov, cov.area_mm2, coverage_target_pct=66.0)
     assert len(selection.greedy) == 1
-    assert len(selection.repair) == 1
-    assert selection.covered.all()
-    assert pytest.approx(selection.coverage_pct) == 100.0
+    assert selection.repair == []
+    assert pytest.approx(selection.coverage_pct) == pytest.approx(200.0 / 3.0)
 
 
 def test_greedy_and_repair_counts_are_reported_separately():
@@ -79,19 +79,20 @@ def test_greedy_and_repair_counts_are_reported_separately():
     assert len(selection.greedy) + len(selection.repair) == len(selection.chosen)
     assert list(selection.sources) == (["greedy"] * len(selection.greedy)
                                        + ["repair"] * len(selection.repair))
-    assert len(selection.greedy) == 1 and len(selection.repair) == 2
+    assert len(selection.greedy) == 1 and selection.repair == []
 
 
-def test_repair_adds_one_pose_for_two_points_when_one_pose_covers_both():
-    # greedy takes the pose covering the two large samples and stops at its target; the
-    # two small ones share the other pose, so repair adds it once rather than twice
+def test_a_met_target_stops_before_the_tail_is_paid_for():
+    # Two poses cover 90.9% and the second one carries the last 9.1%. At a 99% target the
+    # tail is not bought; at 100% it is. This is the whole point-count argument in one test.
     cov = fake_coverage(sets=[np.array([0, 1]), np.array([2, 3])],
                         areas=[10.0, 10.0, 1.0, 1.0], n_targets=4)
-    selection = select(cov, cov.area_mm2, coverage_target_pct=90.0)
-    assert len(selection.greedy) == 1
-    assert len(selection.repair) == 1
-    assert cov.sets[selection.repair[0]].tolist() == [2, 3]
-    assert selection.covered.all()
+    stopped = select(cov, cov.area_mm2, coverage_target_pct=90.0)
+    assert len(stopped.chosen) == 1
+    assert pytest.approx(stopped.coverage_pct) == pytest.approx(100.0 * 20.0 / 22.0)
+    complete = select(cov, cov.area_mm2, coverage_target_pct=100.0)
+    assert len(complete.chosen) == 2
+    assert complete.coverage_pct == pytest.approx(100.0)
 
 
 def test_a_coverage_target_outside_its_range_is_refused():

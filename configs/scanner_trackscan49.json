@@ -64,7 +64,23 @@
     "contact_margin_mm": 5.0,
     "face": "auto",
     "band_deg": 70.0,
-    "knn": 24
+    "knn": 24,
+
+    "_comment_acceptance": [
+      "coverage_target_pct is the SITE's acceptance criterion, not a planner constant:",
+      "it buys 'how much area we are willing to patch by hand'. Measured on the real part",
+      "(design 2026-10-20, section 6.4), the greedy curve needs ~28 items to reach 99.0% and",
+      "~100 to reach 99.7%, so the last 0.7 of a point costs four times the whole rest of",
+      "the plan. 99.0 is the default; null runs until the coverage stops growing, which is",
+      "what reproduces the validated 102/114 baselines. Override per run with",
+      "  scanplan plan ... --coverage-target 97.5     (or  --coverage-target none)",
+      "",
+      "delivery_mode: path = order the sweeps and check a connector between every pair of",
+      "delivered points; lean = hand over the poses alone, exactly like v1, promising",
+      "nothing about the motion between them. Same coverage either way."
+    ],
+    "coverage_target_pct": 99.0,
+    "delivery_mode": "path"
   },
 
   "tracker": {
@@ -90,7 +106,25 @@
     "enabled=false keeps the pool and the result exactly as v1: that is the regression",
     "baseline, and max_stroke_mm=0 is the second way of saying the same thing.",
     "overlap_ratio from the design is deliberately absent: it belongs to the G2 grid sweep,",
-    "which is not implemented, and a knob nobody reads is worse than no knob."
+    "which is not implemented, and a knob nobody reads is worse than no knob.",
+    "",
+    "cost_model / transition_corners_estimate / connector_level / order_axis_weight_mm_per_deg",
+    "belong to the point-count work (design 2026-10-20-point-count-reduction-design.md):",
+    "  cost_model=corners        the selection divides by CORNERS (pose 1+t, stroke 2+t)",
+    "                            instead of by millimetres (pose 100, stroke 900). That ratio",
+    "                            is why the greedy pass took scattered poses and left the",
+    "                            long sweeps for the tail.",
+    "  cost_model=millimetres    the upstream design's pricing, kept so the two can be",
+    "                            compared on the same part.",
+    "  connector_level=2         retract + re-orient point between sweeps (today's path)",
+    "  connector_level=1         spread the rotation over the flight, dropping one corner",
+    "  connector_level=0         also allow a straight move between two identical poses",
+    "                            (WAIT FOR ROBOGUIDE before turning this on)",
+    "  order_axis_weight_mm_per_deg  60 deg of pose change costs the same as 120 mm of",
+    "                            detour. Distance alone makes a large re-orientation look",
+    "                            free, because it is only a short move.",
+    "max_prune_rounds 32: the measured run reported '28 -> 28', i.e. pruning was stopped by",
+    "the round limit and not by the target. Pruning is pure counting, no rays."
   ],
   "stroke": {
     "enabled": false,
@@ -105,7 +139,11 @@
     "check_step_mm": 10.0,
     "retract_clearance_mm": 50.0,
     "max_rot_deg_per_mm": 0.5,
-    "max_prune_rounds": 8
+    "max_prune_rounds": 32,
+    "cost_model": "corners",
+    "transition_corners_estimate": 1.0,
+    "connector_level": 1,
+    "order_axis_weight_mm_per_deg": 2.0
   },
 
   "_comment_motion": [

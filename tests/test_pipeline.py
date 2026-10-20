@@ -16,7 +16,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from scanplan.pipeline import _better, plan, write_outputs
+from scanplan.pipeline import _better, _rank_plan, plan, write_outputs
 from scanplan.selection import Selection
 from scanplan.tracker import Tracker, part_centroid
 
@@ -102,13 +102,26 @@ def test_the_refine_loop_stays_inside_its_budget(clamped_plate, cfg):
 
 def test_the_refine_loop_aims_at_the_uncovered_samples(clamped_plate, cfg):
     # greedy covers everything the pool can reach, so the only thing refinement can
-    # improve is the pool's ceiling - aiming new candidates at the uncovered samples
-    refining = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=1))
+    # improve is the pool's ceiling - aiming new candidates at the uncovered samples.
+    # It only runs below the acceptance target: at a target there is always something
+    # uncovered, and re-aiming at it buys coverage the target excludes.
+    refining = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=1),
+                       target=replace(cfg.target, coverage_target_pct=None))
     result = plan(clamped_plate.station, refining, face="upper")
     counters = result.report["counters"]
     assert counters["refine_rounds"] == 1
     assert counters["refine_candidates"] > 0
     assert len(result.coverage.poses) > len(result.report["viewpoint_records"])
+
+
+def test_refinement_is_skipped_once_the_acceptance_target_is_met(clamped_plate, cfg):
+    """A met target leaves leftovers by definition, so refining would chase the tail."""
+    refining = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=2))
+    result = plan(clamped_plate.station, refining, face="upper")
+    target = refining.target.coverage_target_pct
+    if target is not None and result.selection.coverage_pct + 1e-9 >= target:
+        assert result.report["counters"]["refine_rounds"] == 0
+        assert result.report["counters"]["refine_candidates"] == 0
 
 
 def test_more_coverage_wins_and_a_tie_goes_to_the_fewer_poses():
@@ -123,14 +136,75 @@ def test_more_coverage_wins_and_a_tie_goes_to_the_fewer_poses():
     assert _better(more, more) is more
 
 
+def test_meeting_the_target_outranks_covering_more():
+    """Past the acceptance figure, extra coverage buys nothing the workshop asked for."""
+    met_with_more_corners = (99.13, 80, 4000.0)
+    met_with_fewer_corners = (99.02, 50, 6000.0)
+    missed = (98.90, 10, 900.0)
+    assert _rank_plan(met_with_fewer_corners[0], met_with_fewer_corners[1],
+                      met_with_fewer_corners[2], 99.0) \
+        > _rank_plan(met_with_more_corners[0], met_with_more_corners[1],
+                     met_with_more_corners[2], 99.0)
+    # below the target the old order applies: whoever covers more wins
+    assert _rank_plan(99.0, 80, 4000.0, 99.0) > _rank_plan(*missed, 99.0)
+    assert _rank_plan(98.95, 5, 100.0, 99.0) > _rank_plan(*missed, 99.0)
+    # and an unset target is exactly v1's ordering
+    assert _rank_plan(99.5, 100, 0.0, None) > _rank_plan(99.0, 1, 0.0, None)
+
+
+def test_a_selection_survives_poses_being_appended_to_the_pool():
+    """A stroke's row moves when poses are added, because poses come first in the pool.
+
+    Without the remap, a selection made before a refinement round keeps its numbers but
+    names different candidates - the measured run delivered "8 items, 0 strokes, 33.22%"
+    for a mixed plan that had just covered 97.15%.
+    """
+    from scanplan.pipeline import _shift_rows
+
+    picked = choice(97.15, 3)
+    picked.chosen = [0, 2, 3654, 3660]
+    picked.greedy = [0, 2, 3654]
+    picked.repair = [3660]
+    picked.sources = np.array(["greedy", "greedy", "greedy", "repair"], dtype=object)
+    picked.corners = 7
+    moved = _shift_rows(picked, 3654, 11654)
+    assert moved.chosen == [0, 2, 11654, 11660]
+    assert moved.greedy == [0, 2, 11654] and moved.repair == [11660]
+    assert moved.corners == 7 and moved.coverage_pct == picked.coverage_pct
+    assert _shift_rows(picked, 3654, 3654) is picked
+
+
+def test_two_meeting_plans_are_separated_by_corners_then_travel():
+    left = _rank_plan(99.20, 60, 5000.0, 99.0)
+    right = _rank_plan(99.05, 55, 6000.0, 99.0)
+    assert right > left
+    same_corners = _rank_plan(99.05, 55, 4000.0, 99.0)
+    assert same_corners > right
+
+
+def test_a_priced_selection_uses_its_corners_not_its_item_count():
+    """Ten strokes are twenty corners and thirty poses are thirty: they are not the same."""
+    strokes = choice(99.0, 10)
+    strokes.corners = 20
+    poses = choice(99.0, 30)
+    poses.corners = 30
+    assert strokes.cost_corners == 20 and poses.cost_corners == 30
+    assert _better(poses, strokes) is strokes
+    # unpriced, the item count is the best available answer
+    unpriced = choice(99.0, 10)
+    assert unpriced.cost_corners == 10
+
+
 def test_a_refinement_round_that_gains_nothing_leaves_the_viewpoint_set_alone(
         clamped_plate, cfg):
     # on this station the leak sits under the clamp, so refinement cannot raise the pool's
     # ceiling. Re-selecting over the enlarged pool then only re-rolls the same answer, and
     # greedy on more candidates can need MORE poses for the same coverage - which the design
     # ranks as a worse result (coverage first, then viewpoint count).
-    coarse = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=0))
-    refined = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=1))
+    coarse = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=0),
+                     target=replace(cfg.target, coverage_target_pct=None))
+    refined = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=1),
+                      target=replace(cfg.target, coverage_target_pct=None))
     without = plan(clamped_plate.station, coarse, face="upper")
     with_round = plan(clamped_plate.station, refined, face="upper")
     assert with_round.report["counters"]["refine_rounds"] == 1

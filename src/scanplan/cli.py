@@ -31,7 +31,7 @@ import numpy as np
 
 from scanview import DEFAULT_MAX_FACES, VIEWER_FILE_NAME, render_run
 
-from .config import FACES, load_config, read_json
+from .config import FACES, load_config, override, read_json
 from .raycast import backend_name
 from .report import summary_lines
 from .roboguide.adapt import export as export_ls
@@ -75,6 +75,10 @@ def _build_parser() -> argparse.ArgumentParser:
     planner.add_argument("--fixture", help="fixture mesh, if no --station is given")
     planner.add_argument("--base", help="base mesh, if no --station is given")
     planner.add_argument("--config", help="configuration override (JSON)")
+    planner.add_argument("--coverage-target", dest="coverage_target",
+                         help="acceptance coverage in percent, or 'none' to run until the "
+                              "coverage stops growing; overrides the configuration for "
+                              "this run")
     planner.add_argument("--face", choices=FACES, help="which face of the blank to scan")
     planner.add_argument("--tracker", help="tracker pose 'x,y,z' if the station has none")
     planner.add_argument("--tracker-aim", help="tracker aim point 'x,y,z'")
@@ -127,6 +131,7 @@ def _run_plan(args, parser: argparse.ArgumentParser) -> int:
     say = (lambda message: None) if args.quiet else (lambda message: print(message, flush=True))
     try:
         cfg = load_config(args.config)
+        cfg = _apply_overrides(cfg, args, parser)
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
         parser.error(f"cannot read the configuration: {error}")
         return 2
@@ -160,6 +165,23 @@ def _run_plan(args, parser: argparse.ArgumentParser) -> int:
               "(no network needed)")
     print("next: scanplan ls --viewpoints viewpoints.json --prog-name <NAME> --out <dir>")
     return 0
+
+
+def _apply_overrides(cfg, args, parser: argparse.ArgumentParser):
+    """Apply the flags that are not part of the configuration file merge."""
+    if args.coverage_target is None:
+        return cfg
+    raw = str(args.coverage_target).strip().lower()
+    if raw in ("none", "null", ""):
+        value = None
+    else:
+        try:
+            value = float(raw)
+        except ValueError:
+            parser.error(f"--coverage-target takes a percentage or 'none', not "
+                         f"{args.coverage_target!r}")
+            return cfg
+    return override(cfg, target={"coverage_target_pct": value})
 
 
 def _station_description(args, parser: argparse.ArgumentParser) -> StationDescription:

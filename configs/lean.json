@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Pose-only delivery with a coverage target: the fewest corners this planner can hand over.",
+    "Design 2026-10-20-point-count-reduction-design.md, section 0.2 and decision E9/E10.",
+    "",
+    "  scanplan plan --station input/station.json --config configs/lean.json --out output/lean",
+    "",
+    "`delivery_mode: lean` switches the stroke stage off entirely, so the delivered set is the",
+    "chosen poses and nothing else: no connectors, no clearance check between two poses, and no",
+    "claim about what the head does between them. That is exactly what v1 delivered - the",
+    "difference is only that the selection stops at the acceptance target instead of running",
+    "until the coverage stops growing.",
+    "",
+    "Measured on the real part (upper face, 1.0544 m2): v1 was 102 points at 99.70%. The greedy",
+    "curve needs ~28 items to reach 99.0% and ~100 to reach 99.7%, so the tail is where the",
+    "points went. Use this profile to see the floor; use the default `path` mode when the motion",
+    "between the poses has to be checked.",
+    "",
+    "coverage_target_pct is a SITE setting - change it here rather than passing",
+    "--coverage-target on every run, so the file records what this part was accepted against."
+  ],
+  "target": {
+    "delivery_mode": "lean",
+    "coverage_target_pct": 99.0
+  },
+  "stroke": {
+    "enabled": false
+  }
+}

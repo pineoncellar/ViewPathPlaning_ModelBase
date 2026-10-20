@@ -27,7 +27,7 @@ different from one that a better pool would fix.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,7 +56,14 @@ from .scanner_model import ScannerModel
 from .scene import Station
 from .selection import Selection, select, select_groups
 from .sheet_split import SheetSplit, split_sheet
-from .strokes import StrokeBuilder, StrokeCoverage, combine, merge_stroke_coverage
+from .strokes import (
+    Stroke,
+    StrokeBuilder,
+    StrokeCoverage,
+    combine,
+    merge_stroke_coverage,
+    pose_stroke,
+)
 from .target_surface import TargetSet, build_target
 from .tracker import Tracker, visible_mask
 
@@ -124,7 +131,11 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
                 say(f"  {option} face cannot be planned: {error}")
         if not candidates:
             raise ValueError("no target face could be sampled: check the split of this part")
-        best = max(candidates, key=lambda name: candidates[name].selection.coverage_pct)
+        # The same key the plan is finally judged by: meeting the target first, then
+        # fewer corners. Choosing the face by coverage alone and then ranking the result by
+        # corners would let the two disagree about which side is better.
+        best = max(candidates, key=lambda name: _rank(candidates[name].selection,
+                                                      cfg.target.coverage_target_pct))
         result = candidates[best]
         result.face_candidates = {name: candidate.selection.coverage_pct
                                  for name, candidate in candidates.items()}
@@ -158,13 +169,17 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     say(f"  pose coverage took {time.time() - mark:.0f} s")
     mark = time.time()
 
-    pose_selection = select(coverage, coverage.area_mm2, log=log)
+    pose_selection = select(coverage, coverage.area_mm2,
+                            coverage_target_pct=cfg.target.coverage_target_pct, log=log)
     builder = _stroke_builder(cfg, target, station, model, gate)
     if builder is None:
         say("  stroke planning is off: the delivered set is single poses")
     stroke_cov: StrokeCoverage | None = None
     combined = coverage
     selection = pose_selection
+    # The pose count of the pool `selection` was chosen from. `combine` puts every pose
+    # before every stroke, so appending poses shifts each stroke's row - see `_shift_rows`.
+    selection_poses = len(coverage.poses)
     if builder is not None:
         say("growing scan strokes from the aim grid")
         stroke_cov = builder.evaluate(
@@ -177,12 +192,22 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
         say(f"  pose-only reference: {len(pose_selection.chosen)} viewpoints at "
             f"{pose_selection.coverage_pct:.2f}%; strokes reach "
             f"{len(selection.chosen)} items at {selection.coverage_pct:.2f}%")
+        selection_poses = len(coverage.poses)
 
     counters = dict(coverage.counters)
     counters["refine_rounds"] = 0
     counters["refine_candidates"] = 0
 
     for round_index in range(cfg.scanner.refine_rounds):
+        if (cfg.target.coverage_target_pct is not None
+                and selection.coverage_pct + 1e-9 >= cfg.target.coverage_target_pct):
+            # Refinement re-aims at everything still uncovered, and at a target there is
+            # always something uncovered - by design, that is the area the workshop patches
+            # by hand. The extra candidates mostly buy coverage the target excludes, at a
+            # third of the run's ray budget each. Use `--coverage-target none` to get the
+            # old "keep aiming until nothing is left" behaviour back.
+            say(f"  the {cfg.target.coverage_target_pct:g}% target is met: not refining")
+            break
         # Aim at every sample still uncovered - not only those the current pool can reach.
         # Greedy covers the whole reachable set, so the reachable-but-uncovered set is
         # always empty; what refinement exists to improve is the pool's ceiling, and the
@@ -215,8 +240,11 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
             offered = _group_selection(combined, coverage, stroke_cov, cfg, log=log)
         else:
             combined = coverage
-            offered = select(coverage, coverage.area_mm2, log=log)
-        selection = _better(selection, offered)
+            offered = select(coverage, coverage.area_mm2,
+                             coverage_target_pct=cfg.target.coverage_target_pct, log=log)
+        selection = _better(_shift_rows(selection, selection_poses, len(coverage.poses)),
+                            offered, cfg.target.coverage_target_pct)
+        selection_poses = len(coverage.poses)
         say(f"  pool ceiling {ceiling_before:.2f}% -> {combined.pool_reach_pct:.2f}%; "
             f"keeping {len(selection.chosen)} candidates at {selection.coverage_pct:.2f}% "
             f"(this round offered {len(offered.chosen)} at {offered.coverage_pct:.2f}%)")
@@ -233,8 +261,6 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
         selection, path, swept_pct = _finish_stroke_plan(
             combined, coverage, stroke_cov, selection, pose_selection, target, station,
             model, cfg, gate, log=log)
-        if path is None:
-            combined = coverage
     counters.update({key: value for key, value in combined.counters.items()})
 
     if path is not None:
@@ -260,7 +286,11 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
 
 def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
                     model: ScannerModel, gate) -> StrokeBuilder | None:
-    """The stroke builder, or None when stroke planning is switched off."""
+    """The stroke builder, or None when the delivered set is single poses."""
+    if cfg.target.delivery_mode == "lean":
+        # The lean deliverable is v1 plus a stopping rule: poses alone, no connectors, and
+        # therefore no claim about the motion between them. Strokes cannot be part of it.
+        return None
     if not cfg.stroke.enabled:
         return None
     if cfg.stroke.max_stroke_mm <= 0.0:
@@ -271,12 +301,65 @@ def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
 def _group_selection(combined: CoverageResult, coverage: CoverageResult,
                      stroke_cov: StrokeCoverage, cfg: PlannerConfig, *,
                      log=None) -> Selection:
-    """Set cover over poses and strokes together, priced by travel plus one stop each."""
+    """Set cover over poses and strokes together, priced in the configured unit.
+
+    `corners` is the default because it is what the workshop counts: one stop for a pose,
+    two for a stroke, plus the transition each one drags along. `millimetres` is the
+    upstream design's pricing and is kept so the two can be compared on the same part.
+    """
     stop = float(cfg.stroke.stop_cost_mm)
+    transition = float(cfg.stroke.transition_corners_estimate)
     n_poses = len(coverage.poses)
-    costs = [stop] * n_poses + [stroke.length_mm + stop for stroke in stroke_cov.strokes]
+    if cfg.stroke.cost_model == "corners":
+        costs = [1.0 + transition] * n_poses + [2.0 + transition] * len(stroke_cov.strokes)
+    else:
+        costs = ([stop] * n_poses
+                 + [stroke.length_mm + stop for stroke in stroke_cov.strokes])
     repair_ok = [True] * n_poses + [False] * len(stroke_cov.strokes)
-    return select_groups(combined, costs, repair_ok=repair_ok, log=log)
+    return select_groups(combined, costs, repair_ok=repair_ok,
+                         coverage_target_pct=cfg.target.coverage_target_pct, log=log)
+
+
+def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, str],
+              stroke_cov: StrokeCoverage, coverage: CoverageResult, cfg: PlannerConfig,
+              station: Station, model: ScannerModel, gate, *,
+              log=None) -> tuple[Selection, PathPlan]:
+    """Prune and order an explicit set of chosen rows into a delivered path.
+
+    Poses go in as zero-length strokes. That is not a trick: the module documentation of
+    `strokes` already says a stroke of length zero is a viewpoint, and delivering them this
+    way is what keeps the reported coverage and the program's actual sweep the same number.
+    Pruning sees every row, so a pose the target does not need can go too.
+    """
+    n_poses = len(coverage.poses)
+    say = log or (lambda _message: None)
+    items: list[Stroke] = []
+    item_rows: list[int] = []
+    item_sets: list[np.ndarray] = []
+    for row in rows:
+        item_rows.append(int(row))
+        item_sets.append(combined.sets[int(row)])
+        if row < n_poses:
+            pose = coverage.poses[int(row)]
+            items.append(pose_stroke(pose.position, pose.axis, pose.roll_deg))
+        else:
+            items.append(stroke_cov.strokes[int(row) - n_poses])
+
+    target_pct = cfg.target.coverage_target_pct
+    kept = prune(items, item_sets, list(range(len(items))), combined.area_mm2,
+                 combined.target_area_mm2,
+                 target_pct=PRUNE_TARGET_PCT if target_pct is None else target_pct,
+                 max_rounds=cfg.stroke.max_prune_rounds)
+    if len(kept) < len(items):
+        say(f"  pruning: {len(items)} selected items -> {len(kept)} while staying at "
+            f"{(PRUNE_TARGET_PCT if target_pct is None else target_pct):g}%")
+    kept_rows = [item_rows[index] for index in kept]
+    rebuilt = _rebuild_selection(combined, kept_rows, sources, None)
+    path = build_path([items[index] for index in kept], cfg=cfg, station=station,
+                      model=model, coverage_index=lambda index: kept_rows[index],
+                      sources=lambda index: sources.get(kept_rows[index], "greedy"),
+                      visible=gate, log=log)
+    return rebuilt, path
 
 
 def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
@@ -284,39 +367,61 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
                         pose_selection: Selection, target: TargetSet, station: Station,
                         model: ScannerModel, cfg: PlannerConfig, gate,
                         *, log=None):
-    """Prune, order, connect - then keep the result only if it beats the pose-only plan.
+    """Build both deliveries, then keep the one that is better on the same scale.
 
-    The comparison is the design's guarantee ("not worse than today"): coverage first,
-    then fewer corners, then less travel. It is what stops a bad stroke pool from being
-    handed over just because it was the new idea.
+    Two candidate deliverables, both ordered and connected by the same code:
+
+    * the mixed one - the selected poses and the strokes that survived pruning;
+    * the pose-only one - which is what the run would deliver without a stroke stage.
+
+    Comparing them on ACTUAL corners rather than on "one per pose, two per stroke" is the
+    point. Once the selection stops at a coverage target, the pose pool also stops there,
+    so a hand-waved comparison hands the whole deliverable to poses - with no connectors -
+    and `path` mode silently becomes the unverified v1 motion it exists to replace.
+
+    The ranking is the design's guarantee ("not worse than today"): met the target first,
+    then fewer corners, then less travel.
     """
     say = log or (lambda _message: None)
-    n_poses = len(coverage.poses)
+    target_pct = cfg.target.coverage_target_pct
     sources = {int(row): str(source)
                for row, source in zip(selection.chosen, selection.sources, strict=True)}
-    stroke_rows = [int(row) - n_poses for row in selection.chosen if row >= n_poses]
-    pose_rows = [int(row) for row in selection.chosen if row < n_poses]
-    kept = prune(stroke_cov.strokes, stroke_cov.sets, stroke_rows, combined.area_mm2,
-                 combined.target_area_mm2, target_pct=PRUNE_TARGET_PCT,
-                 max_rounds=cfg.stroke.max_prune_rounds)
-    say(f"  pruning: {len(stroke_rows)} strokes -> {len(kept)} while staying at "
-        f"{PRUNE_TARGET_PCT:g}%")
-    if not kept:
-        say("  no stroke survived pruning: falling back to the pose-only plan")
-        return pose_selection, None, None
-    rows = pose_rows + [n_poses + index for index in kept]
-    rebuilt = _rebuild_selection(combined, rows, sources, selection)
-    path = build_path(
-        [stroke_cov.strokes[index] for index in kept], cfg=cfg, station=station,
-        model=model, coverage_index=lambda index: n_poses + kept[index],
-        sources=lambda index: sources.get(n_poses + kept[index], "greedy"), log=log)
-    if _rank_plan(rebuilt.coverage_pct, path.turns, path.path_length_mm) < _rank_plan(
-            pose_selection.coverage_pct, len(pose_selection.chosen), 0.0):
-        say(f"  the stroke plan ({rebuilt.coverage_pct:.2f}%, {path.turns} corners) does "
-            f"not beat the pose-only plan ({pose_selection.coverage_pct:.2f}%, "
-            f"{len(pose_selection.chosen)} corners): delivering the poses")
-        return pose_selection, None, None
+    mixed_sel, mixed_path = _delivery(combined, selection.chosen, sources, stroke_cov,
+                                      coverage, cfg, station, model, gate, log=log)
+    pose_sources = {int(row): str(source) for row, source
+                    in zip(pose_selection.chosen, pose_selection.sources, strict=True)}
+    pose_sel, pose_path = _delivery(combined, pose_selection.chosen, pose_sources,
+                                    stroke_cov, coverage, cfg, station, model, gate,
+                                    log=log)
+    mixed_sel.corners = mixed_path.turns
+    pose_sel.corners = pose_path.turns
 
+    mixed_rank = _rank_plan(mixed_sel.coverage_pct, mixed_path.turns,
+                            mixed_path.path_length_mm, target_pct)
+    pose_rank = _rank_plan(pose_sel.coverage_pct, pose_path.turns,
+                           pose_path.path_length_mm, target_pct)
+    if pose_rank >= mixed_rank:
+        say(f"  the mixed plan ({mixed_sel.coverage_pct:.2f}%, {mixed_path.turns} corners, "
+            f"{mixed_path.path_length_mm:.0f} mm) does not beat the pose-only plan "
+            f"({pose_sel.coverage_pct:.2f}%, {pose_path.turns} corners, "
+            f"{pose_path.path_length_mm:.0f} mm): delivering the poses")
+        return pose_sel, pose_path, _swept_pct(pose_sel, pose_path, target, station, model,
+                                               cfg, combined, gate, log=log)
+    say(f"  the mixed plan wins: {mixed_sel.coverage_pct:.2f}%, {mixed_path.turns} corners "
+        f"against the pose-only {pose_sel.coverage_pct:.2f}%, {pose_path.turns}")
+    return mixed_sel, mixed_path, _swept_pct(mixed_sel, mixed_path, target, station, model,
+                                             cfg, combined, gate, log=log)
+
+
+def _swept_pct(rebuilt: Selection, path: PathPlan, target: TargetSet, station: Station,
+               model: ScannerModel, cfg: PlannerConfig, combined: CoverageResult, gate,
+               *, log=None) -> float:
+    """The coverage the path actually sweeps, transitions included.
+
+    Reported for the workshop and never used for acceptance: it depends on the ordering,
+    so a plan could "gain" coverage by flying over the part.
+    """
+    say = log or (lambda _message: None)
     swept_pct = rebuilt.coverage_pct
     swings = transition_poses(path, cfg)
     if swings:
@@ -328,12 +433,36 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
             swept_pct = float(100.0 * combined.area_mm2[covered].sum()
                               / combined.target_area_mm2)
         say(f"  the path sweeps {swept_pct:.2f}% against {rebuilt.coverage_pct:.2f}% "
-            f"promised by the strokes alone")
-    return rebuilt, path, swept_pct
+            f"promised by the chosen items alone")
+    return swept_pct
+
+
+def _shift_rows(selection: Selection, old_poses: int, new_poses: int) -> Selection:
+    """Rewrite a selection's stroke rows after more poses were appended to the pool.
+
+    `combine` puts every pose before every stroke, so adding `offset` poses moves stroke `i`
+    from row `old_poses + i` to `new_poses + i`. Without this, a selection made before a
+    refinement round silently points at different candidates afterwards: the measured run
+    printed a mixed plan of 8 items covering 97.15% and then delivered "8 items, 0 strokes,
+    33.22%", because the same row numbers now named eight poses.
+    """
+    offset = int(new_poses) - int(old_poses)
+    if offset == 0:
+        return selection
+
+    def shift(values):
+        return [int(row) if int(row) < old_poses else int(row) + offset for row in values]
+
+    return Selection(chosen=shift(selection.chosen), greedy=shift(selection.greedy),
+                     repair=shift(selection.repair), covered=selection.covered,
+                     curve=list(selection.curve),
+                     coverage_area_mm2=selection.coverage_area_mm2,
+                     target_area_mm2=selection.target_area_mm2,
+                     sources=selection.sources, corners=selection.corners)
 
 
 def _rebuild_selection(combined: CoverageResult, rows, sources: dict[int, str],
-                       previous: Selection) -> Selection:
+                       previous: Selection | None = None) -> Selection:
     """A `Selection` over an explicit row list, after pruning removed some rows."""
     covered = np.zeros(combined.n_targets, dtype=bool)
     for row in rows:
@@ -346,29 +475,43 @@ def _rebuild_selection(combined: CoverageResult, rows, sources: dict[int, str],
                 if label == "greedy"],
         repair=[int(row) for row, label in zip(rows, labels, strict=True)
                 if label == "repair"],
-        covered=covered, curve=list(previous.curve),
+        covered=covered, curve=[] if previous is None else list(previous.curve),
         coverage_area_mm2=float(area[covered].sum()),
         target_area_mm2=combined.target_area_mm2,
         sources=np.array(labels, dtype=object))
 
 
-def _rank_plan(coverage_pct: float, turns: int, length_mm: float) -> tuple:
-    """Coverage, then fewer corners, then less travel - the design's ordering."""
-    return (round(coverage_pct, 6), -int(turns), -float(length_mm))
+def _rank_plan(coverage_pct: float, corners: int, length_mm: float,
+               target_pct: float | None) -> tuple:
+    """Met the target first, then fewer corners, then less travel.
+
+    The first component is a two-way split, not a coverage ranking: once a plan meets the
+    acceptance figure, more coverage buys nothing the workshop asked for, so it must not
+    outrank a plan with fewer corners. Below the target the old order applies - whoever
+    covers more wins - which is what keeps `coverage_target_pct = null` behaving exactly
+    like v1.
+    """
+    if target_pct is None:
+        return (round(float(coverage_pct), 6), -int(corners), -float(length_mm))
+    if float(coverage_pct) + 1e-9 >= float(target_pct):
+        return (1, -int(corners), -float(length_mm))
+    return (0, round(float(coverage_pct), 6), -int(corners), -float(length_mm))
 
 
-def _better(first: Selection, second: Selection) -> Selection:
-    """Coverage first, then fewer poses - the design's ranking of the two criteria.
+def _better(first: Selection, second: Selection,
+            target_pct: float | None = None) -> Selection:
+    """Met the target first, then fewer corners - the design's ranking of the two criteria.
 
     Needed because the pool a later round selects over is larger, and greedy on a larger
     pool can need MORE poses for the same coverage. That is a worse deliverable, so a round
     that does not raise the pool's ceiling must not be allowed to re-roll the answer.
     """
-    return second if _rank(second) > _rank(first) else first
+    return second if _rank(second, target_pct) > _rank(first, target_pct) else first
 
 
-def _rank(selection: Selection) -> tuple[float, int]:
-    return (round(selection.coverage_pct, 6), -len(selection.chosen))
+def _rank(selection: Selection, target_pct: float | None = None) -> tuple:
+    """The ranking key of a selection, in the same form `_rank_plan` produces."""
+    return _rank_plan(selection.coverage_pct, selection.cost_corners, 0.0, target_pct)
 
 
 def write_outputs(result: PlanResult, out_dir, *, write_3d: bool = True,

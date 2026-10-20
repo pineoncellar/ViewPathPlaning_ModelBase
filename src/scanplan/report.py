@@ -228,12 +228,18 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
 
 def _program_block(config: PlannerConfig, viewpoints, path: PathPlan | None) -> dict:
     """What the workshop is handed: the motion, the corners, and what the path costs."""
+    target = config.target.coverage_target_pct
     block = {
         "motion": config.motion.type,
         "termination": config.motion.termination,
         "speed_mm_s": config.motion.speed_mm_s,
         "speed_note": ("set on the floor and deliberately not optimised here: scan speed "
                        "is a site setting, not a planning variable"),
+        "delivery_mode": config.target.delivery_mode,
+        "coverage_target_pct": target,
+        "coverage_target_note": (
+            "the acceptance figure in force for this run; null means the selection ran "
+            "until no candidate added new coverage, which is the v1 behaviour"),
         "points": len(viewpoints),
         "coverage_points": sum(1 for vp in viewpoints if vp.role == "coverage"),
         "transition_points": sum(1 for vp in viewpoints if vp.role != "coverage"),
@@ -253,6 +259,9 @@ def _program_block(config: PlannerConfig, viewpoints, path: PathPlan | None) -> 
         "min_clearance_mm": (None if path.min_clearance_mm is None
                              else round(float(path.min_clearance_mm), 1)),
         "constraint_violations": list(path.violations),
+        # Which route every transition took. Without this, "the connector got cheaper" is
+        # a claim rather than a measurement.
+        "connector_levels": dict(sorted(path.connector_levels.items())),
     })
     return block
 
@@ -267,13 +276,15 @@ def _stroke_block(strokes: StrokeCoverage | None, path: PathPlan | None,
                          "same result v1 produces")}
     lengths = np.array([stroke.length_mm for stroke in strokes.strokes]) \
         if strokes.strokes else np.zeros(0)
+    delivered = None if path is None else int(path.coverage_strokes)
     block = {
         "enabled": True,
-        "delivered": path is not None,
+        "delivered": bool(delivered),
         "candidates": len(strokes.strokes),
-        "delivered_strokes": (None if path is None else
-                              len({point.stroke_id for point in path.points
-                                   if point.stroke_id is not None})),
+        # Counted from the items actually delivered, and a delivered POSE is a zero-length
+        # stroke - so this is the number of real sweeps, not the number of distinct
+        # `stroke_id`s in the path.
+        "delivered_strokes": delivered,
         "length_mm": ({"min": round(float(lengths.min()), 1),
                        "median": round(float(np.median(lengths)), 1),
                        "max": round(float(lengths.max()), 1)} if len(lengths) else None),
@@ -283,15 +294,17 @@ def _stroke_block(strokes: StrokeCoverage | None, path: PathPlan | None,
         else round(float(swept_coverage_pct), 3),
         "pose_only_coverage_pct": None if pose_only_coverage_pct is None
         else round(float(pose_only_coverage_pct), 3),
-        "acceptance": ("promised coverage (coverage_pct) counts the strokes only. The swept "
-                       "figure adds whatever the transition segments happen to pass over; it "
-                       "depends on the ordering, so it is reported for the workshop and never "
-                       "used for acceptance or for the fallback comparison"),
+        "acceptance": ("promised coverage (coverage_pct) counts every delivered coverage "
+                       "point - a selected pose is delivered as a zero-length stroke - so "
+                       "it is what the program actually sweeps. `swept_coverage_pct` adds "
+                       "whatever the transition segments happen to pass over; it depends on "
+                       "the ordering, so it is reported for the workshop and never used for "
+                       "acceptance or for the fallback comparison"),
     }
-    if path is None:
-        block["note"] = ("strokes were generated but the delivered plan is the pose-only "
-                         "one: the stroke plan did not beat it on coverage, corners and "
-                         "travel, which is the guarantee the design asks for")
+    if not delivered:
+        block["note"] = ("the delivered plan is the pose-only one: the mixed plan did not "
+                         "beat it on target, corners and travel, which is the guarantee the "
+                         "design asks for")
     return block
 
 
@@ -505,7 +518,11 @@ def summary_lines(report: dict) -> list[str]:
         f"exempt (clamped)       {report['exempt']['points']} samples "
         f"{report['exempt']['area_mm2'] / 1e6:.4f} m2",
         f"coverage               {report['coverage_pct']:.2f}%  "
-        f"(pool could reach {report['pool_reach_pct']:.2f}%)",
+        f"(pool could reach {report['pool_reach_pct']:.2f}%)"
+        + ("" if report.get("program", {}).get("coverage_target_pct") is None else
+           f"  target {report['program']['coverage_target_pct']:g}% "
+           + ("met" if report["coverage_pct"] + 1e-9
+              >= report["program"]["coverage_target_pct"] else "NOT MET")),
         f"points                 {report['viewpoints']} "
         f"({report['viewpoints_greedy']} greedy + {report['viewpoints_repair']} repair"
         + (f" + {report['viewpoints_transition']} transition"

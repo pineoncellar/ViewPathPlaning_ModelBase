@@ -16,12 +16,20 @@ mistyped parameter would otherwise leave a placeholder silently in force.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields
+import types
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Any, get_args, get_origin, get_type_hints
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 DEFAULT_CONFIG_NAME = "scanner_trackscan49.json"
 FACES = ("upper", "lower", "auto")
+# How the delivered program is assembled. `path` checks the motion between every pair of
+# delivered points; `lean` delivers the poses alone, exactly like v1, and promises nothing
+# about what the head does between them.
+DELIVERY_MODES = ("path", "lean")
+# What the selection optimises against. Millimetres is the upstream design's choice and is
+# kept so the two can be compared on the same part; corners is what the workshop counts.
+COST_MODELS = ("corners", "millimetres")
 
 
 @dataclass(frozen=True)
@@ -55,7 +63,17 @@ class ScannerParams:
 
 @dataclass(frozen=True)
 class TargetParams:
-    """Sampling of the target face and the fixture-contact exemption."""
+    """Sampling of the target face, the fixture-contact exemption, and the acceptance.
+
+    `coverage_target_pct` is the acceptance criterion, and it is a site setting rather
+    than a planner constant: what it buys is "how much area the workshop is willing to
+    patch by hand". Left at None the selection runs until no candidate adds new coverage,
+    which reproduces the validated v1 count.
+
+    `delivery_mode` chooses between the two deliverables. `path` orders the chosen sweeps
+    and inserts a checked connector between them; `lean` hands over the poses alone and
+    makes no claim about the motion between them - see the config comment.
+    """
 
     sample_grid_mm: float
     contact_mm: float
@@ -63,6 +81,8 @@ class TargetParams:
     face: str
     band_deg: float
     knn: int
+    coverage_target_pct: float | None
+    delivery_mode: str
 
 
 @dataclass(frozen=True)
@@ -86,6 +106,22 @@ class StrokeParams:
 
     `enabled=False` reproduces the v1 result exactly, which is what makes every
     later change provable; `max_stroke_mm=0` is the same thing said another way.
+
+    Three of these belong to the point-count work (design 2026-10-20, sections 3-M2,
+    3-M3 and 3-M5):
+
+    * `cost_model` is what the selection divides by. `millimetres` is the upstream
+      design's "travel plus one stop", and it makes a stroke cost 8.9 times a pose, so
+      the greedy pass takes poses first and strokes only for the tail. `corners` counts
+      what the workshop counts: one stop for a pose, two for a stroke, plus the
+      transition an extra `transition_corners_estimate` each.
+    * `connector_level` is the most compressed connector the planner may use: 2 is the
+      route through a retract AND a re-orientation point, 1 spreads the rotation over the
+      flight and drops the second point, 0 also allows a straight move between two
+      identical poses. 0 stays off until ROBOGUIDE has confirmed it.
+    * `order_axis_weight_mm_per_deg` prices a pose change in the ordering. Distance alone
+      ignores the axis, so two adjacent strokes 60 degrees apart in pose look free to
+      travel between and cost a large re-orientation instead.
     """
 
     enabled: bool
@@ -101,6 +137,10 @@ class StrokeParams:
     retract_clearance_mm: float
     max_rot_deg_per_mm: float
     max_prune_rounds: int
+    cost_model: str
+    transition_corners_estimate: float
+    connector_level: int
+    order_axis_weight_mm_per_deg: float
 
 
 @dataclass(frozen=True)
@@ -149,6 +189,21 @@ def load_config(path: str | Path | None = None) -> PlannerConfig:
         data = _deep_merge(data, _read_json(override_path))
         override_name = str(override_path)
     return _build(data, str(base_path), override_name)
+
+
+def override(config: PlannerConfig, **sections) -> PlannerConfig:
+    """A copy of `config` with some section fields replaced, then re-validated.
+
+    The command line is a second writer of the same knobs as the JSON file, so it has to go
+    through the same validation; otherwise the two can disagree about what is legal and the
+    illegal value wins only when it arrives by flag.
+    """
+    replacement = config
+    for name, changes in sections.items():
+        section = getattr(config, name)
+        replacement = replace(replacement, **{name: replace(section, **changes)})
+    _validate(replacement)
+    return replacement
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -244,12 +299,32 @@ def _coerce(annotation: Any, value: Any) -> Any:
 
 
 def _scalar(annotation: Any, value: Any) -> Any:
+    optional = _optional_member(annotation)
+    if value is None:
+        if optional is None and annotation is not type(None):
+            raise ValueError("this value cannot be null")
+        return None
+    if optional is not None:
+        return _scalar(optional, value)
     if isinstance(annotation, type):
         try:
             return annotation(value)
         except (TypeError, ValueError) as error:
             raise ValueError(f"cannot read {value!r} as {annotation.__name__}") from error
     return value
+
+
+def _optional_member(annotation: Any):
+    """The single non-null member of `X | None`, or None when this is not such a union.
+
+    Needed because `null` is a meaningful setting for the acceptance threshold: it is the
+    switch back to "run until the coverage stops growing".
+    """
+    if isinstance(annotation, types.UnionType) or get_origin(annotation) is Union:
+        members = [member for member in get_args(annotation) if member is not type(None)]
+        if len(members) == 1:
+            return members[0]
+    return None
 
 
 MOTION_TYPES = ("J", "L")
@@ -283,6 +358,13 @@ def _validate(config: PlannerConfig) -> None:
         raise ValueError("'depth_of_field_mm' must be positive")
     if target.face not in FACES:
         raise ValueError(f"'face' must be one of {FACES}, not {target.face!r}")
+    if target.coverage_target_pct is not None and not 0.0 < target.coverage_target_pct <= 100.0:
+        raise ValueError("'coverage_target_pct' must be in (0, 100], or null to run until "
+                         "the coverage stops growing - a value outside that range is "
+                         "refused rather than silently clamped")
+    if target.delivery_mode not in DELIVERY_MODES:
+        raise ValueError(f"'delivery_mode' must be one of {DELIVERY_MODES}, "
+                         f"not {target.delivery_mode!r}")
     if config.tracker.model_robot_occlusion:
         # There is no robot model at this stage, so this flag cannot be honoured.
         raise ValueError("'model_robot_occlusion' is not implemented; leave it false")
@@ -315,3 +397,14 @@ def _validate_strokes(stroke: StrokeParams) -> None:
         raise ValueError("'max_prune_rounds' cannot be negative")
     if stroke.max_rot_deg_per_mm <= 0.0:
         raise ValueError("'max_rot_deg_per_mm' must be positive")
+    if stroke.cost_model not in COST_MODELS:
+        raise ValueError(f"'cost_model' must be one of {COST_MODELS}, "
+                         f"not {stroke.cost_model!r}")
+    if stroke.transition_corners_estimate < 0.0:
+        raise ValueError("'transition_corners_estimate' cannot be negative")
+    if not 0 <= stroke.connector_level <= 2:
+        raise ValueError("'connector_level' must be in [0, 2]: 2 is the retract-and-"
+                         "reorient route, 1 drops the reorient point, 0 also allows a "
+                         "straight move between two identical poses")
+    if stroke.order_axis_weight_mm_per_deg < 0.0:
+        raise ValueError("'order_axis_weight_mm_per_deg' cannot be negative")
