@@ -98,8 +98,14 @@ def _build_parser() -> argparse.ArgumentParser:
                                                     "with --place)")
     exporter.add_argument("--utool", type=int, default=1)
     exporter.add_argument("--motion", default="J", choices=["J", "L"],
-                          help="J is the permissive default for a reachability review")
+                          help="J is the permissive default for a reachability review; a "
+                               "stroke plan ignores this and uses the configuration")
     exporter.add_argument("--speed", default="100%")
+    exporter.add_argument("--termination", default="FINE", choices=["FINE", "CNT0", "CNT100"],
+                          help="a stroke plan ignores this and uses the configuration")
+    exporter.add_argument("--config", help="configuration override (JSON); it is authoritative "
+                                          "for motion, termination and speed when the "
+                                          "viewpoint file is a stroke plan")
 
     viewer = subparsers.add_parser(
         "view", help="write a self-contained 3D view of the station and its viewpoints")
@@ -255,10 +261,30 @@ def _run_ls(args, parser: argparse.ArgumentParser) -> int:
     if not viewpoints:
         parser.error(f"{source} contains no viewpoints")
 
+    stroke_plan = any(isinstance(item, dict) and item.get("stroke_id") is not None
+                      for item in viewpoints)
+    motion, speed, termination, order = args.motion, args.speed, args.termination, True
+    if stroke_plan:
+        # The configuration is authoritative here: a stroke plan's motion, termination and
+        # speed are one decision, and two sources for it is how a program ends up flown at
+        # a speed the coverage was not computed for.
+        try:
+            cfg = load_config(args.config)
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+            parser.error(f"cannot read the configuration: {error}")
+            return 2
+        motion = cfg.motion.type
+        termination = cfg.motion.termination
+        speed = f"{cfg.motion.speed_mm_s:g} mm/sec"
+        order = False
+        print(f"stroke plan: {motion} {speed} {termination} from the configuration, and the "
+              "planner's own order is kept (re-sorting would split strokes)")
+
     try:
         contract = export_ls(viewpoints, args.out, prog_name=args.prog_name,
                              place=args.place, uframe=args.uframe, utool=args.utool,
-                             motion=args.motion, speed=args.speed)
+                             motion=motion, speed=speed, termination=termination,
+                             order=order)
     except ValueError as error:
         parser.error(str(error))
         return 2

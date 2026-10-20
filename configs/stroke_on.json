@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "Turn the continuous-path stage on (design 2026-10-19-continuous-scan-stroke-planning-design.md).",
+    "The shipped configuration leaves it off, so the default result stays identical to v1 and the",
+    "regression baseline keeps its meaning. Use it as an override:",
+    "",
+    "  scanplan plan --station input/station.json --config configs/stroke_on.json --face auto",
+    "",
+    "Measured on the real station at 2026-10-20 (auto face, no tracker pose):",
+    "  upper face 99.74% at 114 points (poses: 99.70% at 102), lower face 97.46% at 134 (poses: 97.06% at 155),",
+    "  plan runtime 772 s against 293 s - 2.63x, inside the 3x budget the design allows.",
+    "",
+    "Read that as: coverage holds or improves and the path is now scanned, not flown over; the",
+    "corner count does NOT drop, because a constant pose only stays valid along a few hundred",
+    "millimetres of a curved panel. See the design document, section 13."
+  ],
+  "stroke": {
+    "enabled": true
+  }
+}

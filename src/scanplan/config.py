@@ -36,6 +36,8 @@ class ScannerParams:
     """
 
     standoff_mm: float
+    depth_of_field_mm: float
+    fov_anchor_distance_mm: float
     range_mm: tuple[float, float]
     fov_at_standoff_mm: tuple[float, float]
     fov_cap_mm: tuple[float, float]
@@ -75,10 +77,52 @@ class TrackerParams:
 
 
 @dataclass(frozen=True)
+class StrokeParams:
+    """A straight scan segment with a constant pose, and the steps the two passes use.
+
+    `coverage_step_mm` and `check_step_mm` are deliberately different: a coverage
+    evaluation costs one ray per sample, a legality check one KD-tree lookup per
+    position, so only the cheap one may be fine.
+
+    `enabled=False` reproduces the v1 result exactly, which is what makes every
+    later change provable; `max_stroke_mm=0` is the same thing said another way.
+    """
+
+    enabled: bool
+    max_stroke_mm: float
+    min_stroke_mm: float
+    extend_step_mm: float
+    min_gain_mm2_per_step: float
+    seed_dirs: int
+    dedupe_mm: float
+    stop_cost_mm: float
+    coverage_step_mm: float
+    check_step_mm: float
+    retract_clearance_mm: float
+    max_rot_deg_per_mm: float
+    max_prune_rounds: int
+
+
+@dataclass(frozen=True)
+class MotionParams:
+    """How the delivered program moves between the planned points.
+
+    Speed is a floor setting, not a planning variable; it is carried here only so the
+    program has one source for it instead of a flag and a config that can disagree.
+    """
+
+    type: str
+    termination: str
+    speed_mm_s: float
+
+
+@dataclass(frozen=True)
 class PlannerConfig:
     scanner: ScannerParams
     target: TargetParams
     tracker: TrackerParams
+    stroke: StrokeParams
+    motion: MotionParams
     occlusion_tol_mm: float
     seed: int
     source: str = ""
@@ -138,10 +182,14 @@ def _build(data: dict[str, Any], source: str, override: str | None) -> PlannerCo
     scanner = _section(data, "scanner", ScannerParams)
     target = _section(data, "target", TargetParams)
     tracker = _section(data, "tracker", TrackerParams)
+    stroke = _section(data, "stroke", StrokeParams)
+    motion = _section(data, "motion", MotionParams)
     config = PlannerConfig(
         scanner=scanner,
         target=target,
         tracker=tracker,
+        stroke=stroke,
+        motion=motion,
         occlusion_tol_mm=float(data["occlusion_tol_mm"]),
         seed=int(data["seed"]),
         source=source,
@@ -152,7 +200,7 @@ def _build(data: dict[str, Any], source: str, override: str | None) -> PlannerCo
 
 
 def _reject_unknown(data: dict[str, Any]) -> None:
-    known = {"scanner", "target", "tracker", "occlusion_tol_mm", "seed"}
+    known = {"scanner", "target", "tracker", "stroke", "motion", "occlusion_tol_mm", "seed"}
     unknown = sorted(k for k in data if k not in known and not k.startswith("_"))
     if unknown:
         raise ValueError(f"unknown config section(s): {unknown}")
@@ -161,6 +209,8 @@ def _reject_unknown(data: dict[str, Any]) -> None:
         ("scanner", ScannerParams),
         ("target", TargetParams),
         ("tracker", TrackerParams),
+        ("stroke", StrokeParams),
+        ("motion", MotionParams),
     ):
         body = data.get(section, {})
         allowed = {f.name for f in fields(cls)}
@@ -202,6 +252,10 @@ def _scalar(annotation: Any, value: Any) -> Any:
     return value
 
 
+MOTION_TYPES = ("J", "L")
+TERMINATIONS = ("FINE", "CNT0", "CNT100")
+
+
 def _validate(config: PlannerConfig) -> None:
     scanner = config.scanner
     target = config.target
@@ -223,8 +277,41 @@ def _validate(config: PlannerConfig) -> None:
         raise ValueError("'refine_rounds' cannot be negative")
     if scanner.standoff_mm <= 0.0 or target.sample_grid_mm <= 0.0:
         raise ValueError("'standoff_mm' and 'sample_grid_mm' must be positive")
+    if scanner.fov_anchor_distance_mm <= 0.0:
+        raise ValueError("'fov_anchor_distance_mm' must be positive")
+    if scanner.depth_of_field_mm <= 0.0:
+        raise ValueError("'depth_of_field_mm' must be positive")
     if target.face not in FACES:
         raise ValueError(f"'face' must be one of {FACES}, not {target.face!r}")
     if config.tracker.model_robot_occlusion:
         # There is no robot model at this stage, so this flag cannot be honoured.
         raise ValueError("'model_robot_occlusion' is not implemented; leave it false")
+    _validate_strokes(config.stroke)
+    if config.motion.type not in MOTION_TYPES:
+        raise ValueError(f"'motion.type' must be one of {MOTION_TYPES}, "
+                         f"not {config.motion.type!r}")
+    if config.motion.termination not in TERMINATIONS:
+        raise ValueError(f"'motion.termination' must be one of {TERMINATIONS}, "
+                         f"not {config.motion.termination!r}")
+    if config.motion.speed_mm_s <= 0.0:
+        raise ValueError("'motion.speed_mm_s' must be positive")
+
+
+def _validate_strokes(stroke: StrokeParams) -> None:
+    if stroke.max_stroke_mm < 0.0:
+        raise ValueError("'max_stroke_mm' cannot be negative")
+    if stroke.min_stroke_mm < 0.0:
+        raise ValueError("'min_stroke_mm' cannot be negative")
+    if stroke.min_stroke_mm > stroke.max_stroke_mm and stroke.max_stroke_mm > 0.0:
+        raise ValueError("'min_stroke_mm' cannot exceed 'max_stroke_mm'")
+    for name in ("coverage_step_mm", "check_step_mm", "extend_step_mm"):
+        if getattr(stroke, name) <= 0.0:
+            raise ValueError(f"'{name}' must be positive")
+    if stroke.check_step_mm > stroke.coverage_step_mm:
+        raise ValueError("'check_step_mm' must not exceed 'coverage_step_mm'")
+    if not 0 <= stroke.seed_dirs <= 4:
+        raise ValueError("'seed_dirs' must be in [0, 4]")
+    if stroke.max_prune_rounds < 0:
+        raise ValueError("'max_prune_rounds' cannot be negative")
+    if stroke.max_rot_deg_per_mm <= 0.0:
+        raise ValueError("'max_rot_deg_per_mm' must be positive")

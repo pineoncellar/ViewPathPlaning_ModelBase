@@ -70,11 +70,16 @@ class ScannerModel:
     def footprint_mm(self, distance_mm):
         """The measuring footprint at the given distance, capped at the datasheet value.
 
-        Elementwise, so a vector of distances is fine. The cap is the footprint at the
-        standoff by default, which means it stops growing there and shrinks below it.
+        Elementwise, so a vector of distances is fine. The rectangle scales from the
+        distance at which the datasheet's maximum area is attained - NOT from the
+        standoff. Those two coincide in the shipped configuration (both 300 mm), which
+        is what makes this a no-op for the v1 baseline, but they are separate numbers:
+        the datasheet does not say at what distance the maximum is reached, and the
+        physical reading is the far end of the range, where the projected line is
+        longest and the footprint at the standoff is correspondingly smaller.
         """
         distance = np.asarray(distance_mm, dtype=float)
-        scale = distance / self.params.standoff_mm
+        scale = distance / self.params.fov_anchor_distance_mm
         width = np.minimum(self.params.fov_at_standoff_mm[0] * scale,
                            self.params.fov_cap_mm[0])
         height = np.minimum(self.params.fov_at_standoff_mm[1] * scale,

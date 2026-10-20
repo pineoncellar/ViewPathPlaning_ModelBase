@@ -33,18 +33,26 @@ import numpy as np
 
 from .config import PlannerConfig
 from .coverage import CoverageResult, attribute_uncovered
+from .path import PathPlan
 from .raycast import backend_name
 from .scanner_model import ScannerModel
 from .scene import Station
 from .selection import Selection
 from .sheet_split import SheetSplit
+from .strokes import StrokeCoverage
 from .target_surface import TargetSet, contact_summary
 from .tracker import Tracker
-from .viewpoints import Viewpoint, viewpoints_from_selection  # noqa: F401  (re-export)
+from .viewpoints import (  # noqa: F401  (re-exported for the exporters)
+    Viewpoint,
+    viewpoints_from_path,
+    viewpoints_from_selection,
+)
 
 _EXEMPT_REASON = "fixture_contact"
 _INCIDENCE_BINS = 10
 _CLUSTER_LIMIT = 12
+# Rounded optical axes that count as "the same angle of view", for the diversity histogram.
+_AXIS_DECIMALS = 2
 
 
 def cluster_points(points, area_mm2, *, cell_mm: float = 30.0,
@@ -78,6 +86,9 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
                  split: SheetSplit, target: TargetSet, coverage: CoverageResult,
                  selection: Selection, viewpoints,
                  tracker: Tracker | None = None, checks: dict | None = None,
+                 path: PathPlan | None = None, strokes: StrokeCoverage | None = None,
+                 swept_coverage_pct: float | None = None,
+                 pose_only_coverage_pct: float | None = None,
                  runtime: dict | None = None, log=None) -> dict:
     """The report that has to accompany any viewpoint set (spec 7.2)."""
     say = log or (lambda _message: None)
@@ -150,8 +161,9 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
             float(target.samples.total_area_mm2 / max(coverage.n_targets, 1)), 3),
         "exempt": {**contact_summary(target), "reason": _EXEMPT_REASON},
         "viewpoints": len(viewpoints),
-        "viewpoints_greedy": len(selection.greedy),
-        "viewpoints_repair": len(selection.repair),
+        "viewpoints_greedy": sum(1 for vp in viewpoints if vp.source == "greedy"),
+        "viewpoints_repair": sum(1 for vp in viewpoints if vp.source == "repair"),
+        "viewpoints_transition": sum(1 for vp in viewpoints if vp.role != "coverage"),
         "coverage_pct": round(selection.coverage_pct, 3),
         "pool_reach_pct": round(coverage.pool_reach_pct, 3),
         "coverage_area_mm2": round(selection.coverage_area_mm2, 1),
@@ -170,6 +182,14 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
             "empty_pool": bool(len(angles) == 0),
         },
         "greedy_curve": [[count, round(pct, 3)] for count, pct in selection.curve],
+        "program": _program_block(config, viewpoints, path),
+        "stroke_plan": _stroke_block(strokes, path, swept_coverage_pct,
+                                     pose_only_coverage_pct),
+        "angle_diversity": _angle_diversity(coverage, selection.chosen) if path is not None
+        else {"available": False,
+              "reason": "the delivered set is single poses, so every sample is seen from "
+                        "as many axes as there are poses aimed at it"},
+        "parameter_provenance": _provenance(config),
         "viewpoint_records": [viewpoint.as_dict() for viewpoint in viewpoints],
         "tracker": tracker.describe() if tracker is not None else {
             "name": None, "position_mm": None,
@@ -189,10 +209,12 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
             "on to its large faces) and keep it clear of the arm's normal working sector."
         ),
         "placeholders_note": (
-            "Every value below stands in for a measurement that has not been taken on the "
-            "real device. max_incidence_deg is the most sensitive one: it is the only "
-            "parameter that visibly moves the coverage figure, so do not read any coverage "
-            "number as a prediction until it is measured."
+            "`placeholders` below lists the scanner and tracker values as delivered, and "
+            "`parameter_provenance` says which of them are datasheet facts, which are "
+            "derived from the datasheet, and which are still unmeasured. Only the unmeasured "
+            "ones can move a result: max_incidence_deg is the most sensitive, and "
+            "fov_anchor_distance_mm is the one that changes the footprint everywhere at once. "
+            "Do not read a coverage figure as a prediction until those are measured."
         ),
         "placeholders": placeholders,
         "config": {"source": config.source, "override": config.override, "seed": config.seed},
@@ -202,6 +224,145 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
                     "ray_backend": (runtime or {}).get("ray_backend", backend_name())},
     }
     return _plain(report)
+
+
+def _program_block(config: PlannerConfig, viewpoints, path: PathPlan | None) -> dict:
+    """What the workshop is handed: the motion, the corners, and what the path costs."""
+    block = {
+        "motion": config.motion.type,
+        "termination": config.motion.termination,
+        "speed_mm_s": config.motion.speed_mm_s,
+        "speed_note": ("set on the floor and deliberately not optimised here: scan speed "
+                       "is a site setting, not a planning variable"),
+        "points": len(viewpoints),
+        "coverage_points": sum(1 for vp in viewpoints if vp.role == "coverage"),
+        "transition_points": sum(1 for vp in viewpoints if vp.role != "coverage"),
+        "turns": len(viewpoints),
+    }
+    if path is None:
+        block["ordering"] = ("planner order of single poses; nothing constrains it, so an "
+                             "exporter may re-sort")
+        return block
+    block.update({
+        "ordering": path.ordering,
+        "path_length_mm": round(float(path.path_length_mm), 1),
+        "interrupts": {"translation": int(path.interrupts_a),
+                       "reorient": int(path.interrupts_b)},
+        "interrupts_note": ("every one of these is the scanner idling while the head moves; "
+                            "the site has accepted them"),
+        "min_clearance_mm": (None if path.min_clearance_mm is None
+                             else round(float(path.min_clearance_mm), 1)),
+        "constraint_violations": list(path.violations),
+    })
+    return block
+
+
+def _stroke_block(strokes: StrokeCoverage | None, path: PathPlan | None,
+                  swept_coverage_pct: float | None,
+                  pose_only_coverage_pct: float | None) -> dict:
+    """What the stroke stage produced, and which coverage figure is the promise."""
+    if strokes is None:
+        return {"enabled": False,
+                "note": ("stroke planning is off: the delivered set is single poses, the "
+                         "same result v1 produces")}
+    lengths = np.array([stroke.length_mm for stroke in strokes.strokes]) \
+        if strokes.strokes else np.zeros(0)
+    block = {
+        "enabled": True,
+        "delivered": path is not None,
+        "candidates": len(strokes.strokes),
+        "delivered_strokes": (None if path is None else
+                              len({point.stroke_id for point in path.points
+                                   if point.stroke_id is not None})),
+        "length_mm": ({"min": round(float(lengths.min()), 1),
+                       "median": round(float(np.median(lengths)), 1),
+                       "max": round(float(lengths.max()), 1)} if len(lengths) else None),
+        "min_stroke_clearance_mm": (None if strokes.min_clearance_mm is None
+                                    else round(float(strokes.min_clearance_mm), 1)),
+        "swept_coverage_pct": None if swept_coverage_pct is None
+        else round(float(swept_coverage_pct), 3),
+        "pose_only_coverage_pct": None if pose_only_coverage_pct is None
+        else round(float(pose_only_coverage_pct), 3),
+        "acceptance": ("promised coverage (coverage_pct) counts the strokes only. The swept "
+                       "figure adds whatever the transition segments happen to pass over; it "
+                       "depends on the ordering, so it is reported for the workshop and never "
+                       "used for acceptance or for the fallback comparison"),
+    }
+    if path is None:
+        block["note"] = ("strokes were generated but the delivered plan is the pose-only "
+                         "one: the stroke plan did not beat it on coverage, corners and "
+                         "travel, which is the guarantee the design asks for")
+    return block
+
+
+def _angle_diversity(coverage: CoverageResult, chosen) -> dict:
+    """How many distinct optical axes see each covered sample.
+
+    Reported, never constrained: the workshop's extra passes are hand tremor and
+    experience, and the design explicitly does not ask the planner to imitate them.
+    """
+    if len(chosen) == 0:
+        return {"available": False, "reason": "nothing was selected"}
+    axes = np.array([np.asarray(coverage.poses[int(index)].axis, dtype=float)
+                     for index in chosen])
+    lengths = np.linalg.norm(axes, axis=1, keepdims=True)
+    keys = np.round(axes / np.maximum(lengths, 1e-12), _AXIS_DECIMALS)
+    unique, inverse = np.unique(keys, axis=0, return_inverse=True)
+    looks = np.zeros(coverage.n_targets, dtype=np.int32)
+    for group in range(len(unique)):
+        seen = np.zeros(coverage.n_targets, dtype=bool)
+        for row in np.flatnonzero(np.asarray(inverse).ravel() == group):
+            seen[coverage.sets[int(chosen[int(row)])]] = True
+        looks += seen
+    covered = looks > 0
+    histogram = np.bincount(looks[covered], minlength=2)[1:]
+    return {
+        "meaning": "distinct optical axes that observe each covered sample",
+        "distinct_axes": int(len(unique)),
+        "looks": list(range(1, len(histogram) + 1)),
+        "samples": [int(value) for value in histogram],
+        "mean_looks": round(float(looks[covered].mean()), 2) if covered.any() else 0.0,
+        "note": "reported only; more looks is not a requirement",
+    }
+
+
+def _provenance(config: PlannerConfig) -> dict:
+    """Which numbers are measured, which are derived, and which are still guesses.
+
+    The report used to call every value a placeholder, which is as misleading as trusting
+    them all: a reader cannot tell which number would move the coverage figure.
+    """
+    scanner = config.scanner
+    return {
+        "from_datasheet": {
+            "standoff_mm": scanner.standoff_mm,
+            "depth_of_field_mm": scanner.depth_of_field_mm,
+            "fov_cap_mm": list(scanner.fov_cap_mm),
+            "tracker_distance_mm": list(config.tracker.distance_mm),
+        },
+        "derived_from_datasheet": {
+            "range_mm": list(scanner.range_mm),
+            "tracker_half_angle_deg": config.tracker.half_angle_deg,
+        },
+        "unmeasured": {
+            "max_incidence_deg": scanner.max_incidence_deg,
+            "body_sphere_r_mm": scanner.body_sphere_r_mm,
+            "body_clearance_mm": scanner.body_clearance_mm,
+            "markers_omnidirectional": config.tracker.markers_omnidirectional,
+            "fov_anchor_distance_mm": scanner.fov_anchor_distance_mm,
+        },
+        "design_choice": {
+            "distances_mm": list(scanner.distances_mm),
+            "tilts_deg": list(scanner.tilts_deg),
+            "rolls_deg": list(scanner.rolls_deg),
+            "max_stroke_mm": config.stroke.max_stroke_mm,
+            "coverage_step_mm": config.stroke.coverage_step_mm,
+            "check_step_mm": config.stroke.check_step_mm,
+        },
+        "note": ("the unmeasured block is the one to look at before believing a coverage "
+                 "figure; max_incidence_deg is the most sensitive of them and "
+                 "fov_anchor_distance_mm the one that moves the viewpoint count by ~20%"),
+    }
 
 
 def write_report(out_dir, report: dict) -> Path:
@@ -262,28 +423,124 @@ def write_samples_csv(path, points, normals, reasons) -> Path:
     return target
 
 
+def write_strokes_json(path, plan: PathPlan, coverage: CoverageResult,
+                       config: PlannerConfig) -> Path:
+    """The authoritative program order: every move, then every stroke summarised.
+
+    This file, not `viewpoints.json`, is the source of truth for the sequence. It exists
+    because a stroke is a PAIR of points: anything that re-sorts the flat point table
+    splits a sweep into two unrelated moves, and the coverage figure that was accepted
+    then describes something the robot never does.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    areas = np.asarray(coverage.area_mm2, dtype=float)
+    points = []
+    strokes: list[dict] = []
+    seen: dict[int, int] = {}
+    for order, point in enumerate(plan.points):
+        row = point.coverage_index
+        records = coverage.sets[row] if row is not None else np.zeros(0, dtype=np.int64)
+        points.append({
+            "order": order,
+            "stroke_id": point.stroke_id,
+            "role": point.role,
+            "source": point.source,
+            "position_mm": [round(float(v), 4) for v in point.position],
+            "axis": [round(float(v), 9) for v in point.axis],
+            "roll_deg": float(point.roll_deg),
+            "n_points": int(len(records)),
+            "area_mm2": round(float(areas[records].sum()), 1) if len(records) else 0.0,
+        })
+        if point.stroke_id is None:
+            continue
+        if point.stroke_id not in seen:
+            seen[point.stroke_id] = len(strokes)
+            strokes.append({
+                "id": int(point.stroke_id),
+                "source": str(point.source),
+                "start_mm": [round(float(v), 4) for v in point.position],
+                "end_mm": None,
+                "axis": [round(float(v), 9) for v in point.axis],
+                "roll_deg": float(point.roll_deg),
+                "length_mm": 0.0,
+                "n_points": int(len(records)),
+                "area_mm2": round(float(areas[records].sum()), 1) if len(records) else 0.0,
+            })
+        else:
+            entry = strokes[seen[point.stroke_id]]
+            start = np.asarray(entry["start_mm"], dtype=float)
+            entry["end_mm"] = [round(float(v), 4) for v in point.position]
+            end = np.asarray(entry["end_mm"], dtype=float)
+            entry["length_mm"] = round(float(np.linalg.norm(end - start)), 2)
+
+    body = {
+        "motion": {"type": config.motion.type,
+                   "termination": config.motion.termination,
+                   "speed_mm_s": config.motion.speed_mm_s},
+        "ordering": plan.ordering,
+        "turns": plan.turns,
+        "path_length_mm": round(float(plan.path_length_mm), 1),
+        "interrupts": {"translation": int(plan.interrupts_a),
+                       "reorient": int(plan.interrupts_b)},
+        "constraint_violations": list(plan.violations),
+        "points": points,
+        "strokes": strokes,
+        "note": ("`points` is the program order and must not be re-sorted. `strokes` groups "
+                 "the points that belong to one sweep; a stroke whose two ends are not "
+                 "consecutive in `points` has been re-ordered and no longer scans what the "
+                 "coverage report claims"),
+    }
+    target.write_text(json.dumps(_plain(body), indent=2, ensure_ascii=False), encoding="utf-8")
+    return target
+
+
 def summary_lines(report: dict) -> list[str]:
     """The console summary, ending with the caveat a reader must not miss."""
     reasons = ", ".join(f"{key} {value}" for key, value in sorted(
         report["uncovered_by_reason"].items())) or "none"
-    return [
+    lines = [
         f"target face            {report['target_face_mm2'] / 1e6:.4f} m2 ({report['face']})",
         f"target samples         {report['target_points']}",
         f"exempt (clamped)       {report['exempt']['points']} samples "
         f"{report['exempt']['area_mm2'] / 1e6:.4f} m2",
         f"coverage               {report['coverage_pct']:.2f}%  "
         f"(pool could reach {report['pool_reach_pct']:.2f}%)",
-        f"viewpoints             {report['viewpoints']} "
-        f"({report['viewpoints_greedy']} greedy + {report['viewpoints_repair']} repair)",
+        f"points                 {report['viewpoints']} "
+        f"({report['viewpoints_greedy']} greedy + {report['viewpoints_repair']} repair"
+        + (f" + {report['viewpoints_transition']} transition"
+           if report.get("viewpoints_transition") else "") + ")",
         f"uncovered              {report['uncovered_points']} samples "
         f"{report['uncovered_area_mm2'] / 1e6:.4f} m2  [{reasons}]",
         f"max incidence          {report['placeholders']['max_incidence_deg']:.0f} deg "
         "(PLACEHOLDER)",
+    ]
+    path = report.get("program", {})
+    if path.get("path_length_mm") is not None:
+        interrupts = path.get("interrupts", {})
+        lines += [
+            f"motion                 {path['motion']} {path['speed_mm_s']:g} mm/s "
+            f"{path['termination']}",
+            f"path                   {path['turns']} corners, "
+            f"{path['path_length_mm']:.0f} mm, "
+            f"{interrupts.get('translation', 0)} translation + "
+            f"{interrupts.get('reorient', 0)} re-orient interrupts",
+        ]
+    strokes = report.get("stroke_plan", {})
+    if strokes.get("enabled") and strokes.get("delivered"):
+        lines.append(f"strokes                "
+                     f"{strokes.get('delivered_strokes') or strokes['candidates']} delivered "
+                     f"of {strokes['candidates']} candidates, swept coverage "
+                     f"{strokes['swept_coverage_pct']:.2f}%")
+        for violation in path.get("constraint_violations", []):
+            lines.append(f"CONSTRAINT             {violation}")
+    lines += [
         f"ray backend            {report['runtime']['ray_backend']}",
         "NOTE: coverage is geometric reachability only - robot reachability, joint limits "
         "and robot collision are checked in ROBOGUIDE, and robot-arm occlusion of the "
         "tracker is not modelled.",
     ]
+    return lines
 
 
 def summary_text(report: dict) -> str:

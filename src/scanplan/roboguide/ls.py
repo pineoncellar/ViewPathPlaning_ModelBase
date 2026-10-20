@@ -62,6 +62,7 @@ def build_ls(
     utool: int,
     motion: str = "J",
     speed: str = "100%",
+    termination: str = "FINE",
     config: str = "N U T, 0, 0, 0",
     comment: str = "scan viewpoints",
     constant: str = "",
@@ -73,6 +74,11 @@ def build_ls(
     `points` is the exporter's point table (`xyz_mm` in mm, `wpr_deg` in degrees),
     already in the frame the UFRAME is taught to. `prog_name` must be the file
     name, or the controller refuses the import.
+
+    `termination` matters for a continuous scan: at `FINE` the TCP stops at every point,
+    at `CNT0` it rounds the corner by (almost) nothing and keeps going. A stroke plan is
+    only valid at `CNT0`-like termination, because the linear segment between two points
+    - the thing the coverage was computed from - is what gets flown.
     """
     if isinstance(stamp, str):
         stamp_text = stamp
@@ -83,7 +89,7 @@ def build_ls(
         # a joint representation point can only be reached with a joint move, and
         # FANUC takes a percentage speed for those
         if motion.upper() == "L" and not is_joint:
-            return f"L P[{index}] {speed} FINE"
+            return f"L P[{index}] {speed} {termination.upper()}"
         return f"J P[{index}] {speed} FINE"
 
     mn_lines: list[str] = []

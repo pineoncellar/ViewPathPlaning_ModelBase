@@ -81,6 +81,8 @@ def viewpoints_to_points(viewpoints) -> list[dict]:
                 "xyz_mm": np.asarray(_field(item, "position"), dtype=float).reshape(3),
                 "rotation": rotation,
                 "wpr_deg": wpr.rot_to_fanuc_wpr(rotation),
+                "stroke_id": _field(item, "stroke_id", None),
+                "role": _field(item, "role", "coverage"),
             }
         )
     return points
@@ -95,14 +97,13 @@ def apply_placement(
     placed = []
     for point in points:
         rotation_new = rotation @ np.asarray(point["rotation"], dtype=float).reshape(3, 3)
-        placed.append(
-            {
-                "vp_key": point["vp_key"],
-                "xyz_mm": rotation @ np.asarray(point["xyz_mm"], dtype=float) + translation,
-                "rotation": rotation_new,
-                "wpr_deg": wpr.rot_to_fanuc_wpr(rotation_new),
-            }
-        )
+        moved = dict(point)
+        moved.update({
+            "xyz_mm": rotation @ np.asarray(point["xyz_mm"], dtype=float) + translation,
+            "rotation": rotation_new,
+            "wpr_deg": wpr.rot_to_fanuc_wpr(rotation_new),
+        })
+        placed.append(moved)
     return placed
 
 
@@ -302,6 +303,9 @@ def _contract_blocks(
             "Occlusion of the tracker by the robot arm is not modelled: only the "
             "part, the fixture and the base are traced, so a pose whose arm stands "
             "between the tracker and the scanner is exported as usable.",
+            "Corner rounding at CNT > 0 is not modelled: the scan geometry assumes the "
+            "TCP follows the straight segments, and a rounded corner sweeps less on its "
+            "convex side than the line it replaces.",
         ],
         "extents_mm": extents,
     }
@@ -317,6 +321,7 @@ def export(
     utool=1,
     motion="J",
     speed="100%",
+    termination="FINE",
     config="N U T, 0, 0, 0",
     order=True,
 ) -> dict:
@@ -325,9 +330,23 @@ def export(
     `place` is the optional 'x,y,z,w,p,r' pose of the CAD frame inside the
     ROBOGUIDE world; it re-expresses every point and defaults the UFRAME to 0,
     because the points then need no UFRAME taught by hand.
+
+    `order=True` is refused for a stroke plan. Re-sorting splits each stroke into two
+    unrelated moves, which silently voids the sweep the coverage figure was computed
+    for - the kind of error that survives every visual check. Passing `stroke_id`
+    through therefore forces the delivered order, and asking for a re-sort is an error
+    rather than a silent re-sort.
     """
     name = wpr.normalise_prog_name(prog_name)
     points = viewpoints_to_points(viewpoints)
+
+    strokes = {point["stroke_id"] for point in points if point["stroke_id"] is not None}
+    if strokes and order:
+        raise ValueError(
+            "these viewpoints belong to a stroke plan (they carry stroke_id), so their "
+            "order is the program order and depends on distance; re-sorting would split "
+            "each stroke into two unrelated moves. Call export(order=False), or export "
+            "the single-pose plan instead")
 
     if place:
         rotation_place, translation_place = parse_pose(place)
@@ -366,6 +385,7 @@ def export(
         utool=utool,
         motion=motion,
         speed=speed,
+        termination=termination,
         config=config,
         comment=_COMMENT,
     )
@@ -394,6 +414,8 @@ def export(
         point_count=len(points),
         extents=_extents(points),
     )
+    contract["program"]["termination"] = str(termination).upper()
+    contract["program"]["strokes"] = sorted(strokes) if strokes else []
     with frame_path.open("w", encoding="utf-8") as handle:
         json.dump(contract, handle, indent=2)
 
