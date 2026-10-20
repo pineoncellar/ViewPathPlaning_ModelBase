@@ -116,6 +116,78 @@ def select(cov: CoverageResult, area_mm2=None, *,
     )
 
 
+def select_groups(cov: CoverageResult, costs_mm, *, area_mm2=None,
+                  repair_ok=None, coverage_target_pct: float | None = None,
+                  log: Callable[[str], None] | None = None) -> Selection:
+    """Set cover over candidates of MIXED kind: strokes and single poses together.
+
+    The only difference from :func:`select` is the denominator. A stroke costs the travel
+    it asks for plus one stop; a pose costs one stop. Scoring `gain / (cost + 1)` is what
+    makes a long dense sweep beat the handful of loose poses that would cover the same
+    area one footprint at a time - which is the whole reason the path stops being a
+    zig-zag. `+1` keeps a zero-cost candidate from dividing by zero, and it is 1 mm, so it
+    changes nothing else.
+
+    `repair_ok` restricts the repair pass (default: everything). Pass True for the
+    single poses: a leftover sample is a hole to be patched point by point, and inventing
+    a stroke for it would add two corners and a transition to cover one footprint.
+    """
+    say = log or (lambda _message: None)
+    matrix = cov.matrix()
+    area = (np.asarray(cov.area_mm2, dtype=float) if area_mm2 is None
+            else np.asarray(area_mm2, dtype=float))
+    if len(area) != cov.n_targets:
+        raise ValueError("one area per target sample is required")
+    costs = np.asarray(costs_mm, dtype=float).reshape(-1)
+    if len(costs) != matrix.shape[0]:
+        raise ValueError("one cost per candidate is required")
+    allowed = (np.ones(matrix.shape[0], dtype=bool) if repair_ok is None
+               else np.asarray(repair_ok, dtype=bool))
+    if len(allowed) != matrix.shape[0]:
+        raise ValueError("one repair flag per candidate is required")
+    target_area = float(cov.target_area_mm2)
+
+    def covered_pct() -> float:
+        return 100.0 * float(area[covered].sum()) / target_area if target_area > 0.0 else 0.0
+
+    covered = np.zeros(cov.n_targets, dtype=bool)
+    greedy: list[int] = []
+    curve: list[tuple[int, float]] = []
+    while True:
+        if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
+            break
+        gains = matrix @ np.where(covered, 0.0, area)
+        score = gains / (costs + 1.0)
+        best = int(np.argmax(score))
+        if gains[best] <= 0.0:
+            break
+        greedy.append(best)
+        covered |= _row(matrix, best)
+        curve.append((len(greedy), covered_pct()))
+    say(f"  greedy over groups: {len(greedy)} candidates -> {covered_pct():.2f}%")
+
+    repair: list[int] = []
+    reachable = cov.pool_reach()
+    for target in np.flatnonzero(reachable & ~covered):
+        if covered[target]:
+            continue
+        candidates = np.flatnonzero(_row(matrix, None, column=target) & allowed)
+        if len(candidates) == 0:
+            continue
+        gains = matrix[candidates] @ np.where(covered, 0.0, area)
+        best = int(candidates[int(np.argmax(gains))])
+        repair.append(best)
+        covered |= _row(matrix, best)
+    say(f"  repair over groups: {len(repair)} poses -> {covered_pct():.2f}%")
+
+    chosen = greedy + repair
+    return Selection(
+        chosen=chosen, greedy=greedy, repair=repair, covered=covered, curve=curve,
+        coverage_area_mm2=float(area[covered].sum()), target_area_mm2=target_area,
+        sources=np.array(["greedy"] * len(greedy) + ["repair"] * len(repair), dtype=object),
+    )
+
+
 def _row(matrix, row: int | None, column: int | None = None) -> np.ndarray:
     """One row or one column of the coverage matrix, as a flat boolean array."""
     selected = matrix[[row]] if row is not None else matrix[:, [column]]

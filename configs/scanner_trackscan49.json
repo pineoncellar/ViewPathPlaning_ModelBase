@@ -21,6 +21,8 @@
 
   "scanner": {
     "standoff_mm": 300.0,
+    "depth_of_field_mm": 400.0,
+    "fov_anchor_distance_mm": 300.0,
     "range_mm": [120.0, 480.0],
     "fov_at_standoff_mm": [600.0, 500.0],
     "fov_cap_mm": [600.0, 500.0],
@@ -35,9 +37,13 @@
 
     "_comment_fov": [
       "fov_at_standoff_mm is the datum the footprint scales from; fov_cap_mm stops it growing.",
-      "Anchoring the MAXIMUM at the standoff is the optimistic reading. Physically the projected line",
-      "length grows with distance, so the maximum must sit at the far end of the range - which would",
-      "make the footprint at 300 mm only 360 x 300. The open measurement above settles it.",
+      "fov_anchor_distance_mm is the distance at which the maximum area is attained - it is the",
+      "one number the datasheet does not give. At 300 (= the standoff) the footprint reaches its",
+      "cap there, which is the OPTIMISTIC reading and the one the v1 baseline was measured with.",
+      "Physically the projected line length grows with distance, so the maximum must sit at the",
+      "far end of the range: setting the anchor to 500 makes the footprint at 300 mm only",
+      "360 x 300. One flat-plate scan at 100 / 300 / 500 mm settles it, and until then the",
+      "anchor is the single knob that moves every result - keep it at 300 to reproduce v1.",
       "Long side vs short side is also unverified: nothing says whether the 600 mm runs along local",
       "x or y, and a 90 deg roll swaps which target samples a pose covers."
     ],
@@ -67,6 +73,51 @@
     "aim_at": "part_centroid",
     "markers_omnidirectional": true,
     "model_robot_occlusion": false
+  },
+
+  "_comment_stroke": [
+    "Continuous-path scanning (design 2026-10-19-continuous-scan-stroke-planning-design.md).",
+    "A stroke is a straight segment with a CONSTANT pose, and the six coverage conditions are",
+    "evaluated at two different steps along it:",
+    "  coverage_step_mm - the expensive one (every sample in view gets a ray).",
+    "  check_step_mm - clearance and tracker only (KD tree, and one ray per position).",
+    "The coverage step can be coarse BECAUSE BOTH ENDS ARE SAMPLED: the footprint is convex and",
+    "about 500 mm long along the motion, so the union of the footprints sampled at positions",
+    "closer together than that is exactly the continuous sweep. The design first asked for",
+    "50 mm plus a fine re-check of both ends; including the ends makes the re-check unnecessary",
+    "and 100 mm still overlaps by 80% - measured, the whole plan was 5.5x the v1 runtime at",
+    "50 mm and is inside the 3x budget at 100.",
+    "enabled=false keeps the pool and the result exactly as v1: that is the regression",
+    "baseline, and max_stroke_mm=0 is the second way of saying the same thing.",
+    "overlap_ratio from the design is deliberately absent: it belongs to the G2 grid sweep,",
+    "which is not implemented, and a knob nobody reads is worse than no knob."
+  ],
+  "stroke": {
+    "enabled": false,
+    "max_stroke_mm": 800.0,
+    "min_stroke_mm": 150.0,
+    "extend_step_mm": 25.0,
+    "min_gain_mm2_per_step": 200.0,
+    "seed_dirs": 4,
+    "dedupe_mm": 20.0,
+    "stop_cost_mm": 100.0,
+    "coverage_step_mm": 100.0,
+    "check_step_mm": 10.0,
+    "retract_clearance_mm": 50.0,
+    "max_rot_deg_per_mm": 0.5,
+    "max_prune_rounds": 8
+  },
+
+  "_comment_motion": [
+    "L, not J: a joint move's TCP path is not knowable, so nothing can be said about what it",
+    "sweeps; a straight line with a constant pose is the only interpolated motion that can be",
+    "evaluated geometrically. CNT0 because that is the site's convention. speed_mm_s is set on",
+    "the floor and is NOT optimised by the planner."
+  ],
+  "motion": {
+    "type": "L",
+    "termination": "CNT0",
+    "speed_mm_s": 100.0
   },
 
   "occlusion_tol_mm": 2.0,

@@ -28,7 +28,14 @@ from .target_surface import SampleSet
 
 @dataclass(frozen=True)
 class Viewpoint:
-    """One scanner pose as it is delivered, with the provenance a reviewer needs."""
+    """One scanner pose as it is delivered, with the provenance a reviewer needs.
+
+    `order` is the program order and `stroke_id` the sweep this point belongs to. Both
+    exist because a stroke plan is a PATH: the file order is the motion order and must
+    never be re-sorted, and two points of the same stroke have to stay neighbours or the
+    sweep the coverage figure was computed for does not happen. `role` says whether the
+    point scans (`coverage`) or only moves the head (`retract`, `traverse`, `reorient`).
+    """
 
     id: int
     position: np.ndarray
@@ -40,11 +47,17 @@ class Viewpoint:
     max_incidence_deg: float
     tracker_ok: bool
     source: str
+    order: int | None = None
+    stroke_id: int | None = None
+    role: str = "coverage"
 
     def as_dict(self) -> dict:
         """A plain JSON-ready mapping under the documented field names."""
         return {
             "id": int(self.id),
+            "order": int(self.id if self.order is None else self.order),
+            "stroke_id": None if self.stroke_id is None else int(self.stroke_id),
+            "role": str(self.role),
             "position": [round(float(v), 4) for v in self.position],
             "axis": [round(float(v), 9) for v in self.axis],
             "roll_deg": float(self.roll_deg),
@@ -80,5 +93,41 @@ def viewpoints_from_selection(selection: Selection, coverage: CoverageResult,
             max_incidence_deg=float(angles.max()),
             tracker_ok=bool(coverage.tracker_ok[index]),
             source=str(selection.sources[order]),
+            order=order,
         ))
+    return records
+
+
+def viewpoints_from_path(plan, coverage: CoverageResult,
+                         samples: SampleSet) -> list[Viewpoint]:
+    """The delivered records of a stroke plan, in PROGRAM order.
+
+    Every point of the path is delivered, including the transition corners: the program
+    moves through them, so leaving them out would make the file and the record disagree
+    about what the robot does. A transition corner carries no coverage of its own, and
+    that is shown as zero rather than hidden.
+    """
+    areas = np.asarray(samples.area_mm2, dtype=float)
+    records: list[Viewpoint] = []
+    for order, point in enumerate(plan.points):
+        row = point.coverage_index
+        if row is None or len(coverage.sets[row]) == 0:
+            records.append(Viewpoint(
+                id=order, position=np.asarray(point.position, dtype=float),
+                axis=np.asarray(point.axis, dtype=float),
+                roll_deg=float(point.roll_deg), n_points=0, area_mm2=0.0,
+                mean_incidence_deg=0.0, max_incidence_deg=0.0, tracker_ok=True,
+                source=str(point.source), order=order, stroke_id=point.stroke_id,
+                role=str(point.role)))
+            continue
+        covered = coverage.sets[row]
+        angles = np.degrees(np.arccos(np.clip(coverage.quality[row], -1.0, 1.0)))
+        records.append(Viewpoint(
+            id=order, position=np.asarray(point.position, dtype=float),
+            axis=np.asarray(point.axis, dtype=float), roll_deg=float(point.roll_deg),
+            n_points=int(len(covered)), area_mm2=float(areas[covered].sum()),
+            mean_incidence_deg=float(angles.mean()),
+            max_incidence_deg=float(angles.max()),
+            tracker_ok=bool(coverage.tracker_ok[row]), source=str(point.source),
+            order=order, stroke_id=point.stroke_id, role=str(point.role)))
     return records
