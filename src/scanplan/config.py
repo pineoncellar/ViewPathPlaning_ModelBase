@@ -1,8 +1,10 @@
 """Planner configuration: scanner limits, sampling, tracker.
 
-Holds the PLACEHOLDER scanner values in exactly one place, so replacing them
-with measured ones stays a one-file change. `max_incidence_deg` is the most
-sensitive number in the planner and is not yet measured.
+Holds the scanner envelope in exactly one place, so replacing a measured value
+with the real one stays a one-file change. Which values are datasheet facts,
+which are derived from them, and which are still unmeasured is recorded in
+`configs/scanner_trackscan49.json` and in the design document's section 1.4 —
+`max_incidence_deg` is the most sensitive of the unmeasured ones.
 
 Loads overrides from a JSON file (see `configs/`).
 
@@ -24,7 +26,14 @@ FACES = ("upper", "lower", "auto")
 
 @dataclass(frozen=True)
 class ScannerParams:
-    """The scanner's geometry and quality envelope. All values are placeholders."""
+    """The scanner's geometric and quality envelope.
+
+    Provenance of each value is tracked in the design document
+    (docs/superpowers/specs/2026-10-19-continuous-scan-stroke-planning-design.md, section 1.4):
+    standoff, depth of field and the maximum scan area come from the TrackScan-Sharp 49
+    datasheet; the range and the tracker half-angle are derived from it; the incidence limit
+    and the body envelope are still unmeasured.
+    """
 
     standoff_mm: float
     range_mm: tuple[float, float]
