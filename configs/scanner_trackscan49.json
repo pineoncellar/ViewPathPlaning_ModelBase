@@ -1,10 +1,22 @@
 {
   "_comment": [
-    "PLACEHOLDER scanner parameters. None of these has been measured on the real",
-    "device; they come from the public datasheet plus the geometric meaning of",
-    "'standoff' and 'depth of field'. Replace them with measured values before",
-    "treating any coverage figure as a prediction.",
-    "max_incidence_deg is the most sensitive number in the whole planner."
+    "Scanner envelope for Scantech TrackScan-Sharp 49.",
+    "CONFIRMED from the datasheet (see docs/superpowers/specs/2026-10-19-continuous-scan-stroke-planning-design.md 1.4):",
+    "  standoff_mm 300 (base distance), depth of field 400 mm, max scan area 500 x 600 mm,",
+    "  tracking distance up to 6.0 m.",
+    "DERIVED from the datasheet, NOT yet applied here (changing them moves every result):",
+    "  range_mm should be [100, 500] = standoff +- depth_of_field/2 (this file still narrows it to 120/480),",
+    "  tracker.half_angle_deg should be 25 (back-solved from 10.4 m3 @3.5 m, 28.6 m3 @5.0 m, 49 m3 @6.0 m",
+    "    -> 25.7 / 25.1 / 24.95 deg; the three agree), this file still carries 30.",
+    "STILL PLACEHOLDER, needs a field measurement (each is a 10-30 minute job):",
+    "  max_incidence_deg - the most sensitive number in the planner. Tilt a flat plate until the data breaks.",
+    "  body_sphere_r_mm - a handheld head is far bigger than a 45 mm sphere, and the body sits BEHIND the",
+    "    reference point, not around it. Measure front window -> back, and the max turning radius.",
+    "  markers_omnidirectional - unverified; if the markers only cover some faces, many poses cannot be tracked.",
+    "OPEN, and it changes the coverage baseline by ~2.8x:",
+    "  the 500 x 600 max area is attained at SOME distance, and the datasheet does not say which.",
+    "  If it is the far end of the range (500 mm), the area at the 300 mm standoff is only 360 x 300.",
+    "  Scan a known-size plate at 100 / 300 / 500 mm and measure the point-cloud extents once."
   ],
 
   "scanner": {
@@ -20,6 +32,15 @@
     "rolls_deg": [0.0, 90.0],
     "aim_grid_mm": 100.0,
     "max_candidates": 4000,
+
+    "_comment_fov": [
+      "fov_at_standoff_mm is the datum the footprint scales from; fov_cap_mm stops it growing.",
+      "Anchoring the MAXIMUM at the standoff is the optimistic reading. Physically the projected line",
+      "length grows with distance, so the maximum must sit at the far end of the range - which would",
+      "make the footprint at 300 mm only 360 x 300. The open measurement above settles it.",
+      "Long side vs short side is also unverified: nothing says whether the 600 mm runs along local",
+      "x or y, and a 90 deg roll swaps which target samples a pose covers."
+    ],
 
     "_comment_refine": [
       "DESIGN, not measured (spec 6.4): the coarse-to-fine pass. After the first",
