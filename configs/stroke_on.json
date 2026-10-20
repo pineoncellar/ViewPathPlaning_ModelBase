@@ -12,7 +12,15 @@
     "",
     "Read that as: coverage holds or improves and the path is now scanned, not flown over; the",
     "corner count does NOT drop, because a constant pose only stays valid along a few hundred",
-    "millimetres of a curved panel. See the design document, section 13."
+    "millimetres of a curved panel. See the design document, section 13.",
+    "",
+    "NOTE, 2026-10-20 (point-count work): those 114 points were measured with the selection",
+    "running to coverage exhaustion. The shipped configuration now stops at",
+    "target.coverage_target_pct (99.0) and prices candidates in corners rather than millimetres,",
+    "so this override alone no longer reproduces 114 points - use configs/legacy_exhaust.json",
+    "for that. Also note that of those 114 points the delivered strokes actually swept 91.98%,",
+    "because selected single poses were counted in the coverage figure but never handed to the",
+    "path; that defect is fixed, so from now on the reported percentage and the program agree."
   ],
   "stroke": {
     "enabled": true

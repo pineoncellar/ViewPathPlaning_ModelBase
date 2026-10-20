@@ -9,11 +9,10 @@ being the limiting factor.
 Cost is measured in covered area rather than point count, so that fine sampling
 around a feature cannot outvote a genuinely large uncovered region.
 
-The repair pass is what inflates the viewpoint count: in the measured runs,
+The repair pass used to be what inflated the viewpoint count: in the measured runs,
 greedy reached about 98% with roughly a hundred poses and the last ~1.5% cost
-several hundred more. So when the count looks too high, the fix belongs in
-candidate generation. Do not silently skip the tail either - report greedy and
-repair counts separately so a reviewer can see which part is compressible.
+several hundred more. It now stops at the acceptance target, because a pass that adds
+one pose per leftover sample returns exactly the tail the target exists to cut off.
 """
 
 from __future__ import annotations
@@ -24,6 +23,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from .coverage import CoverageResult
+
+# Guards the division when a caller prices a candidate at zero. It is not a bias term:
+# a real cost here is 1 to 3 corners, so anything additive would swamp the ratio.
+_COST_EPS = 1e-9
 
 
 @dataclass
@@ -38,6 +41,15 @@ class Selection:
     coverage_area_mm2: float
     target_area_mm2: float
     sources: np.ndarray
+    # What the choice is expected to cost the head, in corners, when the caller priced it.
+    # `len(chosen)` is NOT that number once poses and strokes are mixed: ten strokes are
+    # twenty corners and thirty poses are thirty.
+    corners: int | None = None
+
+    @property
+    def cost_corners(self) -> int:
+        """The priced corner count, or one per item when nothing priced it."""
+        return len(self.chosen) if self.corners is None else int(self.corners)
 
     @property
     def coverage_pct(self) -> float:
@@ -58,12 +70,16 @@ def select(cov: CoverageResult, area_mm2=None, *,
     dense sampling around one feature from outvoting a large open region.
 
     `coverage_target_pct` stops greedy as soon as the target is met, which is the reading
-    of "fewest poses that meet the target" and the only way repair has anything to do.
-    Left at None, greedy runs until no pose adds new coverage, which is the behaviour of
-    the validated round-4 run (50 poses, 99.10%, repair 0) - keeping that as the default
-    is what makes this stage's numbers comparable with it. Either way the repair pass is
-    what turns a reachable-but-uncovered point into a dedicated pose; it adds nothing
-    when greedy finished, which is a fact worth reporting rather than hiding.
+    of "fewest poses that meet the target". Left at None, greedy runs until no pose adds
+    new coverage, which is the behaviour of the validated round-4 run (50 poses, 99.10%,
+    repair 0).
+
+    The same target stops the repair pass, and that is deliberate: repair adds one pose per
+    reachable-but-uncovered sample, so running it after a met target would hand back
+    everything the target just saved - the measured run spent seven tenths of its point
+    count on the last 0.74 of a percentage point. The pass stays as a net for the case where
+    greedy stops short for some other reason; it reports how many points it added, so "it
+    did nothing" is visible rather than assumed.
     """
     say = log or (lambda _message: None)
     if coverage_target_pct is not None and not 0.0 < coverage_target_pct <= 100.0:
@@ -96,6 +112,14 @@ def select(cov: CoverageResult, area_mm2=None, *,
     repair: list[int] = []
     reachable = cov.pool_reach()
     for target in np.flatnonzero(reachable & ~covered):
+        if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
+            # The remainder past the target is what the workshop patches by hand. Repairing
+            # it here would hand the whole point of the target back: it adds one pose per
+            # reachable-but-uncovered sample, which is exactly the tail the target exists
+            # to cut off.
+            say(f"  repair: stopped at the {coverage_target_pct:g}% target with "
+                f"{int((reachable & ~covered).sum())} reachable samples left uncovered")
+            break
         if covered[target]:
             continue          # an earlier repair pose already took this one with it
         candidates = np.flatnonzero(_row(matrix, None, column=target))
@@ -116,29 +140,32 @@ def select(cov: CoverageResult, area_mm2=None, *,
     )
 
 
-def select_groups(cov: CoverageResult, costs_mm, *, area_mm2=None,
+def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
                   repair_ok=None, coverage_target_pct: float | None = None,
                   log: Callable[[str], None] | None = None) -> Selection:
     """Set cover over candidates of MIXED kind: strokes and single poses together.
 
-    The only difference from :func:`select` is the denominator. A stroke costs the travel
-    it asks for plus one stop; a pose costs one stop. Scoring `gain / (cost + 1)` is what
-    makes a long dense sweep beat the handful of loose poses that would cover the same
-    area one footprint at a time - which is the whole reason the path stops being a
-    zig-zag. `+1` keeps a zero-cost candidate from dividing by zero, and it is 1 mm, so it
-    changes nothing else.
+    The only difference from :func:`select` is the denominator. `costs` is whatever the
+    caller wants to minimise per candidate - and that choice is the whole design decision,
+    not a detail. Priced in millimetres (a stroke's length plus one stop) a stroke costs
+    about nine times a pose, so the greedy pass takes scattered poses first and reaches for
+    a sweep only at the tail. Priced in corners (one stop for a pose, two for a stroke) the
+    two are comparable, which is what makes the planner prefer one long sweep over the
+    handful of loose poses covering the same area.
 
     `repair_ok` restricts the repair pass (default: everything). Pass True for the
     single poses: a leftover sample is a hole to be patched point by point, and inventing
     a stroke for it would add two corners and a transition to cover one footprint.
     """
     say = log or (lambda _message: None)
+    if coverage_target_pct is not None and not 0.0 < coverage_target_pct <= 100.0:
+        raise ValueError("coverage_target_pct must be in (0, 100]")
     matrix = cov.matrix()
     area = (np.asarray(cov.area_mm2, dtype=float) if area_mm2 is None
             else np.asarray(area_mm2, dtype=float))
     if len(area) != cov.n_targets:
         raise ValueError("one area per target sample is required")
-    costs = np.asarray(costs_mm, dtype=float).reshape(-1)
+    costs = np.asarray(costs, dtype=float).reshape(-1)
     if len(costs) != matrix.shape[0]:
         raise ValueError("one cost per candidate is required")
     allowed = (np.ones(matrix.shape[0], dtype=bool) if repair_ok is None
@@ -157,7 +184,10 @@ def select_groups(cov: CoverageResult, costs_mm, *, area_mm2=None,
         if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
             break
         gains = matrix @ np.where(covered, 0.0, area)
-        score = gains / (costs + 1.0)
+        # `max(cost, eps)` rather than `cost + 1`: the +1 was "one millimetre, ignore it",
+        # which stopped being true the moment the cost became a corner count (2 or 3).
+        # Adding 1 there is a 50% bias and hides the very ratio the caller asked for.
+        score = gains / np.maximum(costs, _COST_EPS)
         best = int(np.argmax(score))
         if gains[best] <= 0.0:
             break
@@ -169,6 +199,10 @@ def select_groups(cov: CoverageResult, costs_mm, *, area_mm2=None,
     repair: list[int] = []
     reachable = cov.pool_reach()
     for target in np.flatnonzero(reachable & ~covered):
+        if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
+            say(f"  repair over groups: stopped at the {coverage_target_pct:g}% target with "
+                f"{int((reachable & ~covered).sum())} reachable samples left uncovered")
+            break
         if covered[target]:
             continue
         candidates = np.flatnonzero(_row(matrix, None, column=target) & allowed)
@@ -185,6 +219,7 @@ def select_groups(cov: CoverageResult, costs_mm, *, area_mm2=None,
         chosen=chosen, greedy=greedy, repair=repair, covered=covered, curve=curve,
         coverage_area_mm2=float(area[covered].sum()), target_area_mm2=target_area,
         sources=np.array(["greedy"] * len(greedy) + ["repair"] * len(repair), dtype=object),
+        corners=int(round(float(costs[chosen].sum()))) if chosen else 0,
     )
 
 

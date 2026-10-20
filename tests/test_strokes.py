@@ -23,11 +23,16 @@ from conftest import box, mesh_from_triangles, plate_triangles, write_station_fi
 from scanplan.config import load_config
 from scanplan.coverage import CoverageResult
 from scanplan.path import (
+    LEVEL_ONE_CORNER,
+    LEVEL_STRAIGHT,
     ROLE_COVERAGE,
     ROLE_REORIENT,
     ROLE_RETRACT,
     ROLE_TRAVERSE,
+    PathPoint,
     build_path,
+    order_strokes,
+    pose_gap_deg,
     prune,
     transition_poses,
 )
@@ -41,6 +46,7 @@ from scanplan.strokes import (
     StrokeCoverage,
     combine,
     dedupe,
+    pose_stroke,
     stroke_offsets,
 )
 from scanplan.target_surface import SampleSet
@@ -172,9 +178,11 @@ def test_the_generator_does_not_offer_two_strokes_over_the_same_line():
 
 def test_a_pose_change_becomes_a_reorientation_and_a_translation_does_not(bench, cfg):
     model = ScannerModel(cfg.scanner)
+    rolled_back = replace(cfg, stroke=replace(cfg.stroke, connector_level=2))
     same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
                  horizontal_stroke(-150.0, 150.0, y=80.0)]
-    path = build_path(same_pose, cfg=cfg, station=bench, model=model, start_near=np.zeros(3))
+    path = build_path(same_pose, cfg=rolled_back, station=bench, model=model,
+                      start_near=np.zeros(3))
     assert path.interrupts_a == 1 and path.interrupts_b == 0
     roles = [point.role for point in path.points]
     assert roles == [ROLE_COVERAGE, ROLE_COVERAGE, ROLE_RETRACT, ROLE_TRAVERSE,
@@ -186,10 +194,46 @@ def test_a_pose_change_becomes_a_reorientation_and_a_translation_does_not(bench,
     tilted = Stroke(start=np.array([0.0, 120.0, PLATE_TOP_MM + 300.0]),
                     end=np.array([200.0, 120.0, PLATE_TOP_MM + 260.0]),
                     axis=np.array([0.0, 0.4, -0.9165]))
-    mixed = build_path([horizontal_stroke(-150.0, 150.0), tilted], cfg=cfg, station=bench,
-                       model=model, start_near=np.zeros(3))
+    mixed = build_path([horizontal_stroke(-150.0, 150.0), tilted], cfg=rolled_back,
+                       station=bench, model=model, start_near=np.zeros(3))
     assert mixed.interrupts_b == 1
     assert ROLE_REORIENT in [point.role for point in mixed.points]
+
+
+def test_the_default_connector_drops_the_reorient_corner(bench, cfg):
+    """L1: retract, then fly straight in, so a same-pose move costs one corner not two."""
+    model = ScannerModel(cfg.scanner)
+    assert cfg.stroke.connector_level == 1
+    same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
+                 horizontal_stroke(-150.0, 150.0, y=80.0)]
+    path = build_path(same_pose, cfg=cfg, station=bench, model=model,
+                      start_near=np.zeros(3))
+    assert [point.role for point in path.points] == [
+        ROLE_COVERAGE, ROLE_COVERAGE, ROLE_RETRACT, ROLE_COVERAGE, ROLE_COVERAGE]
+    assert path.interrupts_a == 1 and path.interrupts_b == 0
+    assert path.connector_levels == {LEVEL_ONE_CORNER: 1}
+    # every route keeps positive clearance, or the point of the level is lost
+    assert path.min_clearance_mm > 0.0
+    assert path.violations == []
+
+
+def test_connector_level_zero_needs_two_identical_poses_and_a_clear_line(bench, cfg):
+    """L0 delivers no corner at all, and only for a pose that does not change."""
+    model = ScannerModel(cfg.scanner)
+    straight = replace(cfg, stroke=replace(cfg.stroke, connector_level=0))
+    same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
+                 horizontal_stroke(-150.0, 150.0, y=80.0)]
+    path = build_path(same_pose, cfg=straight, station=bench, model=model,
+                      start_near=np.zeros(3))
+    assert [point.role for point in path.points] == [ROLE_COVERAGE] * 4
+    assert path.connector_levels == {LEVEL_STRAIGHT: 1}
+    # a changed pose must never take the straight route, whatever the level allows
+    tilted = Stroke(start=np.array([0.0, 120.0, PLATE_TOP_MM + 300.0]),
+                    end=np.array([200.0, 120.0, PLATE_TOP_MM + 260.0]),
+                    axis=np.array([0.0, 0.4, -0.9165]))
+    mixed = build_path([horizontal_stroke(-150.0, 150.0), tilted], cfg=straight,
+                       station=bench, model=model, start_near=np.zeros(3))
+    assert LEVEL_STRAIGHT not in mixed.connector_levels
 
 
 def test_the_transition_poses_are_only_the_moves_between_sweeps(bench, cfg):
@@ -204,8 +248,77 @@ def test_the_transition_poses_are_only_the_moves_between_sweeps(bench, cfg):
     assert len(swings) >= path.interrupts_a + path.interrupts_b
 
 
+def test_a_pose_is_delivered_as_one_point_not_two(bench, cfg):
+    """A zero-length stroke IS a pose, so it must not deliver both of its ends."""
+    model = ScannerModel(cfg.scanner)
+    poses = [pose_stroke(np.array([0.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         np.array([0.0, 0.0, -1.0])),
+             pose_stroke(np.array([200.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         np.array([0.0, 0.0, -1.0]))]
+    path = build_path(poses, cfg=cfg, station=bench, model=model, start_near=np.zeros(3))
+    assert [point.role for point in path.points].count(ROLE_COVERAGE) == 2
+    assert path.coverage_points == 2
+    assert path.coverage_strokes == 0
+    positions = [tuple(np.round(point.position, 6)) for point in path.points
+                 if point.role == ROLE_COVERAGE]
+    assert positions == [(0.0, 0.0, PLATE_TOP_MM + 300.0), (200.0, 0.0, PLATE_TOP_MM + 300.0)]
+
+
+def test_a_zero_length_stroke_is_ordered_like_anything_else(bench, cfg):
+    """It must not be special-cased: a pose sits in the sequence wherever it belongs."""
+    model = ScannerModel(cfg.scanner)
+    items = [horizontal_stroke(-150.0, 150.0),
+             pose_stroke(np.array([600.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         np.array([0.0, 0.0, -1.0])),
+             horizontal_stroke(-150.0, 150.0, y=80.0)]
+    path = build_path(items, cfg=cfg, station=bench, model=model,
+                      start_near=np.array([600.0, 0.0, 0.0]))
+    ids = [point.stroke_id for point in path.points if point.role == ROLE_COVERAGE]
+    # the pose is nearest the start, so it goes first despite being the middle item
+    assert ids[0] == 1
+
+
+def test_a_pure_roll_change_counts_as_a_rotation():
+    """E7: the ordering, `_same_pose` and the rate check must agree about roll."""
+    straight = PathPoint(position=np.zeros(3), axis=np.array([0.0, 0.0, -1.0]),
+                         roll_deg=0.0, role=ROLE_COVERAGE, source="greedy")
+    rolled = PathPoint(position=np.zeros(3), axis=np.array([0.0, 0.0, -1.0]),
+                       roll_deg=30.0, role=ROLE_COVERAGE, source="greedy")
+    assert pose_gap_deg(straight.axis, straight.roll_deg, rolled.axis, rolled.roll_deg) \
+        == pytest.approx(30.0, abs=1e-6)
+    # and it reduces to the axis angle when the roll is the same
+    tilted = PathPoint(position=np.zeros(3), axis=np.array([0.0, 0.4472, -0.8944]),
+                       roll_deg=0.0, role=ROLE_COVERAGE, source="greedy")
+    assert pose_gap_deg(straight.axis, 0.0, tilted.axis, 0.0) == pytest.approx(26.565, abs=1e-3)
+
+
+def test_the_ordering_prices_a_pose_change_and_sorts_like_poses_together(bench, cfg):
+    """Distance alone makes a large wrist turn look free, because it is a short move."""
+    model = ScannerModel(cfg.scanner)
+    flat = horizontal_stroke(-100.0, 100.0)
+    nearby_tilted = Stroke(start=np.array([110.0, 0.0, PLATE_TOP_MM + 300.0]),
+                           end=np.array([310.0, 0.0, PLATE_TOP_MM + 300.0]),
+                           axis=np.array([0.0, 0.6, -0.8]))
+    far_flat = horizontal_stroke(-100.0, 100.0, y=400.0)
+    items = [flat, nearby_tilted, far_flat]
+    weighted = order_strokes(items, np.zeros(3), axis_weight=20.0)
+    plain = order_strokes(items, np.zeros(3), axis_weight=0.0)
+    # the tilted stroke is the odd one out, so weighted ordering puts it last
+    assert [index for index, _ in weighted][-1] == 1
+    # ... and without the pose term it is second, because it is the closest thing there
+    assert [index for index, _ in plain][1] == 1
+
+    by_pose = replace(cfg, stroke=replace(cfg.stroke,
+                                          order_axis_weight_mm_per_deg=20.0))
+    path = build_path(items, cfg=by_pose, station=bench, model=model, start_near=np.zeros(3))
+    ids = [point.stroke_id for point in path.points if point.role == ROLE_COVERAGE]
+    # each stroke's ends stay adjacent, so the tilted one occupies the last two slots
+    assert ids[-2:] == [1, 1]
+    assert ids[0] == ids[1] and ids[2] == ids[3] and ids[0] != ids[2]
+
+
 def test_the_group_score_prefers_one_sweep_over_the_poses_it_replaces():
-    """`gain / (length + stop)` is the mechanism that makes a path out of loose poses."""
+    """`gain / cost` is the mechanism that makes a path out of loose poses."""
     n = 100
     area = np.ones(n, dtype=float)
     pose_sets = [np.arange(i * 25, (i + 1) * 25) for i in range(4)]
@@ -217,10 +330,35 @@ def test_the_group_score_prefers_one_sweep_over_the_poses_it_replaces():
                               tracker_ok=np.ones(5, dtype=bool),
                               counters={}, n_targets=n, area_mm2=area,
                               target_area_mm2=float(n))
-    costs = [100.0] * 4 + [100.0]       # four poses, then the stroke
+    # priced in corners: a stroke is 2, a pose is 1
+    costs = [1.0] * 4 + [2.0]
     selection = select_groups(coverage, costs, repair_ok=[True] * 4 + [False])
     assert list(selection.chosen) == [4]
     assert selection.coverage_pct == pytest.approx(100.0)
+    assert selection.corners == 2
+
+
+def test_the_group_score_divides_by_the_cost_it_is_given():
+    """`max(cost, eps)`, not `cost + 1`: an additive term would flatten the ratio.
+
+    Two poses cover 51% and 49%. At cost 100 (millimetres) the old `+1` was noise; at cost
+    1 against 2 (corners) it would turn a 2:1 preference into 3:2 and can flip the choice.
+    """
+    n = 100
+    area = np.ones(n, dtype=float)
+    big = np.arange(0, 51)
+    small = np.arange(51, 100)
+    poses = [ScannerPose(position=np.zeros(3), axis=np.array([0.0, 0.0, -1.0]))
+             for _ in range(2)]
+    coverage = CoverageResult(poses=poses, sets=[small, big],
+                              quality=[np.ones(len(small)), np.ones(len(big))],
+                              tracker_ok=np.ones(2, dtype=bool),
+                              counters={}, n_targets=n, area_mm2=area,
+                              target_area_mm2=float(n))
+    # equal cost: whoever covers more is taken first
+    assert select_groups(coverage, [1.0, 1.0]).chosen[0] == 1
+    # the cheap one wins when the gain per corner is better: 49/1 beats 51/2
+    assert select_groups(coverage, [1.0, 2.0]).chosen[0] == 0
 
 
 def test_pruning_removes_only_what_is_spare():
@@ -337,15 +475,57 @@ def test_a_stroke_run_reports_the_path_and_never_covers_less(clamped_plate, cfg)
     assert strokes["candidates"] > 0
     assert result.selection.coverage_pct >= result.pose_only_coverage_pct - 1e-9
     assert result.report["parameter_provenance"]["from_datasheet"]["standoff_mm"] == 300.0
-    if strokes["delivered"]:
-        program = result.report["program"]
-        assert program["turns"] == len(result.viewpoints)
-        assert program["motion"] == quick.motion.type
-        assert program["transition_points"] == result.report["viewpoints_transition"]
-        ids = [viewpoint.stroke_id for viewpoint in result.viewpoints]
-        roles = [viewpoint.role for viewpoint in result.viewpoints]
-        assert all(role == ROLE_COVERAGE
-                   for role, stroke in zip(roles, ids, strict=True) if stroke is not None)
-    else:
-        assert result.path is None
+    # In `path` mode EVERY deliverable is a path, including the pose-only one: the connectors
+    # are what make the motion between points checkable, and that does not stop being true
+    # because the strokes lost.
+    assert result.path is not None
+    program = result.report["program"]
+    assert program["turns"] == len(result.viewpoints)
+    assert program["motion"] == quick.motion.type
+    assert program["transition_points"] == result.report["viewpoints_transition"]
+    ids = [viewpoint.stroke_id for viewpoint in result.viewpoints]
+    roles = [viewpoint.role for viewpoint in result.viewpoints]
+    assert all(stroke is not None
+               for role, stroke in zip(roles, ids, strict=True) if role == ROLE_COVERAGE)
+    if not strokes["delivered"]:
         assert "did not beat" in strokes["note"]
+        assert strokes["delivered_strokes"] == 0
+
+
+def test_lean_mode_delivers_poses_and_promises_nothing_between_them(clamped_plate, cfg):
+    """`lean` is v1 plus a stopping rule: no strokes, no connectors, no path."""
+    lean = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=0),
+                   target=replace(cfg.target, delivery_mode="lean"),
+                   stroke=replace(cfg.stroke, enabled=True))
+    result = plan(clamped_plate.station, lean, face="upper")
+    assert result.path is None
+    assert result.strokes is None
+    assert result.report["stroke_plan"]["enabled"] is False
+    assert all(viewpoint.role == ROLE_COVERAGE for viewpoint in result.viewpoints)
+    assert result.report["viewpoints_transition"] == 0
+    # the acceptance figure still applies, which is the only difference from v1
+    assert result.report["program"]["coverage_target_pct"] == lean.target.coverage_target_pct
+    target = lean.target.coverage_target_pct
+    if target is not None:
+        assert result.selection.coverage_pct >= target - 1e-9 or \
+            result.coverage.pool_reach_pct < target
+
+
+def test_the_delivered_coverage_is_the_coverage_of_the_delivered_points(clamped_plate, cfg):
+    """The invariant the whole accounting fix exists for.
+
+    The reported figure used to count poses that never reached the program, so a plan could
+    promise 99.7% and sweep 92%. Recomputing the union over the points that are actually
+    delivered must give the same number as the report, to rounding.
+    """
+    quick = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=0),
+                    stroke=replace(cfg.stroke, enabled=True))
+    result = plan(clamped_plate.station, quick, face="upper")
+    assert result.path is not None
+    covered = np.zeros(result.coverage.n_targets, dtype=bool)
+    for point in result.path.points:
+        if point.role == ROLE_COVERAGE and point.coverage_index is not None:
+            covered[result.coverage.sets[point.coverage_index]] = True
+    area = np.asarray(result.coverage.area_mm2, dtype=float)
+    swept = 100.0 * float(area[covered].sum()) / result.coverage.target_area_mm2
+    assert swept == pytest.approx(result.report["coverage_pct"], abs=1e-3)

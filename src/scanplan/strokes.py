@@ -142,6 +142,20 @@ class Stroke:
         return np.asarray(self.start, dtype=float) + offsets[:, None] * step[None, :]
 
 
+def pose_stroke(position, axis, roll_deg: float = 0.0) -> Stroke:
+    """A single pose as the stroke of zero length that it is.
+
+    The point of this is the accounting, not the geometry: a selected pose has to be
+    handed to the path builder like anything else, or the coverage figure counts a sweep
+    that never appears in the delivered program. The design's measured run promised
+    99.741% and the program swept 91.98% for exactly that reason.
+    """
+    point = np.asarray(position, dtype=float).reshape(3)
+    return Stroke(start=point, end=point.copy(),
+                  axis=unit(np.asarray(axis, dtype=float).reshape(3)),
+                  roll_deg=float(roll_deg))
+
+
 def stroke_offsets(length_mm: float, coverage_step_mm: float,
                    check_step_mm: float) -> np.ndarray:
     """The offsets along a stroke of `length_mm` where coverage is evaluated.

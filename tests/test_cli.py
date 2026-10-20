@@ -176,6 +176,31 @@ def test_face_auto_records_both_faces(cli_station, quick_override, tmp_path):
     assert report["face"] in {"upper", "lower"}
 
 
+def test_the_coverage_target_can_be_set_for_one_run(cli_station, tmp_path):
+    assert main(["plan", "--station", str(cli_station / "station.json"),
+                 "--face", "upper", "--coverage-target", "97.5",
+                 "--out", str(tmp_path)]) == 0
+    report = json.loads((tmp_path / "coverage_report.json").read_text(encoding="utf-8"))
+    assert report["program"]["coverage_target_pct"] == 97.5
+    assert "target 97.5%" in (tmp_path / "summary.txt").read_text(encoding="utf-8")
+
+
+def test_the_coverage_target_can_be_switched_off_for_one_run(cli_station, tmp_path):
+    assert main(["plan", "--station", str(cli_station / "station.json"),
+                 "--face", "upper", "--coverage-target", "none",
+                 "--out", str(tmp_path)]) == 0
+    report = json.loads((tmp_path / "coverage_report.json").read_text(encoding="utf-8"))
+    assert report["program"]["coverage_target_pct"] is None
+
+
+def test_a_coverage_target_outside_its_range_is_a_usage_error(cli_station, tmp_path):
+    for bad in ("0", "-1", "150", "soon"):
+        with pytest.raises(SystemExit) as caught:
+            main(["plan", "--station", str(cli_station / "station.json"),
+                  "--face", "upper", "--coverage-target", bad, "--out", str(tmp_path)])
+        assert caught.value.code == 2
+
+
 def test_the_summary_prints_the_caveat(cli_station, tmp_path, capsys):
     assert main(["plan", "--station", str(cli_station / "station.json"),
                  "--face", "upper", "--out", str(tmp_path)]) == 0

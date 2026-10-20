@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "The old behaviour, as exactly as the planner can still reproduce it.",
+    "Design 2026-10-20-point-count-reduction-design.md, section 5 and constraint C4.",
+    "",
+    "  scanplan plan --station input/station.json --config configs/legacy_exhaust.json --out output/legacy",
+    "",
+    "Every switch that the point-count work turned on is turned back off here:",
+    "  coverage_target_pct          null    greedy runs until nothing new is covered",
+    "  cost_model                   millimetres   the upstream design's pricing",
+    "  connector_level              2       retract + re-orient point between sweeps",
+    "  order_axis_weight_mm_per_deg 0       order by distance alone",
+    "  max_prune_rounds             8       the old round limit",
+    "",
+    "Two differences cannot be switched off, and they are deliberate:",
+    "  1. The selection score is gain / max(cost, eps) instead of gain / (cost + 1). The +1 was",
+    "     one millimetre, so at millimetre pricing this is a 0.1% difference - but it is a",
+    "     difference, and two candidates that scored within a tenth of a percent of each other",
+    "     can now come out in the other order.",
+    "  2. A selected pose is delivered as a zero-length stroke, so it appears in the path with",
+    "     its own connectors instead of being counted in the coverage and then dropped from the",
+    "     program.",
+    "",
+    "Measured baseline to compare against (2026-10-20, upper face): the old code delivered 114",
+    "points and reported 99.741%, while the delivered strokes actually swept 91.98%. This profile",
+    "measured on the same part delivers 405 points at 99.74% and sweeps 99.75% - the difference is",
+    "97 selected poses (plus 194 connector points) that the old code counted in the coverage but",
+    "never wrote into the program. That is the accounting bug being fixed, not a regression, and it",
+    "can only ever ADD points to the delivery.",
+    "",
+    "It also turns up 12 connector violations that the old program could not have shown, because",
+    "those connections did not exist in it: 5 routes keep negative clearance, 7 cannot spread a",
+    "90-136 deg flip over the largest lift within max_rot_deg_per_mm. That is why scenario 'deliver",
+    "every chosen item' and scenario 'price the choice in corners and order it by pose' are not",
+    "alternatives: the second is what makes the first survive a clearance check."
+  ],
+  "target": {
+    "coverage_target_pct": null,
+    "delivery_mode": "path"
+  },
+  "stroke": {
+    "enabled": true,
+    "cost_model": "millimetres",
+    "connector_level": 2,
+    "order_axis_weight_mm_per_deg": 0.0,
+    "max_prune_rounds": 8
+  }
+}

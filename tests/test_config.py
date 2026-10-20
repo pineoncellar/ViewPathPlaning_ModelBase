@@ -63,3 +63,67 @@ def test_a_typo_in_a_key_name_is_rejected(tmp_path):
     bad.write_text(json.dumps({"scanner": {"max_incidence_degs": 45.0}}), encoding="utf-8")
     with pytest.raises(ValueError, match="unknown key"):
         load_config(bad)
+
+
+def test_the_acceptance_threshold_is_a_configurable_nullable_setting(tmp_path):
+    cfg = load_config()
+    assert cfg.target.coverage_target_pct == 99.0
+    assert cfg.target.delivery_mode == "path"
+    # null is the switch back to "run until nothing new is covered", so it must survive
+    # the loader rather than being coerced
+    exhaust = tmp_path / "exhaust.json"
+    exhaust.write_text(json.dumps({"target": {"coverage_target_pct": None}}), encoding="utf-8")
+    assert load_config(exhaust).target.coverage_target_pct is None
+    tuned = tmp_path / "tuned.json"
+    tuned.write_text(json.dumps({"target": {"coverage_target_pct": 97}}), encoding="utf-8")
+    assert load_config(tuned).target.coverage_target_pct == pytest.approx(97.0)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, 100.5, 1000.0])
+def test_a_threshold_outside_its_range_is_refused_not_clamped(tmp_path, value):
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"target": {"coverage_target_pct": value}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="coverage_target_pct"):
+        load_config(bad)
+
+
+def test_the_point_count_knobs_are_validated(tmp_path):
+    for section, key, value, match in (
+        ("target", "delivery_mode", "fast", "delivery_mode"),
+        ("stroke", "cost_model", "millimetres-squared", "cost_model"),
+        ("stroke", "connector_level", 3, "connector_level"),
+        ("stroke", "transition_corners_estimate", -1.0, "transition_corners_estimate"),
+        ("stroke", "order_axis_weight_mm_per_deg", -1.0, "order_axis_weight"),
+    ):
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps({section: {key: value}}), encoding="utf-8")
+        with pytest.raises(ValueError, match=match):
+            load_config(bad)
+
+
+def test_the_shipped_profiles_are_all_loadable():
+    """The three profiles the workshop runs by hand must stay valid together."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "configs"
+    for name in ("stroke_on.json", "lean.json", "legacy_exhaust.json"):
+        cfg = load_config(root / name)
+        assert cfg.target.delivery_mode in ("path", "lean")
+        assert cfg.stroke.cost_model in ("corners", "millimetres")
+    lean = load_config(root / "lean.json")
+    assert lean.target.delivery_mode == "lean" and lean.stroke.enabled is False
+    legacy = load_config(root / "legacy_exhaust.json")
+    assert legacy.target.coverage_target_pct is None
+    assert legacy.stroke.connector_level == 2
+    assert legacy.stroke.order_axis_weight_mm_per_deg == 0.0
+
+
+def test_a_runtime_override_is_validated_like_a_file():
+    from scanplan.config import override
+
+    cfg = load_config()
+    tightened = override(cfg, target={"coverage_target_pct": 97.5})
+    assert tightened.target.coverage_target_pct == pytest.approx(97.5)
+    assert cfg.target.coverage_target_pct == 99.0          # the original is untouched
+    with pytest.raises(ValueError, match="coverage_target_pct"):
+        override(cfg, target={"coverage_target_pct": 0.0})
