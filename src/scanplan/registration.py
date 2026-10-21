@@ -99,14 +99,27 @@ def parse_measured_points(text: str) -> np.ndarray:
     return points
 
 
-def fit_three_points(cad_points, measured_points, *,
-                     target_frame: str = "robot_base", uframe: int = 0
-                     ) -> RigidRegistration:
-    """Find the least-squares proper rigid transform mapping CAD points to measured ones."""
+def fit_points(cad_points, measured_points, *,
+               target_frame: str = "robot_base", uframe: int = 0
+               ) -> RigidRegistration:
+    """Least-squares proper rigid transform for three or more paired datum points.
+
+    Three points determine the transform exactly.  A fourth point does not fit an
+    arbitrary rigid transform, so the extra pair is used the only way it can be:
+    as a least-squares check that catches a mistyped measurement or a mismatched
+    feature.  That is why the browser interface offers 3 or 4 points rather than
+    forcing exactly three.
+    """
     source = np.asarray(cad_points, dtype=float)
     target = np.asarray(measured_points, dtype=float)
-    if source.shape != (3, 3) or target.shape != (3, 3):
-        raise ValueError("three-point registration requires two arrays with shape (3, 3)")
+    if source.ndim != 2 or source.shape != target.shape or source.shape[1:] != (3,):
+        raise ValueError(
+            "registration requires matching CAD and measured point arrays with shape (N, 3)"
+        )
+    if source.shape[0] < 3:
+        raise ValueError(
+            "pick three CAD points (or four) and enter the matching measured coordinates"
+        )
     if not np.isfinite(source).all() or not np.isfinite(target).all():
         raise ValueError("registration coordinates must all be finite numbers")
     _require_non_collinear(source, "CAD")
@@ -131,6 +144,17 @@ def fit_three_points(cad_points, measured_points, *,
         target_frame=target_frame,
         uframe=uframe,
     )
+
+
+def fit_three_points(cad_points, measured_points, *,
+                     target_frame: str = "robot_base", uframe: int = 0
+                     ) -> RigidRegistration:
+    """Find the least-squares proper rigid transform mapping three CAD points."""
+    source = np.asarray(cad_points, dtype=float)
+    target = np.asarray(measured_points, dtype=float)
+    if source.shape != (3, 3) or target.shape != (3, 3):
+        raise ValueError("three-point registration requires two arrays with shape (3, 3)")
+    return fit_points(source, target, target_frame=target_frame, uframe=uframe)
 
 
 _UFRAME_REFUSED = (
@@ -179,6 +203,6 @@ def _require_non_collinear(points: np.ndarray, name: str) -> None:
     singular_values = np.linalg.svd(centred, compute_uv=False)
     if singular_values[0] <= 1e-9 or singular_values[1] <= singular_values[0] * 1e-6:
         raise ValueError(
-            f"the three {name} datum points are collinear or too close together "
+            f"the {name} datum points are collinear or too close together "
             "to determine a stable 3D rotation"
         )
