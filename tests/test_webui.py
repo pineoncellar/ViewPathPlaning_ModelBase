@@ -9,10 +9,12 @@ import pytest
 import trimesh
 
 from scanweb import (
+    _available_run_id,
     _decode_stl,
     _preview_registration,
     _registration_from_payload,
     _sync_input_part,
+    _synthetic_base,
 )
 
 
@@ -50,6 +52,40 @@ def test_registration_payload_requires_three_matching_points():
 
     with pytest.raises(ValueError, match="pick three CAD points"):
         _registration_from_payload(payload)
+
+
+def test_four_point_registration_fits_the_same_rigid_transform():
+    payload = valid_payload()
+    rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    translation = np.array([500.0, -250.0, 900.0])
+    vehicle = np.array([
+        [0.0, 0.0, 0.0], [100.0, 0.0, 0.0],
+        [0.0, 80.0, 0.0], [40.0, 30.0, 25.0],
+    ])
+    payload["cad_points_vehicle_mm"] = vehicle.tolist()
+    payload["measured_points_mm"] = (vehicle @ rotation.T + translation).tolist()
+
+    result = _preview_registration(payload)
+
+    assert len(result["point_errors_mm"]) == 4
+    assert result["rms_error_mm"] == pytest.approx(0.0, abs=1e-10)
+    assert result["translation_vehicle_origin_in_measured_mm"] == pytest.approx(
+        [500, -250, 900]
+    )
+
+
+def test_synthetic_base_sits_below_the_part_and_fixture():
+    part = trimesh.creation.box(extents=[100.0, 80.0, 2.0])
+    part.apply_translation([0.0, 0.0, 50.0])
+    fixture = trimesh.creation.box(extents=[140.0, 120.0, 40.0])
+    fixture.apply_translation([0.0, 0.0, 20.0])
+
+    base = _synthetic_base(part, fixture)
+
+    assert base.bounds[1][2] < fixture.bounds[0][2]
+    assert base.bounds[1][2] < part.bounds[0][2]
+    assert base.extents[0] >= fixture.extents[0]
+    assert base.extents[1] >= fixture.extents[1]
 
 
 def test_reset_poses_are_parsed_as_vehicle_frame_rigid_transforms():
@@ -101,3 +137,23 @@ def test_uploaded_part_replaces_canonical_input_part(tmp_path):
     assert part_path == input_dir / "part.stl"
     assert part_path.read_bytes() == uploaded_stl
     assert list(input_dir.iterdir()) == [part_path]
+
+
+def test_repeated_run_name_gets_a_unique_folder_instead_of_failing(tmp_path):
+    assert _available_run_id("AB1", tmp_path) == "AB1"
+
+    (tmp_path / "AB1").mkdir()
+    assert _available_run_id("AB1", tmp_path) == "AB1"
+
+    (tmp_path / "AB1" / "summary.txt").write_text("existing", encoding="utf-8")
+    first = _available_run_id("AB1", tmp_path)
+    assert first.startswith("AB1_")
+    assert first != "AB1"
+    assert len(first) <= 64
+    assert not (tmp_path / first).exists()
+
+    (tmp_path / first).mkdir()
+    (tmp_path / first / "summary.txt").write_text("existing", encoding="utf-8")
+    second = _available_run_id("AB1", tmp_path)
+    assert second != first
+    assert second.startswith("AB1_")
