@@ -21,6 +21,7 @@ def test_shipped_config_loads_with_placeholder_incidence():
     assert cfg.scanner.max_incidence_deg == 45.0
     assert cfg.scanner.range_mm == (120.0, 480.0)
     assert cfg.scanner.distances_mm == (250.0, 300.0, 380.0)
+    assert cfg.scanner.max_viewpoints == 60
     assert cfg.target.face == "auto"
     assert cfg.contact_distance_mm == 8.0  # 3 mm contact + 5 mm margin
     assert cfg.tracker.distance_mm == (300.0, 6000.0)

@@ -56,6 +56,11 @@ def main(argv: list[str] | None = None) -> int:
         return _run_ls(args, parser)
     if args.command == "pick-datums":
         return _run_pick_datums(args, parser)
+    if args.command == "web":
+        from .webui import serve
+
+        serve(args.host, args.port)
+        return 0
     parser.error("a subcommand is required: plan or ls")
     return 2
 
@@ -89,9 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
                                          "ROBOGUIDE world; switches the program to UFRAME 0")
     exporter.add_argument(
         "--registration",
-        help="JSON with three matching CAD and measured datum points; registers the "
-             "viewpoints to the measured part installation and runs the program under "
-             "the UFRAME the points were measured in (UFRAME 0 for robot-base points)",
+        help="JSON with three matching CAD and robot-base datum points; registers the "
+             "viewpoints to the measured part installation and uses UFRAME 0",
     )
     exporter.add_argument(
         "--max-registration-error-mm",
@@ -128,6 +132,13 @@ def _build_parser() -> argparse.ArgumentParser:
              "as click guides; points must still be selected in the viewer",
     )
     picker.add_argument("--out", required=True, help="registration JSON output path")
+
+    web = subparsers.add_parser(
+        "web",
+        help="start the local browser interface for station setup and path planning",
+    )
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8765)
     return parser
 
 
@@ -361,9 +372,7 @@ def _write_registration_outputs(
     registration: RigidRegistration,
     source: str | Path,
 ) -> None:
-    """Record the calibration used to express the exported path in the measured frame."""
-    frame = registration.frame_label
-    measured_key = f"{registration.target_frame}_mm"
+    """Record the calibration used to express the exported path in robot-base coordinates."""
     report = {
         "method": "least-squares proper rigid transform from three paired datum points",
         "source_frame": "CAD frame used by viewpoints.json",
@@ -377,7 +386,7 @@ def _write_registration_outputs(
         "point_pairs": [
             {
                 "cad_mm": cad.tolist(),
-                measured_key: measured.tolist(),
+                "robot_base_mm": measured.tolist(),
                 "residual_mm": residual.tolist(),
                 "error_mm": float(np.linalg.norm(residual)),
             }
@@ -389,8 +398,8 @@ def _write_registration_outputs(
             )
         ],
         "warning": (
-            f"Confirm the measured points use {frame} coordinates and that each CAD "
-            "point matches the same physical datum before running."
+            "Confirm the measured points use the robot base coordinate system and "
+            "that each CAD point matches the same physical datum before running."
         ),
     }
     output = Path(out_dir)
@@ -398,25 +407,13 @@ def _write_registration_outputs(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     contract["frame"]["origin"] = (
-        f"CAD origin transformed into the {frame} coordinate frame by the "
+        "CAD origin transformed into the robot base coordinate frame by the "
         "three-point registration"
     )
     contract["frame"]["axes"] = (
-        f"{frame} axes; all exported positions and orientations are expressed in the "
-        f"{frame} frame"
+        "robot base axes; all exported positions and orientations are expressed "
+        "in the robot base frame"
     )
-    if registration.uframe == 0:
-        contract["uframe_utool"]["uframe_note"] = (
-            "UFRAME 0 is the robot base frame the three registration datum points were "
-            "measured in; the exported points are already expressed in that frame"
-        )
-    else:
-        contract["uframe_utool"]["uframe_note"] = (
-            f"UFRAME {registration.uframe} is the measured frame the three registration "
-            f"datum points were recorded in, NOT the CAD origin; the exported points are "
-            f"expressed in that same frame, so UFRAME {registration.uframe} must be "
-            "taught as that measured frame"
-        )
     contract["frame"]["note"] = (
         f"UFRAME {registration.uframe} is used. The registration transform was fitted "
         "from the three datum-point pairs recorded in registration_report.json."

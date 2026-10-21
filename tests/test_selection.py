@@ -101,6 +101,25 @@ def test_a_coverage_target_outside_its_range_is_refused():
             select(cov, cov.area_mm2, coverage_target_pct=bad)
 
 
+def test_viewpoint_limit_caps_greedy_and_repair_poses():
+    cov = fake_coverage(
+        sets=[np.array([0, 1]), np.array([2]), np.array([3]), np.array([0, 2])],
+        n_targets=4,
+    )
+
+    selection = select(cov, cov.area_mm2, max_viewpoints=2)
+
+    assert len(selection.chosen) == 2
+    assert np.array_equal(selection.covered, [True, True, True, False])
+
+
+def test_a_nonpositive_viewpoint_limit_is_refused():
+    cov = fake_coverage(sets=[np.array([0])], n_targets=1)
+
+    with pytest.raises(ValueError, match="max_viewpoints"):
+        select(cov, cov.area_mm2, max_viewpoints=0)
+
+
 def test_repair_leaves_genuinely_unreachable_points_alone():
     cov = fake_coverage(sets=[np.array([0])], n_targets=2)
     selection = select(cov, cov.area_mm2)
@@ -141,4 +160,3 @@ def test_the_same_input_selects_the_same_poses():
     second = select(cov, cov.area_mm2)
     assert first.chosen == second.chosen
     assert first.curve == second.curve
-

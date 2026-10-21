@@ -49,6 +49,7 @@ class Selection:
 
 def select(cov: CoverageResult, area_mm2=None, *,
            coverage_target_pct: float | None = None,
+           max_viewpoints: int | None = None,
            log: Callable[[str], None] | None = None) -> Selection:
     """Greedy set cover on covered AREA, then a repair pass for the leftovers.
 
@@ -68,6 +69,8 @@ def select(cov: CoverageResult, area_mm2=None, *,
     say = log or (lambda _message: None)
     if coverage_target_pct is not None and not 0.0 < coverage_target_pct <= 100.0:
         raise ValueError("coverage_target_pct must be in (0, 100]")
+    if max_viewpoints is not None and max_viewpoints <= 0:
+        raise ValueError("max_viewpoints must be positive")
     matrix = cov.matrix()
     area = (np.asarray(cov.area_mm2, dtype=float) if area_mm2 is None
             else np.asarray(area_mm2, dtype=float))
@@ -82,6 +85,8 @@ def select(cov: CoverageResult, area_mm2=None, *,
     greedy: list[int] = []
     curve: list[tuple[int, float]] = []
     while True:
+        if max_viewpoints is not None and len(greedy) >= max_viewpoints:
+            break
         if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
             break
         gains = matrix @ np.where(covered, 0.0, area)
@@ -96,6 +101,8 @@ def select(cov: CoverageResult, area_mm2=None, *,
     repair: list[int] = []
     reachable = cov.pool_reach()
     for target in np.flatnonzero(reachable & ~covered):
+        if max_viewpoints is not None and len(greedy) + len(repair) >= max_viewpoints:
+            break
         if covered[target]:
             continue          # an earlier repair pose already took this one with it
         candidates = np.flatnonzero(_row(matrix, None, column=target))
