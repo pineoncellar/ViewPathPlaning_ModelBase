@@ -8,6 +8,7 @@ the service (unlike a repo-root asset), so an installed `scanplan web` finds it.
 from __future__ import annotations
 
 import base64
+import html
 import json
 import re
 import traceback
@@ -16,21 +17,25 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 import trimesh
 
 from scanplan.config import load_config
 from scanplan.pipeline import plan, write_outputs
-from scanplan.registration import RigidRegistration, fit_three_points
+from scanplan.registration import RigidRegistration, fit_points
 from scanplan.roboguide.adapt import export as export_ls
+from scanplan.roboguide.wpr import normalise_prog_name
 from scanplan.scene import StationDescription, load_station
 from scanplan.sheet_split import split_sheet
 
 _WEB_ROOT = Path(__file__).resolve().parent
+_STATIC_ROOT = Path(__file__).resolve().parents[1] / "scanplan" / "static"
 _MAX_STL_BYTES = 120 * 1024 * 1024
 _MAX_REQUEST_BYTES = 380 * 1024 * 1024
 _SAFE_RUN_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_SAFE_ARTIFACT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,96}$")
 
 
 def _vector(value: Any, name: str) -> np.ndarray:
@@ -54,9 +59,13 @@ def _pose_matrix(pose: dict, name: str) -> np.ndarray:
 def _registration_from_payload(data: dict) -> tuple[RigidRegistration, list[np.ndarray]]:
     cad = np.asarray(data.get("cad_points_vehicle_mm"), dtype=float)
     measured = np.asarray(data.get("measured_points_mm"), dtype=float)
-    if cad.shape != (3, 3) or measured.shape != (3, 3):
-        raise ValueError("pick three CAD points and enter three matching measured XYZ points")
-    registration = fit_three_points(
+    if cad.ndim != 2 or cad.shape != measured.shape or cad.shape[1:] != (3,) \
+            or cad.shape[0] not in (3, 4):
+        raise ValueError(
+            "pick three CAD points (or four) and enter the same number of matching "
+            "measured XYZ points"
+        )
+    registration = fit_points(
         cad,
         measured,
         target_frame=str(data.get("measured_frame", "robot_uframe_1")),
@@ -113,6 +122,167 @@ def _sync_input_part(raw: bytes, input_dir: Path) -> Path:
     return part_path
 
 
+def _synthetic_base(part: trimesh.Trimesh, fixture: trimesh.Trimesh) -> trimesh.Trimesh:
+    """A flat reference plate under the uploaded models when no base is supplied.
+
+    The planner traces the base as an obstacle, so it cannot simply be omitted.
+    A plate well below the part and fixture keeps the base from creating false
+    occlusion while still giving the station a closed, printable reference body.
+    """
+    bounds = np.vstack((np.asarray(part.bounds, dtype=float),
+                        np.asarray(fixture.bounds, dtype=float)))
+    low = bounds.min(axis=0)
+    high = bounds.max(axis=0)
+    span = np.maximum(high - low, 1.0)
+    thickness = max(20.0, float(span[2]) * 0.04)
+    plate = trimesh.creation.box(extents=[
+        float(span[0]) + 120.0,
+        float(span[1]) + 120.0,
+        thickness,
+    ])
+    plate.apply_translation([
+        float((low[0] + high[0]) * 0.5),
+        float((low[1] + high[1]) * 0.5),
+        float(low[2] - thickness * 0.5 - 2.0),
+    ])
+    return plate
+
+
+def _vehicle_point(matrix: np.ndarray, point) -> list[float]:
+    """Map a point from the registered measured frame back to the uploaded STL frame."""
+    inverse = np.linalg.inv(matrix)
+    moved = inverse[:3, :3] @ np.asarray(point, dtype=float) + inverse[:3, 3]
+    return [round(float(value), 4) for value in moved]
+
+
+def _vehicle_axis(matrix: np.ndarray, axis) -> list[float]:
+    inverse = np.linalg.inv(matrix)
+    moved = inverse[:3, :3] @ np.asarray(axis, dtype=float)
+    norm = float(np.linalg.norm(moved))
+    if norm < 1e-12:
+        return [0.0, 0.0, 0.0]
+    return [round(float(value / norm), 9) for value in moved]
+
+
+def _write_planning_report(path: Path, *, run_id: str, prog_name: str,
+                           report: dict, registration: RigidRegistration,
+                           face_axis: np.ndarray, downloads: list[str]) -> Path:
+    """A human-readable planning report next to the machine-readable JSON."""
+    pair_rows = []
+    for index in range(len(registration.cad_points)):
+        cad = ", ".join(f"{value:.3f}" for value in registration.cad_points[index])
+        measured = ", ".join(
+            f"{value:.3f}" for value in registration.measured_points[index]
+        )
+        error = float(np.linalg.norm(registration.residuals_mm[index]))
+        pair_rows.append(
+            f"<tr><td>P{index + 1}</td><td>{cad}</td>"
+            f"<td>{measured}</td><td>{error:.3f}</td></tr>"
+        )
+    pairs = "".join(pair_rows)
+    uncovered = report.get("uncovered_by_reason", {})
+    reason_text = "、".join(f"{key} {value}" for key, value in uncovered.items()) or "无"
+    file_rows = "".join(f"<li>{html.escape(name)}</li>" for name in downloads)
+    face_text = ", ".join(f"{value:.4f}" for value in face_axis)
+    coverage = float(report.get("coverage_pct", 0))
+    target_area = float(report.get("target_face_mm2", 0)) / 1e6
+    body = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>扫描规划报告 · {html.escape(prog_name)}</title>
+<style>
+body{{
+  margin:0;background:#f3f6fa;color:#1c2c40;
+  font:14px/1.7 "Segoe UI","Microsoft YaHei",sans-serif;
+}}
+main{{max-width:980px;margin:32px auto;padding:0 22px 48px}}
+header{{
+  padding:24px 28px;border-radius:10px;
+  background:linear-gradient(120deg,#10243d,#1d4a74);color:#fff;
+}}
+header h1{{margin:0 0 6px;font-size:24px}}
+header p{{margin:0;color:#b9d2e8}}
+section{{
+  margin-top:16px;padding:20px 22px;border:1px solid #e5eaf0;
+  border-radius:8px;background:#fff;
+}}
+h2{{margin:0 0 14px;font-size:17px}}
+.metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}
+.metric{{padding:14px;border:1px solid #e9edf2;border-radius:6px;background:#f8fafc}}
+.metric span{{display:block;color:#78879a;font-size:12px}}
+.metric b{{display:block;margin-top:7px;color:#2f6896;font:600 24px Consolas,monospace}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th,td{{padding:7px 8px;border-bottom:1px solid #edf0f4;text-align:left}}
+th{{color:#78879a;font-weight:600}}
+.warn{{
+  padding:11px 13px;border:1px solid #eee6d8;border-radius:5px;
+  background:#fcf8f1;color:#8d7957;
+}}
+code{{color:#315c82}}
+</style></head><body><main>
+<header><h1>扫描路径规划报告</h1>
+<p>运行编号 {html.escape(run_id)} · 程序 {html.escape(prog_name)}</p></header>
+<section><h2>主要结果</h2><div class="metrics">
+<div class="metric"><span>目标面覆盖率</span><b>{coverage:.2f}%</b></div>
+<div class="metric"><span>扫描视点</span><b>{int(report.get('viewpoints', 0))}</b></div>
+<div class="metric"><span>目标采样点</span><b>{int(report.get('target_points', 0))}</b></div>
+<div class="metric"><span>漏扫点</span><b>{int(report.get('uncovered_points', 0))}</b></div>
+</div>
+<p>目标面：<b>{html.escape(str(report.get('face', '—')))}</b> ·
+面积 {target_area:.4f} m² · 漏扫原因：{html.escape(reason_text)}</p></section>
+<section><h2>三点/四点配准</h2>
+<p>现场坐标系：<b>{html.escape(registration.frame_label)}</b> ·
+RMS {registration.rms_error_mm:.3f} mm ·
+最大误差 {registration.max_error_mm:.3f} mm</p>
+<table><thead><tr><th>点</th><th>CAD / 整车坐标 (mm)</th>
+<th>现场测量坐标 (mm)</th><th>误差 (mm)</th></tr></thead>
+<tbody>{pairs}</tbody></table>
+<p>扫描面外法向（整车坐标）：<code>{face_text}</code></p></section>
+<section><h2>交付文件</h2><ul>{file_rows}</ul></section>
+<section><h2>使用限制</h2>
+<div class="warn">本报告只描述几何可达性，不包含机器人逆解、关节限位、
+机械臂碰撞和跟踪器被机械臂遮挡的判断。导入 ROBOGUIDE 后必须复核 UFRAME、
+UTOOL、可达性与碰撞。</div></section>
+</main></body></html>"""
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _available_run_id(requested: str, root: Path) -> str:
+    """Keep a requested run name when free, otherwise append a timestamp.
+
+    A rerun with the same run name used to fail with "folder already exists",
+    which surfaced as a planning error even though the inputs were fine.  The
+    run name is a label, not a uniqueness constraint: reuse it when the folder is
+    empty, otherwise make a new folder that still starts with the user's name.
+    """
+    folder = root / requested
+    if not folder.exists() or not any(folder.iterdir()):
+        return requested
+    stem = requested[:40].rstrip("_-") or "run"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = f"{stem}_{stamp}"
+    index = 2
+    while (root / candidate).exists() and any((root / candidate).iterdir()):
+        candidate = f"{stem}_{stamp}_{index}"
+        index += 1
+    return candidate
+
+
+def _download_entries(prog_name: str) -> list[dict[str, str]]:
+    return [
+        {"name": f"{prog_name}.LS", "label": "FANUC 控制程序 (.LS)"},
+        {"name": f"{prog_name}_points.csv", "label": "程序点位 CSV"},
+        {"name": f"{prog_name}_frame.json", "label": "帧契约 JSON"},
+        {"name": "planning_report.html", "label": "扫描规划报告 (HTML)"},
+        {"name": "coverage_report.json", "label": "覆盖报告 JSON"},
+        {"name": "registration_report.json", "label": "配准报告 JSON"},
+        {"name": "summary.txt", "label": "规划摘要 TXT"},
+        {"name": "viewpoints.csv", "label": "视点数据 CSV"},
+        {"name": "unreachable_points.csv", "label": "漏扫点 CSV"},
+        {"name": "exempt_points.csv", "label": "夹具豁免点 CSV"},
+    ]
+
+
 def solve_job(data: dict) -> dict:
     """Register uploaded meshes, plan the selected side, and export FANUC files."""
     if not isinstance(data, dict):
@@ -127,11 +297,22 @@ def solve_job(data: dict) -> dict:
             f"the allowed limit is {tolerance:.3f} mm"
         )
 
-    base = _decode_stl(data.get("models", {}).get("base", {}), "base")
-    support = _decode_stl(data.get("models", {}).get("support", {}), "support/fixture")
-    part_raw = _decode_stl_bytes(data.get("models", {}).get("part", {}), "part")
-    _load_stl(part_raw, "part")
+    models = data.get("models", {})
+    if not isinstance(models, dict):
+        raise ValueError("models must be an object")
+    support = _decode_stl(models.get("support", {}), "support/fixture")
+    part_raw = _decode_stl_bytes(models.get("part", {}), "part")
+    part = _load_stl(part_raw, "part")
+    base_payload = models.get("base") or {}
+    base_supplied = isinstance(base_payload, dict) and bool(base_payload.get("stl_base64"))
+    base = (_decode_stl(base_payload, "base") if base_supplied
+            else _synthetic_base(part, support))
     base_reset, support_reset, part_reset = resets
+
+    try:
+        prog_name = normalise_prog_name(data.get("prog_name") or "PART01")
+    except ValueError as error:
+        raise ValueError(str(error)) from error
 
     face_axis_vehicle = _vector(data.get("scan_face_axis"), "main scan-face axis")
     if not np.isclose(np.linalg.norm(face_axis_vehicle), 1.0, atol=1e-6):
@@ -154,14 +335,15 @@ def solve_job(data: dict) -> dict:
     combined_base = combined_base @ base_reset
     scan_axis_target = registration.rotation @ face_axis_vehicle
 
-    run_id = str(data.get("run_id") or (
+    requested_run_id = str(data.get("run_id") or (
         datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     ))
-    if not _SAFE_RUN_ID.fullmatch(run_id):
+    if not _SAFE_RUN_ID.fullmatch(requested_run_id):
         raise ValueError("run id may contain only letters, digits, underscores, and hyphens")
-    output = (Path.cwd() / "output" / "web_runs" / run_id).resolve()
-    if output.exists() and any(output.iterdir()):
-        raise ValueError(f"output folder already exists and is not empty: {output}")
+    runs_root = (Path.cwd() / "output" / "web_runs").resolve()
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_id = _available_run_id(requested_run_id, runs_root)
+    output = (runs_root / run_id).resolve()
     output.mkdir(parents=True, exist_ok=True)
     _sync_input_part(part_raw, Path.cwd() / "input")
 
@@ -226,7 +408,7 @@ def solve_job(data: dict) -> dict:
         contract = export_ls(
             result.viewpoints,
             output,
-            prog_name="PART01",
+            prog_name=prog_name,
             uframe=output_uframe,
             utool=int(data.get("utool", 1)),
             motion=str(data.get("motion", "J")),
@@ -251,7 +433,7 @@ def solve_job(data: dict) -> dict:
             "max_error_mm": registration.max_error_mm,
             "report": "registration_report.json",
         }
-        (output / "PART01_frame.json").write_text(
+        (output / f"{prog_name}_frame.json").write_text(
             json.dumps(contract, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
         report = {
@@ -281,7 +463,7 @@ def solve_job(data: dict) -> dict:
             }),
             "part_scan_face_axis_vehicle": face_axis_vehicle.tolist(),
             "scan_face_axis_measured_frame": scan_axis_target.tolist(),
-            "outputs": ["PART01.LS", "PART01_points.csv", "viewpoints.json"],
+            "outputs": [entry["name"] for entry in _download_entries(prog_name)],
             "warning": (
                 "This is geometric planning only; verify robot reachability, collision, "
                 "UFRAME, and the scanner TCP in ROBOGUIDE before running."
@@ -290,19 +472,49 @@ def solve_job(data: dict) -> dict:
         (output / "registration_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+        _write_planning_report(
+            output / "planning_report.html",
+            run_id=run_id,
+            prog_name=prog_name,
+            report=result.report,
+            registration=registration,
+            face_axis=face_axis_vehicle,
+            downloads=[entry["name"] for entry in _download_entries(prog_name)],
+        )
     except Exception:
         (output / "job_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
         raise
 
+    delivered = []
+    for viewpoint in result.viewpoints:
+        record = viewpoint.as_dict()
+        record["position"] = _vehicle_point(combined_part, viewpoint.position)
+        record["axis"] = _vehicle_axis(combined_part, viewpoint.axis)
+        delivered.append(record)
+    delivered.sort(key=lambda record: record["order"])
+
     return {
         "run_id": run_id,
         "output_dir": str(output),
-        "program": str(output / "PART01.LS"),
+        "program": str(output / f"{prog_name}.LS"),
+        "program_name": prog_name,
         "point_count": len(result.viewpoints),
-        "coverage_pct": result.report["coverage_pct"],
+        "coverage_pct": float(result.report["coverage_pct"]),
+        "target_points": int(result.report.get("target_points", 0)),
+        "uncovered_points": int(result.report.get("uncovered_points", 0)),
+        "target_face_mm2": float(result.report.get("target_face_mm2", 0.0)),
+        "face": str(result.report.get("face", "")),
+        "uncovered_by_reason": result.report.get("uncovered_by_reason", {}),
+        "scan_face_axis_vehicle": face_axis_vehicle.tolist(),
         "scan_face_axis_measured_frame": scan_axis_target.tolist(),
+        "measured_frame": registration.frame_label,
         "registration_rms_error_mm": registration.rms_error_mm,
         "registration_max_error_mm": registration.max_error_mm,
+        "datum_count": int(len(registration.cad_points)),
+        "base_supplied": base_supplied,
+        "viewpoints": delivered,
+        "viewer_url": f"/api/viewer?run_id={run_id}",
+        "downloads": _download_entries(prog_name),
     }
 
 
@@ -310,41 +522,54 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "ScanplanWeb/1.0"
 
     def do_GET(self) -> None:
-        if self.path in ("/", "/index.html"):
-            page = (_WEB_ROOT / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(page)))
-            self.end_headers()
-            self.wfile.write(page)
+        route = urlsplit(self.path)
+        if route.path in ("/", "/index.html"):
+            self._send_bytes((_WEB_ROOT / "index.html").read_bytes(),
+                             "text/html; charset=utf-8")
             return
-        if self.path.startswith("/api/file?"):
-            from urllib.parse import parse_qs, urlsplit
-
-            query = parse_qs(urlsplit(self.path).query)
-            run_id = query.get("run_id", [""])[0]
-            name = query.get("name", [""])[0]
-            allowed = {
-                "PART01.LS",
-                "PART01_points.csv",
-                "PART01_frame.json",
-                "registration_report.json",
-                "coverage_report.json",
-                "summary.txt",
-                "viewpoints.json",
-                "viewpoints.csv",
-            }
-            if not _SAFE_RUN_ID.fullmatch(run_id) or name not in allowed:
-                self.send_error(400, "invalid output file")
+        if route.path == "/app.css":
+            css = _STATIC_ROOT / "app.css"
+            if not css.is_file():
+                self.send_error(404)
                 return
-            path = Path.cwd() / "output" / "web_runs" / run_id / name
+            self._send_bytes(css.read_bytes(), "text/css; charset=utf-8")
+            return
+        if route.path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+        if route.path == "/api/viewer":
+            query = parse_qs(route.query)
+            run_id = query.get("run_id", [""])[0]
+            if not _SAFE_RUN_ID.fullmatch(run_id):
+                self.send_error(400, "invalid run id")
+                return
+            path = Path.cwd() / "output" / "web_runs" / run_id / "viewpoints_3d.html"
             if not path.is_file():
                 self.send_error(404)
                 return
+            self._send_bytes(path.read_bytes(), "text/html; charset=utf-8")
+            return
+        if route.path == "/api/file":
+            query = parse_qs(route.query)
+            run_id = query.get("run_id", [""])[0]
+            name = query.get("name", [""])[0]
+            if not _SAFE_RUN_ID.fullmatch(run_id) or not _SAFE_ARTIFACT.fullmatch(name):
+                self.send_error(400, "invalid output file")
+                return
+            run_dir = (Path.cwd() / "output" / "web_runs" / run_id).resolve()
+            path = (run_dir / name).resolve()
+            if path.parent != run_dir or not path.is_file():
+                self.send_error(404)
+                return
             content = path.read_bytes()
-            content_type = "application/octet-stream" if name.endswith(".LS") \
-                else "application/json; charset=utf-8" if name.endswith(".json") \
+            content_type = (
+                "application/octet-stream" if name.upper().endswith(".LS")
+                else "application/json; charset=utf-8" if name.endswith(".json")
+                else "text/html; charset=utf-8" if name.endswith(".html")
+                else "text/csv; charset=utf-8" if name.endswith(".csv")
                 else "text/plain; charset=utf-8"
+            )
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(content)))
@@ -353,6 +578,14 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
         self.send_error(404)
+
+    def _send_bytes(self, content: bytes, content_type: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(content)
 
     def do_POST(self) -> None:
         if self.path not in ("/api/register", "/api/solve"):
