@@ -79,7 +79,7 @@ def test_registration_file_requires_exactly_three_pairs(tmp_path):
         load_registration(path)
 
 
-def test_registration_reads_existing_uframe_point_array_format(tmp_path):
+def test_registration_refuses_the_uframe_point_array_format(tmp_path):
     points = [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 80.0, 0.0]]
     path = tmp_path / "registration.json"
     path.write_text(json.dumps({
@@ -89,14 +89,11 @@ def test_registration_reads_existing_uframe_point_array_format(tmp_path):
         "measured_points_mm": points,
     }), encoding="utf-8")
 
-    result = load_registration(path)
-
-    assert result.target_frame == "robot_uframe_1"
-    assert result.uframe == 1
-    assert result.max_error_mm == pytest.approx(0.0, abs=1e-10)
+    with pytest.raises(ValueError, match="only accepts robot-base"):
+        load_registration(path)
 
 
-def test_registration_file_reads_uframe_pairs_schema(tmp_path):
+def test_registration_refuses_the_uframe_pairs_schema(tmp_path):
     points = [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 80.0, 0.0]]
     path = tmp_path / "registration.json"
     path.write_text(json.dumps({
@@ -106,10 +103,8 @@ def test_registration_file_reads_uframe_pairs_schema(tmp_path):
         ],
     }), encoding="utf-8")
 
-    result = load_registration(path)
-
-    assert result.uframe == 1
-    assert result.max_error_mm == pytest.approx(0.0, abs=1e-10)
+    with pytest.raises(ValueError, match="only accepts robot-base"):
+        load_registration(path)
 
 
 def test_ls_registers_viewpoints_to_robot_base(tmp_path, viewpoints_json, capsys):
@@ -139,8 +134,12 @@ def test_ls_registers_viewpoints_to_robot_base(tmp_path, viewpoints_json, capsys
     assert "480.0,-240.0,1200.0" in points
     report = json.loads((output / "registration_report.json").read_text(encoding="utf-8"))
     assert report["rms_error_mm"] == pytest.approx(0.0, abs=1e-10)
+    assert report["point_pairs"][0]["robot_base_mm"] == pytest.approx(measured[0])
+    assert "robot base" in report["target_frame"]
     frame = json.loads((output / "REGISTERED_frame.json").read_text(encoding="utf-8"))
     assert frame["uframe_utool"]["uframe"] == 0
+    assert "UFRAME 0 is the robot base frame" in frame["uframe_utool"]["uframe_note"]
+    assert "robot base axes" in frame["frame"]["axes"]
     assert frame["placement"]["registration"]["report"] == "registration_report.json"
     assert "max error 0.000 mm" in capsys.readouterr().out
 
@@ -165,17 +164,32 @@ def test_pick_datums_writes_paired_registration_without_opening_viewer(
     assert main([
         "pick-datums", "--station", str(station),
         "--measured-points", ";".join(",".join(map(str, point)) for point in measured),
-        "--coordinate-system", "robot_uframe_1_mm", "--out", str(output),
+        "--coordinate-system", "robot_base_mm", "--out", str(output),
     ]) == 0
 
     body = json.loads(output.read_text(encoding="utf-8"))
-    assert body["coordinate_system"] == "robot_uframe_1_mm"
+    assert body["coordinate_system"] == "robot_base_mm"
     assert body["point_pairs"][0]["cad_mm"] == pytest.approx(cad[0])
-    assert body["point_pairs"][0]["robot_uframe_1_mm"] == pytest.approx(measured[0])
+    assert body["point_pairs"][0]["robot_base_mm"] == pytest.approx(measured[0])
     assert "maximum 0.000 mm" in capsys.readouterr().out
 
 
-def test_ls_registration_preserves_the_measured_uframe(tmp_path, viewpoints_json):
+def test_pick_datums_refuses_a_uframe_coordinate_system(tmp_path, capsys):
+    output = tmp_path / "registration.json"
+
+    with pytest.raises(SystemExit) as caught:
+        main([
+            "pick-datums", "--station", str(tmp_path / "station.json"),
+            "--measured-points", "0,0,0;100,0,0;0,80,0",
+            "--coordinate-system", "robot_uframe_1_mm", "--out", str(output),
+        ])
+
+    assert caught.value.code == 2
+    assert "robot_base_mm" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_ls_refuses_a_uframe_registration(tmp_path, viewpoints_json, capsys):
     cad = np.array([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 80.0, 0.0]])
     measured = cad + np.array([100.0, 200.0, 300.0])
     registration_path = tmp_path / "registration.json"
@@ -187,17 +201,15 @@ def test_ls_registration_preserves_the_measured_uframe(tmp_path, viewpoints_json
     }), encoding="utf-8")
     output = tmp_path / "uframe1"
 
-    assert main([
-        "ls", "--viewpoints", str(viewpoints_json), "--prog-name", "UFRAME1",
-        "--registration", str(registration_path), "--out", str(output),
-    ]) == 0
+    with pytest.raises(SystemExit) as caught:
+        main([
+            "ls", "--viewpoints", str(viewpoints_json), "--prog-name", "UFRAME1",
+            "--registration", str(registration_path), "--out", str(output),
+        ])
 
-    program = (output / "UFRAME1.LS").read_text(encoding="ascii")
-    assert "UFRAME_NUM=1 ;" in program
-    contract = json.loads((output / "UFRAME1_frame.json").read_text(encoding="utf-8"))
-    assert contract["uframe_utool"]["uframe"] == 1
-    report = json.loads((output / "registration_report.json").read_text(encoding="utf-8"))
-    assert "robot UFRAME 1 coordinates" in report["target_frame"]
+    assert caught.value.code == 2
+    assert "only accepts robot-base" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_ls_refuses_registration_errors_above_limit(

@@ -103,15 +103,15 @@ uv run scanplan ls   --viewpoints output/<零件>/viewpoints.json \
 哪里）需要与现场商定，可能只要求重新导出而不必重跑规划。所以 `ls` 只读视点文件，
 **不需要数模**。
 
-现场可用零件上的三个定位基准点，把 CAD 路径配准到测量坐标系。每个基准点必须提供一对
-坐标：CAD/视点文件坐标中的点，以及现场在机器人基坐标系或指定 `UFRAME` 中测得的点（mm）。
+现场可用零件上的三个定位基准点，把 CAD 路径配准到实测的机器人基坐标系。每个基准点必须提供一对
+坐标：CAD/视点文件坐标中的点，以及现场在机器人基坐标系中测得的点（mm）。
 如果 CAD 中的对应特征还没有坐标，可以先在模型视图中点选，再输入三组现场测量值。
-下面示例默认现场坐标来自 `UFRAME 1`；拾取命令目前支持机器人基坐标和 `UFRAME 1`：
+下面示例中现场坐标来自机器人基坐标：
 
 ```bash
 uv run scanplan pick-datums --station input/<工位>.json \
   --measured-points "x1,y1,z1;x2,y2,z2;x3,y3,z3" \
-  --coordinate-system robot_uframe_1_mm \
+  --coordinate-system robot_base_mm \
   --out output/<零件>/registration_picked.json
 ```
 
@@ -137,16 +137,16 @@ uv run scanplan pick-datums --station input/<工位>.json \
 ```bash
 uv run scanplan pick-datums --station input/<工位>.json \
   --measured-points "x1,y1,z1;x2,y2,z2;x3,y3,z3" \
-  --coordinate-system robot_uframe_1_mm \
+  --coordinate-system robot_base_mm \
   --guide-registration input/previous_registration.json \
   --out output/<零件>/registration_picked.json
 ```
 
-如果实测坐标来自 `UFRAME 1`，将坐标系统改为 `"robot_uframe_1_mm"`，并把配对字段名改为
-`robot_uframe_1_mm`；也兼容 `measured_coordinate_frame`、`cad_points_mm`、
-`measured_points_mm` 这种数组格式。直接编辑 JSON 时，配准输入支持 `UFRAME 1` 至
-`UFRAME 9`；拾取命令的 `--coordinate-system` 目前仅提供基坐标和 `UFRAME 1` 选项。
-导出会使用与实测坐标匹配的 FANUC `UFRAME`：
+配准输入只接受机器人基坐标：`coordinate_system` 必须是 `"robot_base_mm"`，配对字段名必须是
+`robot_base_mm`；也兼容 `measured_coordinate_frame: "robot base"` 配合 `cad_points_mm`、
+`measured_points_mm` 这种数组格式。写成 `UFRAME 1`–`UFRAME 9` 的配准文件会被拒绝并提示
+用基坐标重新量点——现场用 UFRAME 量点时请改用浏览器界面（`scanplan web`），那里可以直接
+选择机器人基坐标或 `UFRAME 1`–`UFRAME 9`。
 
 ```bash
 uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
@@ -157,8 +157,8 @@ uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
 
 默认要求三个点的最大配准残差不超过 3 mm；可按测量精度用
 `--max-registration-error-mm` 调整。输出 `registration_report.json`，记录刚体变换和各点误差。
-三个定位点必须不共线、对应同一组 CAD 特征，且现场坐标必须是机器人基坐标或与指定
-`UFRAME` 一致的坐标，不能混用。导出后仍须在 ROBOGUIDE/现场核对点位。
+三个定位点必须不共线、对应同一组 CAD 特征，且现场坐标必须是机器人基坐标，不能与其他
+坐标系混用。程序因此固定使用 `UFRAME 0`；导出后仍须在 ROBOGUIDE/现场核对点位。
 
 ### 本机浏览器工位界面
 
