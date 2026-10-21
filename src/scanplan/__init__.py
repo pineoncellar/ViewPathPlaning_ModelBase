@@ -18,6 +18,7 @@ Two invariants the whole package has to agree on:
    See :mod:`scanplan.sheet_split`.
 
 The pipeline is `scene -> sheet_split -> target_surface -> candidates -> coverage ->
-selection -> report`, and `scanplan.cli` drives it as three subcommands. The single-file
-3D view that ships beside a run lives in the sibling package `scanview`.
+selection -> report`, and `scanplan.cli` drives it as five subcommands. The sibling
+packages own the two front ends: `scanview` writes the single-file 3D view that ships
+beside a run, and `scanweb` serves the local browser interface.
 """
