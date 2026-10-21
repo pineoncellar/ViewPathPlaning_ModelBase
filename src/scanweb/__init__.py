@@ -1,4 +1,9 @@
-"""Local-only browser interface for station setup, datum registration, and path export."""
+"""Local-only browser interface for station setup, datum registration, and path export.
+
+`scanplan web` serves `index.html` from this package and answers its JSON requests
+with the planner's own API; nothing is uploaded anywhere. The page is packaged with
+the service (unlike a repo-root asset), so an installed `scanplan web` finds it.
+"""
 
 from __future__ import annotations
 
@@ -15,14 +20,14 @@ from typing import Any
 import numpy as np
 import trimesh
 
-from .config import load_config
-from .pipeline import plan, write_outputs
-from .registration import RigidRegistration, fit_three_points
-from .roboguide.adapt import export as export_ls
-from .scene import StationDescription, load_station
-from .sheet_split import split_sheet
+from scanplan.config import load_config
+from scanplan.pipeline import plan, write_outputs
+from scanplan.registration import RigidRegistration, fit_three_points
+from scanplan.roboguide.adapt import export as export_ls
+from scanplan.scene import StationDescription, load_station
+from scanplan.sheet_split import split_sheet
 
-_WEB_ROOT = Path(__file__).resolve().parents[2] / "web"
+_WEB_ROOT = Path(__file__).resolve().parent
 _MAX_STL_BYTES = 120 * 1024 * 1024
 _MAX_REQUEST_BYTES = 380 * 1024 * 1024
 _SAFE_RUN_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
@@ -36,7 +41,7 @@ def _vector(value: Any, name: str) -> np.ndarray:
 
 
 def _pose_matrix(pose: dict, name: str) -> np.ndarray:
-    from .roboguide.wpr import wpr_to_rot
+    from scanplan.roboguide.wpr import wpr_to_rot
 
     position = _vector(pose.get("xyz"), f"{name} reset XYZ")
     wpr = _vector(pose.get("wpr"), f"{name} reset WPR")

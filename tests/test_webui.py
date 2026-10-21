@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import trimesh
 
-from scanplan.webui import (
+from scanweb import (
     _decode_stl,
     _preview_registration,
     _registration_from_payload,
