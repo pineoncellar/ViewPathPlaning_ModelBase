@@ -16,7 +16,8 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from scanplan.pipeline import _better, _rank_plan, plan, write_outputs
+from scanplan.pipeline import plan, write_outputs
+from scanplan.pipeline.ranking import _better, _rank_plan
 from scanplan.selection import Selection
 from scanplan.tracker import Tracker, part_centroid
 
@@ -159,7 +160,7 @@ def test_a_selection_survives_poses_being_appended_to_the_pool():
     names different candidates - the measured run delivered "8 items, 0 strokes, 33.22%"
     for a mixed plan that had just covered 97.15%.
     """
-    from scanplan.pipeline import _shift_rows
+    from scanplan.pipeline.refine import _shift_rows
 
     picked = choice(97.15, 3)
     picked.chosen = [0, 2, 3654, 3660]

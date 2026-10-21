@@ -441,7 +441,7 @@ def test_a_stroke_run_writes_the_program_order_and_a_matching_3d_mask(
     plan delivers more points than it selects items, so passing the selection's rows
     straight through would mislabel every highlight after the first stroke).
     """
-    from scanplan import pipeline
+    from scanplan.pipeline import outputs
 
     captured: dict = {}
 
@@ -449,7 +449,7 @@ def test_a_stroke_run_writes_the_program_order_and_a_matching_3d_mask(
         captured.update(kwargs)
         return {}
 
-    monkeypatch.setattr(pipeline, "write_run_outputs", capture)
+    monkeypatch.setattr(outputs, "write_run_outputs", capture)
     quick = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=0),
                     stroke=replace(cfg.stroke, enabled=True))
     result = plan(clamped_plate.station, quick, face="upper")
