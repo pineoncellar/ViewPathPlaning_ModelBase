@@ -104,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="maximum allowed residual for any registration point (default: 3 mm)",
     )
     exporter.add_argument("--uframe", type=int, help="UFRAME number (default 1, or 0 "
-                                                    "with --place)")
+                                                    "with --place or --registration)")
     exporter.add_argument("--utool", type=int, default=1)
     exporter.add_argument("--motion", default="J", choices=["J", "L"],
                           help="J is the permissive default for a reachability review")
@@ -122,9 +122,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     picker.add_argument(
         "--coordinate-system",
-        choices=["robot_base_mm", "robot_uframe_1_mm"],
-        default="robot_uframe_1_mm",
-        help="coordinate frame used to measure points (default: robot_uframe_1_mm)",
+        choices=["robot_base_mm"],
+        default="robot_base_mm",
+        help="coordinate frame used to measure points; three-point registration only "
+             "accepts robot_base_mm",
     )
     picker.add_argument(
         "--guide-registration",
@@ -195,23 +196,16 @@ def _run_pick_datums(args, parser: argparse.ArgumentParser) -> int:
         part = loaded.dump(concatenate=True) if isinstance(loaded, trimesh.Scene) else loaded
         part = apply_transform(part, read_transform(description.transform_part))
         cad = pick_cad_datums(part, reference_points=reference_points)
-        registration = fit_three_points(
-            cad,
-            measured,
-            target_frame=("robot_base" if args.coordinate_system == "robot_base_mm"
-                          else "robot_uframe_1"),
-            uframe=0 if args.coordinate_system == "robot_base_mm" else 1,
-        )
+        registration = fit_three_points(cad, measured)
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
         parser.error(str(error))
         return 2
 
-    measured_key = args.coordinate_system
     body = {
-        "coordinate_system": args.coordinate_system,
+        "coordinate_system": "robot_base_mm",
         "units": "mm",
         "point_pairs": [
-            {"cad_mm": cad_point.tolist(), measured_key: measured_point.tolist()}
+            {"cad_mm": cad_point.tolist(), "robot_base_mm": measured_point.tolist()}
             for cad_point, measured_point in zip(cad, measured, strict=True)
         ],
     }
@@ -376,8 +370,7 @@ def _write_registration_outputs(
     report = {
         "method": "least-squares proper rigid transform from three paired datum points",
         "source_frame": "CAD frame used by viewpoints.json",
-        "target_frame": f"{registration.frame_label} coordinates "
-                        f"(UFRAME {registration.uframe}), millimetres",
+        "target_frame": "robot base coordinates (UFRAME 0), millimetres",
         "source_file": str(Path(source).resolve()),
         "rotation_cad_to_target_frame": registration.rotation.tolist(),
         "translation_cad_origin_in_target_frame_mm": registration.translation.tolist(),
@@ -414,18 +407,20 @@ def _write_registration_outputs(
         "robot base axes; all exported positions and orientations are expressed "
         "in the robot base frame"
     )
+    contract["uframe_utool"]["uframe_note"] = (
+        "UFRAME 0 is the robot base frame the three registration datum points were "
+        "measured in; the exported points are already expressed in that frame"
+    )
     contract["frame"]["note"] = (
-        f"UFRAME {registration.uframe} is used. The registration transform was fitted "
+        "UFRAME 0 is the robot base frame. The registration transform was fitted "
         "from the three datum-point pairs recorded in registration_report.json."
     )
     contract["placement"]["meaning"] = (
-        f"the fitted rigid transform from the CAD frame into robot UFRAME "
-        f"{registration.uframe}"
+        "the fitted rigid transform from the CAD frame into the robot base frame"
     )
     contract["placement"]["warning"] = (
-        f"the exported positions and orientations are expressed in robot UFRAME "
-        f"{registration.uframe}; confirm that this frame matches the one used to "
-        "measure the three registration datum points"
+        "the exported positions and orientations are expressed in the robot base "
+        "frame; confirm that the three registration datum points were measured there"
     )
     contract["placement"]["registration"] = {
         "method": report["method"],

@@ -1,4 +1,4 @@
-"""Register three CAD datum points to a measured robot coordinate frame."""
+"""Register three CAD datum points to the measured robot base frame."""
 
 from __future__ import annotations
 
@@ -133,26 +133,37 @@ def fit_three_points(cad_points, measured_points, *,
     )
 
 
+_UFRAME_REFUSED = (
+    "three-point registration only accepts robot-base coordinates ('robot_base_mm' or "
+    "measured_coordinate_frame 'robot base'); re-measure the datum points in the robot "
+    "base frame, or use the browser interface (scanplan web) for UFRAME coordinates"
+)
+
+
 def _target_frame(body: dict) -> tuple[str, int]:
-    """Read the output frame from the new format or the existing field-file format."""
+    """Read the output frame; registration only accepts robot-base coordinates."""
     if body.get("units", "mm") != "mm":
         raise ValueError("registration units must be millimetres ('mm')")
+
     coordinate_system = body.get("coordinate_system")
-    if coordinate_system == "robot_base_mm":
-        return "robot_base", 0
-    match = re.fullmatch(r"robot_uframe_([1-9])_mm", str(coordinate_system))
-    if match:
-        return f"robot_uframe_{match.group(1)}", int(match.group(1))
+    if coordinate_system is not None:
+        if coordinate_system == "robot_base_mm":
+            return "robot_base", 0
+        if re.fullmatch(r"robot_uframe_[1-9]_mm", str(coordinate_system)):
+            raise ValueError(_UFRAME_REFUSED)
+        raise ValueError(
+            "registration coordinate_system must be 'robot_base_mm', "
+            f"not {coordinate_system!r}"
+        )
 
     measured_frame = body.get("measured_coordinate_frame")
-    match = re.fullmatch(r"robot UFRAME ([1-9])", str(measured_frame))
-    if match:
-        return f"robot_uframe_{match.group(1)}", int(match.group(1))
     if measured_frame == "robot base":
         return "robot_base", 0
+    if re.fullmatch(r"robot UFRAME [1-9]", str(measured_frame)):
+        raise ValueError(_UFRAME_REFUSED)
     raise ValueError(
-        "registration must identify coordinates as 'robot_base_mm', "
-        "'robot_uframe_N_mm', or measured_coordinate_frame 'robot UFRAME N'"
+        "registration must identify coordinates as 'robot_base_mm' or "
+        "measured_coordinate_frame 'robot base'"
     )
 
 
