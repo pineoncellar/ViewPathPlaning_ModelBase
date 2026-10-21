@@ -71,6 +71,15 @@ def test_the_report_coverage_and_the_viewpoint_set_agree(clamped_plate, quick_cf
         >= result.selection.covered.sum()
 
 
+def test_configured_viewpoint_limit_applies_to_pipeline_and_report(clamped_plate, quick_cfg):
+    cfg = replace(quick_cfg, scanner=replace(quick_cfg.scanner, max_viewpoints=2))
+
+    result = plan(clamped_plate.station, cfg, face="upper")
+
+    assert len(result.viewpoints) <= 2
+    assert result.report["viewpoint_limit"] == 2
+
+
 def test_the_report_states_that_robot_reachability_is_not_modelled(clamped_plate, quick_cfg):
     scope = plan(clamped_plate.station, quick_cfg, face="upper").report["scope"].lower()
     assert "robot" in scope and "not" in scope and "roboguide" in scope
@@ -233,5 +242,4 @@ def test_planning_one_face_can_reuse_a_precomputed_split(clamped_plate, quick_cf
     result = plan(clamped_plate.station, quick_cfg, face="upper",
                   split=clamped_plate.split)
     assert result.split is clamped_plate.split
-
 

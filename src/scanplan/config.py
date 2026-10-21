@@ -38,6 +38,7 @@ class ScannerParams:
     rolls_deg: tuple[float, ...]
     aim_grid_mm: float
     max_candidates: int
+    max_viewpoints: int
     refine_rounds: int
     refine_aim_grid_mm: float
 
@@ -210,6 +211,8 @@ def _validate(config: PlannerConfig) -> None:
         )
     if scanner.max_candidates <= 0:
         raise ValueError("'max_candidates' must be positive")
+    if scanner.max_viewpoints <= 0:
+        raise ValueError("'max_viewpoints' must be positive")
     if scanner.refine_rounds < 0:
         raise ValueError("'refine_rounds' cannot be negative")
     if scanner.standoff_mm <= 0.0 or target.sample_grid_mm <= 0.0:

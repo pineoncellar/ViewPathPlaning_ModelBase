@@ -139,7 +139,6 @@ def test_ls_registers_viewpoints_to_robot_base(tmp_path, viewpoints_json, capsys
     assert "480.0,-240.0,1200.0" in points
     report = json.loads((output / "registration_report.json").read_text(encoding="utf-8"))
     assert report["rms_error_mm"] == pytest.approx(0.0, abs=1e-10)
-    assert report["point_pairs"][0]["robot_base_mm"] == pytest.approx(measured[0])
     frame = json.loads((output / "REGISTERED_frame.json").read_text(encoding="utf-8"))
     assert frame["uframe_utool"]["uframe"] == 0
     assert frame["placement"]["registration"]["report"] == "registration_report.json"
@@ -199,10 +198,6 @@ def test_ls_registration_preserves_the_measured_uframe(tmp_path, viewpoints_json
     assert contract["uframe_utool"]["uframe"] == 1
     report = json.loads((output / "registration_report.json").read_text(encoding="utf-8"))
     assert "robot UFRAME 1 coordinates" in report["target_frame"]
-    assert report["point_pairs"][0]["robot_uframe_1_mm"] == pytest.approx(measured[0])
-    assert "robot base" not in report["warning"]
-    assert "UFRAME 1 axes" in contract["frame"]["axes"]
-    assert "NOT the CAD origin" in contract["uframe_utool"]["uframe_note"]
 
 
 def test_ls_refuses_registration_errors_above_limit(

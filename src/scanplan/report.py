@@ -150,6 +150,11 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
             float(target.samples.total_area_mm2 / max(coverage.n_targets, 1)), 3),
         "exempt": {**contact_summary(target), "reason": _EXEMPT_REASON},
         "viewpoints": len(viewpoints),
+        "viewpoint_limit": config.scanner.max_viewpoints,
+        "viewpoint_budget_reached": (
+            len(viewpoints) >= config.scanner.max_viewpoints
+            and selection.coverage_pct < coverage.pool_reach_pct - 1e-6
+        ),
         "viewpoints_greedy": len(selection.greedy),
         "viewpoints_repair": len(selection.repair),
         "coverage_pct": round(selection.coverage_pct, 3),
@@ -275,6 +280,8 @@ def summary_lines(report: dict) -> list[str]:
         f"(pool could reach {report['pool_reach_pct']:.2f}%)",
         f"viewpoints             {report['viewpoints']} "
         f"({report['viewpoints_greedy']} greedy + {report['viewpoints_repair']} repair)",
+        f"viewpoint budget       {report['viewpoints']}/{report['viewpoint_limit']}"
+        + (" (coverage limited by point cap)" if report["viewpoint_budget_reached"] else ""),
         f"uncovered              {report['uncovered_points']} samples "
         f"{report['uncovered_area_mm2'] / 1e6:.4f} m2  [{reasons}]",
         f"max incidence          {report['placeholders']['max_incidence_deg']:.0f} deg "

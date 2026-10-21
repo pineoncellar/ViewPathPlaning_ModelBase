@@ -20,6 +20,7 @@
     "rolls_deg": [0.0, 90.0],
     "aim_grid_mm": 100.0,
     "max_candidates": 4000,
+    "max_viewpoints": 60,
 
     "_comment_refine": [
       "DESIGN, not measured (spec 6.4): the coarse-to-fine pass. After the first",

@@ -145,18 +145,20 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     counters["refine_rounds"] = 0
     counters["refine_candidates"] = 0
 
-    selection = select(coverage, coverage.area_mm2, log=log)
+    selection = select(
+        coverage, coverage.area_mm2,
+        max_viewpoints=cfg.scanner.max_viewpoints,
+        log=log,
+    )
     for round_index in range(cfg.scanner.refine_rounds):
-        # Aim at every sample still uncovered - not only those the current pool can reach.
-        # Greedy covers the whole reachable set, so the reachable-but-uncovered set is
-        # always empty; what refinement exists to improve is the pool's ceiling, and the
-        # samples to re-aim at are exactly the ones nothing in the pool can see.
+        # The configured viewpoint budget may leave reachable samples uncovered;
+        # refinement can still add candidates that cover more area per pose.
         leftover = np.flatnonzero(~selection.covered)
         if len(leftover) == 0:
             break
         reachable = coverage.pool_reach()
         say(f"refinement round {round_index + 1}: {len(leftover)} uncovered samples "
-            f"({int((~reachable[leftover]).sum())} of them out of the pool's reach)")
+            f"({int((~reachable[leftover]).sum())} beyond the pool's reach)")
         ceiling_before = coverage.pool_reach_pct
         extra = refine(target.samples.points[leftover], target.samples.normals[leftover],
                        cfg.scanner, seed=cfg.seed + round_index, log=log)
@@ -167,7 +169,11 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
         coverage = merge(coverage,
                          evaluate(extra, target.samples, station, model, cfg,
                                   visible=gate, log=log))
-        offered = select(coverage, coverage.area_mm2, log=log)
+        offered = select(
+            coverage, coverage.area_mm2,
+            max_viewpoints=cfg.scanner.max_viewpoints,
+            log=log,
+        )
         selection = _better(selection, offered)
         say(f"  pool ceiling {ceiling_before:.2f}% -> {coverage.pool_reach_pct:.2f}%; "
             f"keeping {len(selection.chosen)} poses at {selection.coverage_pct:.2f}% "
