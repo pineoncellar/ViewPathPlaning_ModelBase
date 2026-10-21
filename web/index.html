@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ScanPlan 工位姿态与路径</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #03080d;
+      --muted: #647382;
+      --line: #d8e0e7;
+      --panel: #fff;
+      --canvas: #f5f8fa;
+      --blue: #126b91;
+      --blue-dark: #0b4e6b;
+      --orange: #bd4b2e;
+      --green: #207348;
+      --red: #a53636;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #edf2f5;
+      font: 14px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    header {
+      padding: 19px clamp(18px, 4vw, 56px);
+      color: white;
+      background: linear-gradient(110deg, #123d53, #167095);
+    }
+    header h1 { margin: 0 0 3px; font-size: 22px; font-weight: 650; }
+    header p { margin: 0; color: #d4e8f0; }
+    main { max-width: 1500px; margin: 22px auto; padding: 0 18px 40px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+    .stack { display: grid; gap: 16px; align-content: start; }
+    .card {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: 0 5px 20px #17374a0b;
+    }
+    .card h2 { margin: 0 0 12px; font-size: 16px; }
+    .step { display: inline-grid; width: 23px; height: 23px; margin-right: 6px; place-items: center; border-radius: 50%; color: white; background: var(--blue); font-size: 12px; }
+    .hint { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
+    .model-inputs { display: grid; gap: 10px; }
+    .file-row { display: grid; grid-template-columns: 78px 1fr; align-items: center; gap: 9px; }
+    label { font-weight: 600; }
+    input, select, button {
+      min-height: 36px;
+      border: 1px solid #c5d0d8;
+      border-radius: 7px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+    }
+    input[type="file"] { width: 100%; padding: 5px; font-size: 12px; }
+    input[type="number"], input[type="text"], select { width: 100%; padding: 6px 8px; }
+    input:focus, select:focus { outline: 2px solid #60a9ca55; border-color: var(--blue); }
+    .mesh-name { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .axis-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: end; }
+    .axis-controls label, .field-grid label { display: grid; gap: 5px; font-size: 12px; }
+    .axis-mode { display: flex; gap: 7px; margin-top: 10px; flex-wrap: wrap; }
+    button { padding: 7px 12px; cursor: pointer; font-weight: 650; transition: background .15s, border .15s; }
+    button:hover { border-color: var(--blue); }
+    button.secondary { color: var(--blue-dark); background: #eff8fb; border-color: #b9d7e3; }
+    button.active { color: #fff; background: var(--blue); border-color: var(--blue); }
+    button.primary { color: #fff; background: var(--blue); border-color: var(--blue); }
+    button.primary:hover { background: var(--blue-dark); }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    .point-table { display: grid; grid-template-columns: 42px repeat(3, minmax(50px, 1fr)); gap: 5px; align-items: center; }
+    .point-table .head { color: var(--muted); font-size: 11px; text-align: center; }
+    .point-table .point-label { font-size: 12px; font-weight: 700; }
+    .point-table input { min-width: 0; min-height: 32px; padding: 4px 5px; font-size: 12px; text-align: right; }
+    .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 11px; }
+    .viewer-card { display: flex; min-height: 550px; flex-direction: column; }
+    .viewer-toolbar { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .viewer-toolbar select { max-width: 200px; }
+    .canvas-wrap { position: relative; flex: 1; min-height: 400px; margin-top: 11px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); }
+    canvas { display: block; width: 100%; height: 100%; }
+    #partCanvas { min-height: 400px; cursor: crosshair; }
+    .canvas-note { display: flex; justify-content: space-between; gap: 8px; margin-top: 7px; color: var(--muted); font-size: 11px; }
+    .point-list { display: grid; gap: 5px; margin-top: 10px; }
+    .point-chip { display: flex; gap: 8px; color: var(--muted); font: 12px/1.4 Consolas, monospace; }
+    .dot { width: 9px; height: 9px; margin-top: 3px; flex: 0 0 9px; border-radius: 50%; background: var(--blue); }
+    .status { min-height: 35px; margin-top: 12px; padding: 8px 10px; border-radius: 7px; color: #43525d; background: #f0f4f6; font-size: 12px; white-space: pre-wrap; }
+    .status.success { color: var(--green); background: #eaf6ef; }
+    .status.error { color: var(--red); background: #fff0ef; }
+    .status.busy { color: var(--blue-dark); background: #eaf5f9; }
+    .actions { display: flex; gap: 9px; flex-wrap: wrap; margin-top: 13px; }
+    .result { display: none; margin-top: 14px; padding: 12px; border: 1px solid #bfdbca; border-radius: 8px; background: #f1faf4; }
+    .result.visible { display: block; }
+    .result-links { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+    .result a { color: var(--blue-dark); font-weight: 650; }
+    .warning { margin: 11px 0 0; padding: 9px 10px; border-left: 3px solid #d69637; border-radius: 4px; color: #664a1e; background: #fff8e9; font-size: 12px; }
+    .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; color: var(--blue-dark); background: #e6f3f8; font-size: 11px; }
+    @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } .viewer-card { min-height: 520px; } }
+    @media (max-width: 540px) { main { padding: 0 10px 24px; } .card { padding: 13px; } .point-table { grid-template-columns: 32px repeat(3, minmax(38px, 1fr)); gap: 3px; } .point-table input { padding: 3px 2px; font-size: 10px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ScanPlan · 工位姿态与扫描路径</h1>
+    <p>本机运行，STL 文件不会上传到外部服务。将模型点与现场测量坐标配对，生成现场扫描路径。</p>
+  </header>
+  <main>
+    <div class="layout">
+      <div class="stack">
+        <section class="card">
+          <h2><span class="step">1</span>导入三份 STL 数模</h2>
+          <div class="model-inputs">
+            <div class="file-row"><label for="baseFile">底座</label><div><input id="baseFile" type="file" accept=".stl"><div id="baseName" class="mesh-name">未导入</div></div></div>
+            <div class="file-row"><label for="supportFile">支基/夹具</label><div><input id="supportFile" type="file" accept=".stl"><div id="supportName" class="mesh-name">未导入</div></div></div>
+            <div class="file-row"><label for="partFile">零件</label><div><input id="partFile" type="file" accept=".stl"><div id="partName" class="mesh-name">未导入</div></div></div>
+          </div>
+          <p class="hint">单位按 mm 处理。导入的 STL 当前坐标直接作为整车复位坐标，请确保底座、支基和零件数模已经按装配关系对齐。</p>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">2</span>选择整车主扫描面</h2>
+          <div class="axis-controls">
+            <label for="scanAxis">扫描仪所在侧 / 主面外法向
+              <select id="scanAxis">
+                <option value="-Y" selected>−Y · 左侧（Y−）</option><option value="+Y">+Y · 右侧（Y+）</option>
+                <option value="+X">+X · 车尾</option><option value="-X">−X · 车头</option>
+                <option value="+Z">+Z · 上</option><option value="-Z">−Z · 下</option>
+              </select>
+            </label>
+            <label for="measureFrame">现场测量坐标系
+              <select id="measureFrame"><option value="1">机器人 UFRAME 1</option><option value="0">机器人基坐标 / UFRAME 0</option></select>
+            </label>
+          </div>
+          <div class="axis-mode">
+            <button id="axisClickButton" class="secondary" type="button">从模型点击自动判断扫描侧</button>
+            <span id="axisBadge" class="badge">观察方向：+Y</span>
+          </div>
+          <p class="hint">整车轴：X 前−后+，Y 左−、右+，Z 下−上+。六个方向都可选；也可在模型上点主面自动判断轴向。</p>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">3</span>输入三个现场定位点</h2>
+          <div class="point-table">
+            <div></div><div class="head">X mm</div><div class="head">Y mm</div><div class="head">Z mm</div>
+            <div class="point-label">P1</div><input data-measure="0" data-axis="x" type="number" step="0.001"><input data-measure="0" data-axis="y" type="number" step="0.001"><input data-measure="0" data-axis="z" type="number" step="0.001">
+            <div class="point-label">P2</div><input data-measure="1" data-axis="x" type="number" step="0.001"><input data-measure="1" data-axis="y" type="number" step="0.001"><input data-measure="1" data-axis="z" type="number" step="0.001">
+            <div class="point-label">P3</div><input data-measure="2" data-axis="x" type="number" step="0.001"><input data-measure="2" data-axis="y" type="number" step="0.001"><input data-measure="2" data-axis="z" type="number" step="0.001">
+          </div>
+          <p class="hint">先填写现场 P1/P2/P3 坐标，再在下方模型视图依次点击与它们对应的 CAD 定位特征。</p>
+          <div class="actions">
+            <button id="clearPoints" class="secondary" type="button">清空已选 CAD 点</button>
+            <button id="checkRegistration" class="secondary" type="button">计算安装姿态 / 检查配准</button>
+          </div>
+          <div id="registrationStatus" class="status">输入现场点并在下方依次选择对应 CAD 点后，将自动计算安装位置、姿态和配准误差。</div>
+        </section>
+
+        <section class="card viewer-card">
+          <div class="viewer-toolbar">
+            <div><h2 style="margin-bottom:2px"><span class="step">4</span>模型选点：按 P1 → P2 → P3 对应现场点</h2><div id="projectionLabel" class="hint" style="margin:0">从扫描仪一侧看向模型；点击与上方现场点对应的 CAD 定位点</div></div>
+            <button id="resetView" class="secondary" type="button">适配视图</button>
+          </div>
+          <div class="canvas-wrap"><canvas id="partCanvas"></canvas></div>
+          <div class="canvas-note"><span id="clickInstruction">按现场点顺序，点击模型上的 P1、P2、P3 对应特征；右键撤销最后一点。</span><span id="pointCounter">0 / 3</span></div>
+          <div id="pickedPoints" class="point-list"></div>
+        </section>
+
+        <section class="card">
+          <h2><span class="step">5</span>根据安装姿态规划并导出现场路径</h2>
+          <div class="field-grid">
+            <label>配准最大误差限值（mm）<input id="errorLimit" type="number" value="50" min="0.001" step="0.1"></label>
+            <label>本次运行名称<input id="runId" type="text" placeholder="留空自动命名"></label>
+          </div>
+          <p class="hint">点位密度：最多 60 个扫描视点；未覆盖区域和覆盖率会写入报告。</p>
+          <div class="warning">生成的是笛卡尔 .LS 路径，不等于机器人已验证可达。运行前必须检查 UFRAME、UTOOL、机器人可达性及碰撞。</div>
+          <div class="actions">
+            <button id="solveButton" class="primary" type="button" disabled>配准、规划并生成 FANUC LS</button>
+          </div>
+          <div id="solveStatus" class="status">完成三份 STL 导入、三组点位配对并确认安装姿态后，即可规划路径。</div>
+          <div id="result" class="result"></div>
+        </section>
+      </div>
+
+    </div>
+  </main>
+  <script>
+    "use strict";
+    const state = { models: {}, picked: [], autoFace: false, registration: null };
+    const sideVectors = { "+X":[1,0,0], "-X":[-1,0,0], "+Y":[0,1,0], "-Y":[0,-1,0], "+Z":[0,0,1], "-Z":[0,0,-1] };
+    const partCanvas = document.getElementById("partCanvas");
+    const ctx = partCanvas.getContext("2d");
+    const statusNode = document.getElementById("registrationStatus");
+    const solveStatus = document.getElementById("solveStatus");
+    let registrationTimer = null;
+    let registrationRequest = 0;
+
+    function parseStl(buffer) {
+      const view = new DataView(buffer);
+      if (buffer.byteLength >= 84) {
+        const count=view.getUint32(80,true);
+        if (84+count*50===buffer.byteLength && count>0) {
+          const tris=new Array(count); let offset=84;
+          for(let t=0;t<count;t++) {
+            offset+=12; const tri=[];
+            for(let v=0;v<3;v++) { tri.push([view.getFloat32(offset,true),view.getFloat32(offset+4,true),view.getFloat32(offset+8,true)]); offset+=12; }
+            offset+=2; tris[t]=tri;
+          }
+          return tris;
+        }
+      }
+      const text=new TextDecoder().decode(buffer);
+      const values=[...text.matchAll(/vertex\s+([-+\d.eE]+)\s+([-+\d.eE]+)\s+([-+\d.eE]+)/gi)];
+      if(!values.length || values.length%3) throw new Error("无法识别 STL：文件需为有效的 ASCII 或 Binary STL。");
+      const triangles=[];
+      for(let i=0;i<values.length;i+=3) triangles.push(values.slice(i,i+3).map(m=>[Number(m[1]),Number(m[2]),Number(m[3])]));
+      return triangles;
+    }
+    function modelTriangles(name) {
+      const model=state.models[name]; if(!model) return [];
+      return model.triangles.map(vertices => {
+        const points=vertices;
+        const a=points[1].map((v,i)=>v-points[0][i]), b=points[2].map((v,i)=>v-points[0][i]);
+        let normal=[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+        const length=Math.hypot(...normal)||1; normal=normal.map(v=>v/length);
+        return {points,normal};
+      });
+    }
+    function resizeCanvas(canvas, context) {
+      const rect=canvas.getBoundingClientRect(), ratio=window.devicePixelRatio||1;
+      const width=Math.max(1,Math.floor(rect.width*ratio)), height=Math.max(1,Math.floor(rect.height*ratio));
+      if(canvas.width!==width||canvas.height!==height) { canvas.width=width; canvas.height=height; }
+      context.setTransform(ratio,0,0,ratio,0,0);
+      return {width:rect.width,height:rect.height};
+    }
+    function projection(side, point) {
+      const sign=side[0]==="+"?1:-1, axis=side[1];
+      if(axis==="X") return {u:point[1],v:point[2],depth:sign*point[0]};
+      if(axis==="Y") return {u:point[0],v:point[2],depth:sign*point[1]};
+      return {u:point[0],v:point[1],depth:sign*point[2]};
+    }
+    function canvasProjection(tris, side, width, height, margin=32) {
+      const projected=[];
+      let minU=Infinity,maxU=-Infinity,minV=Infinity,maxV=-Infinity;
+      for(let i=0;i<tris.length;i++) {
+        const t=tris[i], vertices=t.points.map(p=>projection(side,p));
+        for(const p of vertices){ minU=Math.min(minU,p.u);maxU=Math.max(maxU,p.u);minV=Math.min(minV,p.v);maxV=Math.max(maxV,p.v); }
+        projected.push({vertices,normal:t.normal,index:i,depth:vertices.reduce((s,p)=>s+p.depth,0)/3});
+      }
+      if(!projected.length) return null;
+      const rangeU=Math.max(maxU-minU,1e-6), rangeV=Math.max(maxV-minV,1e-6);
+      const scale=Math.min((width-margin*2)/rangeU,(height-margin*2)/rangeV);
+      const centerU=(minU+maxU)/2, centerV=(minV+maxV)/2;
+      const screen=p=>({x:width/2+(p.u-centerU)*scale,y:height/2-(p.v-centerV)*scale});
+      for(const tri of projected) tri.screen=tri.vertices.map(screen);
+      projected.sort((a,b)=>a.depth-b.depth);
+      return {projected,screen,scale,centerU,centerV,minU,maxU,minV,maxV};
+    }
+    function colorFor(normal, face) {
+      const side=sideVectors[face], alignment=normal[0]*side[0]+normal[1]*side[1]+normal[2]*side[2];
+      if(alignment>0.45) return "#c75a35";
+      if(alignment< -0.45) return "#7798aa";
+      return "#c4cdd2";
+    }
+    function drawPart() {
+      const {width,height}=resizeCanvas(partCanvas,ctx);
+      ctx.clearRect(0,0,width,height);
+      const side=document.getElementById("scanAxis").value;
+      const triangles=modelTriangles("part");
+      if(!triangles.length) { ctx.fillStyle="#667783";ctx.textAlign="center";ctx.font="14px Segoe UI";ctx.fillText("导入零件 STL 后显示主扫描面视图",width/2,height/2); return; }
+      const fit=canvasProjection(triangles,side,width,height);
+      ctx.lineJoin="round";
+      for(const tri of fit.projected) {
+        ctx.beginPath();ctx.moveTo(tri.screen[0].x,tri.screen[0].y);
+        ctx.lineTo(tri.screen[1].x,tri.screen[1].y);ctx.lineTo(tri.screen[2].x,tri.screen[2].y);ctx.closePath();
+        ctx.fillStyle=colorFor(tri.normal,side);ctx.fill();
+      }
+      state.partProjection={...fit,triangles,side,width,height};
+      ctx.fillStyle="#31434f";ctx.font="12px Segoe UI";ctx.textAlign="left";
+      ctx.fillText(`观察方向 ${side} · 主面红色 · 背面蓝色`,12,19);
+      drawPicked();
+      const labels={"+X":"YZ 侧视（从车尾看）","-X":"YZ 侧视（从车头看）","+Y":"XZ 侧视（从右侧看）","-Y":"XZ 侧视（从左侧看）","+Z":"XY 俯视（从上看）","-Z":"XY 仰视（从下看）"};
+      document.getElementById("projectionLabel").textContent=labels[side];
+      document.getElementById("axisBadge").textContent=`观察方向：${side}`;
+    }
+    function drawPicked() {
+      if(!state.partProjection) return;
+      const projection=state.partProjection;
+      state.picked.forEach((point,index)=>{
+        const p=projection.screen(projectionFn(projection.side,point));
+        ctx.beginPath();ctx.arc(p.x,p.y,7,0,Math.PI*2);ctx.fillStyle="#114e9b";ctx.fill();ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.stroke();
+        ctx.fillStyle="#123d53";ctx.font="bold 12px Segoe UI";ctx.fillText(`P${index+1}`,p.x+9,p.y-8);
+      });
+    }
+    function projectionFn(side,point){return projection(side,point);}
+    function barycentric(p,a,b,c) {
+      const v0=[b.x-a.x,b.y-a.y],v1=[c.x-a.x,c.y-a.y],v2=[p.x-a.x,p.y-a.y];
+      const den=v0[0]*v1[1]-v1[0]*v0[1];
+      if(Math.abs(den)<1e-9)return null;
+      const beta=(v2[0]*v1[1]-v1[0]*v2[1])/den,gamma=(v0[0]*v2[1]-v2[0]*v0[1])/den,alpha=1-beta-gamma;
+      return alpha>=-1e-5&&beta>=-1e-5&&gamma>=-1e-5?[alpha,beta,gamma]:null;
+    }
+    function pointAtClick(event) {
+      const stateProjection=state.partProjection;if(!stateProjection)return null;
+      const rect=partCanvas.getBoundingClientRect(), point={x:event.clientX-rect.left,y:event.clientY-rect.top};
+      let best=null,bestDepth=-Infinity;
+      for(const tri of stateProjection.projected) {
+        const weights=barycentric(point,...tri.screen);if(!weights)continue;
+        if(tri.depth>bestDepth){bestDepth=tri.depth;best=tri; }
+      }
+      if(!best)return null;
+      const weights=barycentric(point,...best.screen);
+      const xyz=[0,1,2].map(axis=>weights.reduce((s,w,i)=>s+w*best.vertices[i][["u","v","depth"][axis]],0));
+      const side=stateProjection.side;
+      let vehicle;
+      if(side[1]==="X") vehicle=[(side[0]==="+"?1:-1)*xyz[2],xyz[0],xyz[1]];
+      else if(side[1]==="Y") vehicle=[xyz[0],(side[0]==="+"?1:-1)*xyz[2],xyz[1]];
+      else vehicle=[xyz[0],xyz[1],(side[0]==="+"?1:-1)*xyz[2]];
+      // Recover exact 3D position by barycentrically interpolating the source triangle.
+      const src=stateProjection.triangles[best.index].points;
+      const exact=[0,1,2].map(axis=>weights.reduce((s,w,i)=>s+w*src[i][axis],0));
+      return {point:exact,normal:best.normal,vehicle,face:side};
+    }
+    function renderPickedList() {
+      const node=document.getElementById("pickedPoints");node.replaceChildren();
+      state.picked.forEach((p,i)=>{
+        const row=document.createElement("div");row.className="point-chip";
+        const dot=document.createElement("span");dot.className="dot";
+        const text=document.createElement("span");
+        const measured=[...document.querySelectorAll(`[data-measure="${i}"]`)]
+          .map(input=>input.value);
+        const measuredText=measured.length===3&&measured.every(value=>value!=="")
+          ?` ↔ 现场 (${measured.map(value=>Number(value).toFixed(3)).join(", ")}) mm`
+          :" ↔ 请填写对应的现场坐标";
+        text.textContent=`P${i+1} CAD (${p.map(v=>v.toFixed(3)).join(", ")}) mm${measuredText}`;
+        row.append(dot,text);node.append(row);
+      });
+      document.getElementById("pointCounter").textContent=`${state.picked.length} / 3`;
+      document.getElementById("clickInstruction").textContent=state.autoFace
+        ?"点击主扫描面，自动判断其整车坐标轴方向"
+        :`按现场点顺序，点击模型上的 P${Math.min(state.picked.length+1,3)} 对应特征；右键撤销最后一点`;
+    }
+    function updateAll() {
+      try {
+        drawPart();
+        updateSolveAvailability();
+      }
+      catch(error){setStatus(statusNode,error.message,"error");}
+    }
+    function updateSolveAvailability() {
+      const tolerance=Number(document.getElementById("errorLimit").value);
+      document.getElementById("solveButton").disabled=
+        !["base","support","part"].every(name=>state.models[name]) ||
+        state.picked.length!==3 || !hasMeasuredPoints() ||
+        !state.registration || !Number.isFinite(tolerance) || tolerance<=0 ||
+        state.registration.max_error_mm>tolerance;
+    }
+    function setStatus(node,message,type="") { node.className=`status ${type}`;node.textContent=message; }
+    function measuredPoints() {
+      return [0,1,2].map(index=>["x","y","z"].map(axis=>{
+        const input=document.querySelector(`[data-measure="${index}"][data-axis="${axis}"]`);
+        const value=Number(input.value);if(input.value===""||!Number.isFinite(value))throw new Error(`请填写现场 P${index+1} 的 X/Y/Z 坐标`);
+        return value;
+      }));
+    }
+    function hasMeasuredPoints() {
+      return [...document.querySelectorAll("[data-measure]")].every(input =>
+        input.value !== "" && Number.isFinite(Number(input.value))
+      );
+    }
+    function scheduleRegistrationCheck() {
+      window.clearTimeout(registrationTimer);
+      registrationRequest+=1;
+      if(state.picked.length!==3 || !hasMeasuredPoints())return;
+      registrationTimer=window.setTimeout(checkRegistration,250);
+    }
+    function payload(includeMeshes=false) {
+      if(state.picked.length!==3)throw new Error("请在模型视图中依次选取三个 CAD 定位点");
+      const frame=Number(document.getElementById("measureFrame").value);
+      const data={
+        cad_points_vehicle_mm:state.picked,
+        measured_points_mm:measuredPoints(),
+        measured_frame:frame===0?"robot_base":"robot_uframe_1",
+        uframe:frame,
+        scan_face_axis:sideVectors[document.getElementById("scanAxis").value],
+        max_registration_error_mm:Number(document.getElementById("errorLimit").value),
+        run_id:document.getElementById("runId").value.trim()||undefined
+      };
+      if(includeMeshes)data.models=Object.fromEntries(["base","support","part"].map(name=>[name,{stl_base64:state.models[name].base64}]));
+      return data;
+    }
+    async function checkRegistration() {
+      const request=++registrationRequest;
+      try {
+        setStatus(statusNode,"正在检查三点配准…","busy");
+        const response=await fetch("/api/register",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload())});
+        const body=await response.json();if(!response.ok||!body.ok)throw new Error(body.error||"配准失败");
+        if(request!==registrationRequest)return;
+        state.registration=body.result;
+        updateSolveAvailability();
+        const errors=body.result.point_errors_mm.map((x,i)=>`P${i+1} ${x.toFixed(3)} mm`).join(" · ");
+        const translation=body.result.translation_vehicle_origin_in_measured_mm.map(v=>v.toFixed(3)).join(", ");
+        const rotation=body.result.rotation_vehicle_to_measured.map(row=>row.map(v=>v.toFixed(4)).join(", ")).join(" | ");
+        setStatus(statusNode,`安装变换：整车 CAD 坐标 → ${body.result.measured_frame}\n平移 XYZ: ${translation} mm\n旋转矩阵: ${rotation}\n三点配准 RMS ${body.result.rms_error_mm.toFixed(3)} mm；最大误差 ${body.result.max_error_mm.toFixed(3)} mm（${errors}）`,body.result.max_error_mm<=Number(document.getElementById("errorLimit").value)?"success":"error");
+      } catch(error){if(request!==registrationRequest)return;state.registration=null;updateSolveAvailability();setStatus(statusNode,error.message,"error");}
+    }
+    async function fileBase64(file) {
+      const bytes=new Uint8Array(await file.arrayBuffer());let binary="";
+      for(let start=0;start<bytes.length;start+=0x8000)binary+=String.fromCharCode(...bytes.subarray(start,Math.min(start+0x8000,bytes.length)));
+      return btoa(binary);
+    }
+    async function solve() {
+      const button=document.getElementById("solveButton");button.disabled=true;
+      try {
+        setStatus(solveStatus,"正在上传到本机服务并执行配准、规划…\n零件复杂时规划可能需要几分钟，请勿关闭此页。","busy");
+        const data=payload(true);
+        for(const name of ["base","support","part"])data.models[name].stl_base64=await fileBase64(state.models[name].file);
+        const response=await fetch("/api/solve",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
+        const body=await response.json();if(!response.ok||!body.ok)throw new Error(body.error||"路径生成失败");
+        const r=body.result;setStatus(solveStatus,`完成：${r.point_count} 个点位；覆盖率 ${Number(r.coverage_pct).toFixed(2)}%；配准最大误差 ${r.registration_max_error_mm.toFixed(3)} mm。`,`success`);
+        const result=document.getElementById("result");result.classList.add("visible");result.replaceChildren();
+        const title=document.createElement("strong");title.textContent=`输出目录：${r.output_dir}`;
+        const links=document.createElement("div");links.className="result-links";
+        for(const [name,label] of [["PART01.LS","下载 FANUC PART01.LS"],["PART01_points.csv","点位 CSV"],["registration_report.json","配准报告"],["coverage_report.json","覆盖报告"]]){
+          const link=document.createElement("a");link.href=`/api/file?run_id=${encodeURIComponent(r.run_id)}&name=${encodeURIComponent(name)}`;link.download=name;link.textContent=label;links.append(link);
+        }
+        result.append(title,links);
+      } catch(error){setStatus(solveStatus,error.message,"error");}
+      finally{updateSolveAvailability();}
+    }
+    async function loadModel(name,file) {
+      if(!file)return;
+      const triangles=parseStl(await file.arrayBuffer());
+      if(triangles.length>500000)throw new Error(`${name} STL 三角面超过 500,000，请先简化网格`);
+      state.models[name]={file,triangles,base64:null};
+      document.getElementById(`${name}Name`).textContent=`${file.name} · ${triangles.length.toLocaleString()} triangles`;
+      if(name==="part"){
+        state.picked=[];state.registration=null;registrationRequest+=1;
+        window.clearTimeout(registrationTimer);renderPickedList();
+      }
+      updateAll();
+    }
+    for(const name of ["base","support","part"])document.getElementById(`${name}File`).addEventListener("change",async event=>{
+      try{await loadModel(name,event.target.files[0]);}catch(error){setStatus(statusNode,error.message,"error");}
+    });
+    document.getElementById("scanAxis").addEventListener("change",updateAll);
+    document.getElementById("measureFrame").addEventListener("change",()=>{
+      state.registration=null;
+      scheduleRegistrationCheck();
+    });
+    partCanvas.addEventListener("contextmenu",event=>{
+      event.preventDefault();
+      if(state.autoFace){
+        state.autoFace=false;
+        document.getElementById("axisClickButton").classList.remove("active");
+      }
+      if(state.picked.length===0){
+        setStatus(statusNode,"当前没有可撤销的 CAD 选点。");
+        return;
+      }
+      const index=state.picked.length;
+      state.picked.pop();
+      state.registration=null;
+      registrationRequest+=1;
+      window.clearTimeout(registrationTimer);
+      drawPart();
+      renderPickedList();
+      updateSolveAvailability();
+      setStatus(statusNode,`已撤销 CAD P${index}；下次点击将重新选择 P${index}。`);
+    });
+    partCanvas.addEventListener("click",event=>{
+      const hit=pointAtClick(event);if(!hit)return;
+      if(state.autoFace){
+        const n=hit.normal;let index=0;if(Math.abs(n[1])>Math.abs(n[index]))index=1;if(Math.abs(n[2])>Math.abs(n[index]))index=2;
+        const axis="XYZ"[index],sign=n[index]>=0?"+":"-";
+        document.getElementById("scanAxis").value=`${sign}${axis}`;state.autoFace=false;document.getElementById("axisClickButton").classList.remove("active");
+        updateAll();setStatus(statusNode,`根据点击表面法向自动选择 ${sign}${axis} 扫描侧；请在新视图中依次选择 P1/P2/P3。`,"success");return;
+      }
+      if(state.picked.length>=3)return;
+      state.picked.push(hit.point);state.registration=null;drawPart();renderPickedList();
+      updateSolveAvailability();
+      setStatus(statusNode,`已选 CAD P${state.picked.length}: ${hit.point.map(v=>v.toFixed(3)).join(", ")} mm。继续按顺序选择其余点。`);
+      scheduleRegistrationCheck();
+    });
+    document.getElementById("axisClickButton").addEventListener("click",event=>{
+      if(!state.models.part){setStatus(statusNode,"请先导入零件 STL。","error");return;}
+      state.autoFace=!state.autoFace;event.currentTarget.classList.toggle("active",state.autoFace);
+      document.getElementById("clickInstruction").textContent=state.autoFace?"点击主扫描面以自动推断轴向":"点击模型上的 CAD 定位特征";
+    });
+    document.getElementById("clearPoints").addEventListener("click",()=>{
+      state.picked=[];state.registration=null;registrationRequest+=1;
+      window.clearTimeout(registrationTimer);
+      drawPart();renderPickedList();updateSolveAvailability();
+      setStatus(statusNode,"已清空 CAD 选点。");
+    });
+    document.getElementById("checkRegistration").addEventListener("click",checkRegistration);
+    document.querySelectorAll("[data-measure]").forEach(input=>input.addEventListener("input",()=>{
+      state.registration=null;
+      renderPickedList();
+      updateSolveAvailability();
+      scheduleRegistrationCheck();
+    }));
+    document.getElementById("errorLimit").addEventListener("input",updateSolveAvailability);
+    document.getElementById("solveButton").addEventListener("click",solve);
+    document.getElementById("resetView").addEventListener("click",drawPart);
+    window.addEventListener("resize",updateAll);
+    renderPickedList();updateAll();
+  </script>
+</body>
+</html>

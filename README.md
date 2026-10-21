@@ -113,6 +113,84 @@ uv run scanplan view --viewpoints output/<零件>/viewpoints.json \
 哪里）需要与现场商定，可能只要求重新导出而不必重跑规划。所以 `ls` 只读视点文件，
 **不需要数模**。
 
+现场可用零件上的三个定位基准点，把 CAD 路径配准到实测的机器人基坐标系。每个基准点必须提供一对
+坐标：CAD/视点文件坐标中的点，以及现场在机器人基坐标系中测得的点（mm）。
+如果 CAD 中的对应特征还没有坐标，可以先在模型视图中点选，再输入三组现场测量值。
+下面示例中现场坐标来自机器人基坐标：
+
+```bash
+uv run scanplan pick-datums --station input/<工位>.json \
+  --measured-points "x1,y1,z1;x2,y2,z2;x3,y3,z3" \
+  --coordinate-system robot_base_mm \
+  --out output/<零件>/registration_picked.json
+```
+
+窗口中按 P1、P2、P3 的顺序点击 CAD 上同一物理基准特征，并确保顺序与测量坐标一一对应；
+视图按所选的整车坐标轴正负方向投射到模型，右键可以撤销上一个选择。若已有配准文件，可用
+`--guide-registration` 将其中的 CAD 点显示为青色参考标记；仍需在窗口中逐点点击，点击标记
+附近（30 mm 内）会吸附到原 CAD 点，其他位置则按表面射线拾取。点选完会输出配准 JSON，
+并打印拟合误差。三对点也可以直接写入 JSON：
+
+```json
+{
+  "coordinate_system": "robot_base_mm",
+  "point_pairs": [
+    {"cad_mm": [100.0, 200.0, 300.0], "robot_base_mm": [510.0, 220.0, 840.0]},
+    {"cad_mm": [200.0, 200.0, 300.0], "robot_base_mm": [510.0, 320.0, 840.0]},
+    {"cad_mm": [100.0, 280.0, 300.0], "robot_base_mm": [430.0, 220.0, 840.0]}
+  ]
+}
+```
+
+需要重用已有 CAD 点作为拾取参考时，可添加 `--guide-registration`：
+
+```bash
+uv run scanplan pick-datums --station input/<工位>.json \
+  --measured-points "x1,y1,z1;x2,y2,z2;x3,y3,z3" \
+  --coordinate-system robot_base_mm \
+  --guide-registration input/previous_registration.json \
+  --out output/<零件>/registration_picked.json
+```
+
+配准输入只接受机器人基坐标：`coordinate_system` 必须是 `"robot_base_mm"`，配对字段名必须是
+`robot_base_mm`；也兼容 `measured_coordinate_frame: "robot base"` 配合 `cad_points_mm`、
+`measured_points_mm` 这种数组格式。写成 `UFRAME 1`–`UFRAME 9` 的配准文件会被拒绝并提示
+用基坐标重新量点——现场用 UFRAME 量点时请改用浏览器界面（`scanplan web`），那里可以直接
+选择机器人基坐标或 `UFRAME 1`–`UFRAME 9`。
+
+```bash
+uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
+                   --prog-name PART01 \
+                   --registration input/part_registration.json \
+                   --out output/<零件>_现场配准/
+```
+
+默认要求三个点的最大配准残差不超过 3 mm；可按测量精度用
+`--max-registration-error-mm` 调整。输出 `registration_report.json`，记录刚体变换和各点误差。
+三个定位点必须不共线、对应同一组 CAD 特征，且现场坐标必须是机器人基坐标，不能与其他
+坐标系混用。程序因此固定使用 `UFRAME 0`；导出后仍须在 ROBOGUIDE/现场核对点位。
+
+### 本机浏览器工位界面
+
+```powershell
+uv run scanplan web
+```
+
+浏览器访问 `http://127.0.0.1:8765`。界面可导入底座、支基/夹具、零件 STL（STL 当前坐标
+直接作为整车坐标，三份数模需预先按装配关系对齐），选择整车主扫描面，先输入现场 P1/P2/P3
+定位点坐标，再在输入区下方的模型视图中依次点击对应的 CAD 定位点。每对点按相同序号配对；
+三组点齐全后自动计算并显示从整车 CAD 坐标到所选机器人坐标系的安装平移和旋转矩阵。
+配准最大误差限值默认为 50 mm，超过该限值时拒绝输出。确认安装姿态后，按所选方向分割目标面、运行路径规划并生成
+FANUC `.LS`。覆盖报告会记录实际视点数量与未覆盖区域。所有 STL 和输出都只在
+本机处理，不发送到外部服务。
+路径规划使用本次界面导入的零件 STL，生成前同步覆盖项目 `input/part.stl`，同时将相同的
+STL 副本保存为该次运行目录中的 `part.stl` 并应用三点配准变换；不会使用其他运行遗留的
+零件模型。模型视图中可按鼠标右键撤销最后一个 CAD 选点。
+
+整车轴向固定为 X 前负后正、Y 左负右正、Z 下负上正。扫描面可用 ±X/±Y/±Z 选择，或在
+主面视图点击表面自动判断轴向。浏览器工具生成的路径仍需在 ROBOGUIDE 核实 UFRAME/UTOOL、
+可达性与碰撞；它不替代机器人仿真和现场安全确认。
+
 ### 交付物
 
 `plan` 在输出目录写下八个文件（`--no-3d` 时六个）：
