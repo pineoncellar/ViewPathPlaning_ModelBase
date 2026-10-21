@@ -8,8 +8,7 @@ import numpy as np
 import pytest
 import trimesh
 
-import scanplan.cli as cli
-from scanplan.cli import main
+from scanplan.cli import main, pick_datums
 from scanplan.datum_picker import snap_to_reference
 from scanplan.registration import fit_three_points, load_registration, parse_measured_points
 
@@ -157,7 +156,7 @@ def test_pick_datums_writes_paired_registration_without_opening_viewer(
     cad = np.array([[-30.0, -1.0, -20.0], [30.0, -1.0, -20.0], [-30.0, -1.0, 20.0]])
     measured = cad + np.array([200.0, 100.0, 300.0])
     monkeypatch.setattr(
-        cli, "pick_cad_datums", lambda _part, reference_points=None: cad
+        pick_datums, "pick_cad_datums", lambda _part, reference_points=None: cad
     )
     output = tmp_path / "registration.json"
 
