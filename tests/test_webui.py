@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 
 import numpy as np
 import pytest
 import trimesh
 
+import scanweb
 from scanweb import (
+    _STATIC_ROOT,
     _available_run_id,
     _decode_stl,
     _preview_registration,
@@ -52,6 +55,15 @@ def test_registration_payload_requires_three_matching_points():
 
     with pytest.raises(ValueError, match="pick three CAD points"):
         _registration_from_payload(payload)
+
+
+def test_web_page_stylesheet_ships_with_the_package():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+    stylesheet = _STATIC_ROOT / "app.css"
+
+    assert 'href="/app.css"' in page
+    assert stylesheet.is_file(), "index.html links /app.css but the file is missing"
+    assert ".app-shell" in stylesheet.read_text(encoding="utf-8")
 
 
 def test_four_point_registration_fits_the_same_rigid_transform():
