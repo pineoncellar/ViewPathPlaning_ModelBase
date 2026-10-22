@@ -1,8 +1,9 @@
 """Local-only browser interface for station setup, datum registration, and path export.
 
-`scanplan web` serves `index.html` from this package and answers its JSON requests
-with the planner's own API; nothing is uploaded anywhere. The page is packaged with
-the service (unlike a repo-root asset), so an installed `scanplan web` finds it.
+`scanplan web` serves `index.html`, `app.css` and `app.js` from this package and
+answers their JSON requests with the planner's own API; nothing is uploaded
+anywhere. The page is packaged with the service (unlike a repo-root asset), so an
+installed `scanplan web` finds it.
 """
 
 from __future__ import annotations
@@ -11,9 +12,13 @@ import base64
 import html
 import json
 import re
+import shutil
+import socket
+import sqlite3
 import traceback
 import uuid
-from datetime import datetime
+import zlib
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -30,8 +35,9 @@ from scanplan.roboguide.wpr import normalise_prog_name
 from scanplan.scene import StationDescription, load_station
 from scanplan.sheet_split import split_sheet
 
+from .cad_import import mesh_from_bytes, to_stl_bytes
+
 _WEB_ROOT = Path(__file__).resolve().parent
-_STATIC_ROOT = Path(__file__).resolve().parents[1] / "scanplan" / "static"
 _MAX_STL_BYTES = 120 * 1024 * 1024
 _MAX_REQUEST_BYTES = 380 * 1024 * 1024
 _SAFE_RUN_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
@@ -559,6 +565,129 @@ def solve_job(data: dict) -> dict:
     }
 
 
+# --- history (SQLite) ------------------------------------------------------
+#
+# Every completed run is recorded next to its output directory, so the browser
+# can list, reopen and re-download earlier work after a restart. The payload is
+# the same JSON that /api/solve returned, zlib-compressed to keep viewpoint
+# tables small. History is advisory: a write failure must never fail a job.
+
+_HISTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    prog_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    coverage_pct REAL,
+    point_count INTEGER,
+    target_points INTEGER,
+    uncovered_points INTEGER,
+    target_face_mm2 REAL,
+    face TEXT,
+    error TEXT,
+    payload BLOB
+);
+CREATE INDEX IF NOT EXISTS runs_created_idx ON runs (created_at DESC);
+"""
+
+
+def _history_connection() -> sqlite3.Connection:
+    root = Path.cwd() / "output" / "web_runs"
+    root.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(root / "history.sqlite3", timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.executescript(_HISTORY_SCHEMA)
+    return connection
+
+
+def _init_history() -> None:
+    connection = _history_connection()
+    try:
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _record_history_run(result: dict, display_name: str = "") -> None:
+    try:
+        packed = zlib.compress(
+            json.dumps(result, ensure_ascii=False).encode("utf-8"), 6
+        )
+        name = display_name.strip() or f"{result['program_name']} · {result['run_id']}"
+        connection = _history_connection()
+        try:
+            connection.execute(
+                "INSERT OR REPLACE INTO runs (run_id, display_name, prog_name,"
+                " created_at, status, coverage_pct, point_count, target_points,"
+                " uncovered_points, target_face_mm2, face, error, payload)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                (
+                    result["run_id"],
+                    name,
+                    result["program_name"],
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "completed",
+                    float(result["coverage_pct"]),
+                    int(result["point_count"]),
+                    int(result["target_points"]),
+                    int(result["uncovered_points"]),
+                    float(result.get("target_face_mm2", 0.0)),
+                    str(result.get("face", "")),
+                    packed,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError) as error:
+        print(f"[scanplan-web] history write skipped: {error}", flush=True)
+
+
+def _history_runs(limit: int = 200) -> list[dict]:
+    connection = _history_connection()
+    try:
+        rows = connection.execute(
+            "SELECT run_id, display_name, prog_name, created_at, status, coverage_pct,"
+            " point_count, target_points, uncovered_points, target_face_mm2, face, error"
+            " FROM runs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        connection.close()
+    return [dict(row) for row in rows]
+
+
+def _history_run_payload(run_id: str) -> dict | None:
+    connection = _history_connection()
+    try:
+        row = connection.execute(
+            "SELECT payload FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None or row["payload"] is None:
+        return None
+    return json.loads(zlib.decompress(row["payload"]).decode("utf-8"))
+
+
+def _delete_history_run(run_id: str) -> bool:
+    connection = _history_connection()
+    try:
+        deleted = connection.execute(
+            "DELETE FROM runs WHERE run_id = ?", (run_id,)
+        ).rowcount > 0
+        connection.commit()
+    finally:
+        connection.close()
+    runs_root = (Path.cwd() / "output" / "web_runs").resolve()
+    run_dir = (runs_root / run_id).resolve()
+    if deleted and run_dir.parent == runs_root and run_dir.is_dir():
+        shutil.rmtree(run_dir, ignore_errors=True)
+    return deleted
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "ScanplanWeb/1.0"
 
@@ -569,15 +698,51 @@ class _Handler(BaseHTTPRequestHandler):
                              "text/html; charset=utf-8")
             return
         if route.path == "/app.css":
-            css = _STATIC_ROOT / "app.css"
+            css = _WEB_ROOT / "app.css"
             if not css.is_file():
                 self.send_error(404)
                 return
             self._send_bytes(css.read_bytes(), "text/css; charset=utf-8")
             return
+        if route.path == "/app.js":
+            script = _WEB_ROOT / "app.js"
+            if not script.is_file():
+                self.send_error(404)
+                return
+            self._send_bytes(script.read_bytes(), "text/javascript; charset=utf-8")
+            return
         if route.path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
+            return
+        if route.path == "/api/history":
+            self._json_response(200, {"ok": True, "runs": _history_runs()})
+            return
+        if route.path == "/api/history/detail":
+            query = parse_qs(route.query)
+            run_id = query.get("run_id", [""])[0]
+            if not _SAFE_RUN_ID.fullmatch(run_id):
+                self.send_error(400, "invalid run id")
+                return
+            record = _history_run_payload(run_id)
+            if record is None:
+                self._json_response(404, {"ok": False, "error": "run not found"})
+                return
+            self._json_response(200, {"ok": True, "result": record})
+            return
+        if route.path == "/api/history/model":
+            query = parse_qs(route.query)
+            run_id = query.get("run_id", [""])[0]
+            name = query.get("name", [""])[0]
+            if not _SAFE_RUN_ID.fullmatch(run_id) or name not in ("part", "support", "base"):
+                self.send_error(400, "invalid run or model name")
+                return
+            runs_root = (Path.cwd() / "output" / "web_runs").resolve()
+            model = (runs_root / run_id / f"{name}.stl").resolve()
+            if model.parent.parent != runs_root or not model.is_file():
+                self.send_error(404)
+                return
+            self._send_bytes(model.read_bytes(), "model/stl")
             return
         if route.path == "/api/viewer":
             query = parse_qs(route.query)
@@ -629,7 +794,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def do_POST(self) -> None:
-        if self.path not in ("/api/register", "/api/solve"):
+        if self.path not in (
+            "/api/register", "/api/solve", "/api/convert", "/api/history/delete"
+        ):
             self.send_error(404)
             return
         try:
@@ -639,8 +806,55 @@ class _Handler(BaseHTTPRequestHandler):
                     f"request size must be between 1 and {_MAX_REQUEST_BYTES} bytes"
                 )
             data = json.loads(self.rfile.read(length))
-            result = _preview_registration(data) if self.path == "/api/register" \
-                else solve_job(data)
+            if not isinstance(data, dict):
+                raise ValueError("request body must be a JSON object")
+            if self.path == "/api/convert":
+                filename = str(data.get("filename") or "")
+                encoded = data.get("data_base64")
+                if not isinstance(encoded, str) or not encoded:
+                    raise ValueError("缺少模型文件数据")
+                try:
+                    raw = base64.b64decode(encoded, validate=True)
+                except ValueError as error:
+                    raise ValueError("模型文件数据不是有效的 base64") from error
+                if len(raw) > _MAX_STL_BYTES:
+                    raise ValueError(
+                        f"模型文件超过 {_MAX_STL_BYTES // (1024 * 1024)} MB 限制"
+                    )
+                try:
+                    mesh = mesh_from_bytes(raw, filename)
+                except ValueError:
+                    raise
+                except Exception as error:
+                    raise ValueError(f"模型转换失败：{error}") from error
+                stl = to_stl_bytes(mesh)
+                if len(stl) > _MAX_STL_BYTES:
+                    raise ValueError(
+                        f"转换后的网格超过 {_MAX_STL_BYTES // (1024 * 1024)} MB，"
+                        "请先在 CAD 中简化模型"
+                    )
+                self._json_response(200, {
+                    "ok": True,
+                    "stl_base64": base64.b64encode(stl).decode("ascii"),
+                    "faces": int(len(mesh.faces)),
+                    "vertices": int(len(mesh.vertices)),
+                })
+                return
+            if self.path == "/api/history/delete":
+                run_id = str(data.get("run_id") or "")
+                if not _SAFE_RUN_ID.fullmatch(run_id):
+                    raise ValueError("invalid run id")
+                self._json_response(
+                    200, {"ok": True, "deleted": _delete_history_run(run_id)}
+                )
+                return
+            if self.path == "/api/register":
+                self._json_response(
+                    200, {"ok": True, "result": _preview_registration(data)}
+                )
+                return
+            result = solve_job(data)
+            _record_history_run(result, str(data.get("run_name") or ""))
             self._json_response(200, {"ok": True, "result": result})
         except (ValueError, json.JSONDecodeError, OSError) as error:
             self._json_response(400, {"ok": False, "error": str(error)})
@@ -674,12 +888,50 @@ def _preview_registration(data: dict) -> dict:
     }
 
 
+def _local_addresses() -> list[str]:
+    """Best-effort LAN IPv4 addresses, for the startup banner."""
+    addresses: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = str(info[4][0])
+            if address not in addresses and not address.startswith("127."):
+                addresses.append(address)
+    except OSError:
+        pass
+    if not addresses:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(("8.8.8.8", 80))
+                addresses.append(str(probe.getsockname()[0]))
+        except OSError:
+            pass
+    return addresses
+
+
+def _bind_urls(host: str, port: int) -> list[str]:
+    if host in ("", "0.0.0.0", "::"):
+        urls = [f"http://127.0.0.1:{port}"]
+        urls.extend(f"http://{address}:{port}" for address in _local_addresses())
+        return urls
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return [f"http://127.0.0.1:{port}"]
+    return [f"http://{host}:{port}"]
+
+
 def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
-    """Serve the UI only on loopback; STL files never leave the local machine."""
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        raise ValueError("the browser UI only binds to localhost")
+    """Serve the UI. Bind 0.0.0.0 to let other machines on the LAN open it."""
+    _init_history()
+    exposed = host not in ("127.0.0.1", "localhost", "::1")
+    if exposed:
+        print(
+            "warning: the UI is reachable from other machines. Anyone who can reach "
+            "this port can submit jobs and download previous outputs, so use it only "
+            "on a trusted network.",
+            flush=True,
+        )
     server = ThreadingHTTPServer((host, port), _Handler)
-    print(f"scanplan web UI: http://127.0.0.1:{port}", flush=True)
+    for url in _bind_urls(host, port):
+        print(f"scanplan web UI: {url}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
