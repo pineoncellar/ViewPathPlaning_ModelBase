@@ -18,7 +18,8 @@
   #stats { display: grid; grid-template-columns: auto auto; gap: 2px 18px; }
   #stats span { color: #8b98a8; }
   #stats b { justify-self: end; font-weight: 600; font-variant-numeric: tabular-nums; }
-  #tools { top: 14px; right: 14px; padding: 10px 12px; width: 184px; }
+  #tools { top: 14px; right: 14px; padding: 10px 12px; width: 208px;
+    max-height: calc(100vh - 28px); overflow-y: auto; }
   #tools h2 { margin: 0 0 6px; font-size: 11px; font-weight: 600; color: #8b98a8;
     text-transform: uppercase; letter-spacing: .6px; }
   #tools label { display: flex; align-items: center; gap: 7px; padding: 2px 0;
@@ -26,6 +27,10 @@
   #tools input { accent-color: #3b82f6; margin: 0; }
   #tools select { margin-left: auto; background: #1c2530; color: #c9d3de; border: 1px solid #2b3440;
     border-radius: 5px; font-family: inherit; font-size: 11px; padding: 1px 3px; }
+  #tools input[type="range"] { width: 100%; margin: 5px 0 0; accent-color: #ffcf6b; }
+  #tools .divider { margin-top: 9px; padding-top: 8px; border-top: 1px solid #2b3440; }
+  #play-status { margin-top: 5px; color: #97a3b2; font-size: 11px; line-height: 1.55;
+    font-variant-numeric: tabular-nums; white-space: pre-line; }
   #tools .note { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2b3440;
     color: #78838f; line-height: 1.6; font-size: 11px; }
   .btnrow { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px;
@@ -71,6 +76,7 @@
   <label><input type="checkbox" id="show-fixture" checked> 夹具</label>
   <label><input type="checkbox" id="show-base" checked> 底座</label>
   <label><input type="checkbox" id="show-viewpoints" checked> 视点位置</label>
+  <label><input type="checkbox" id="show-path" checked> 扫描路径</label>
   <label>视场锥
     <select id="fov-mode">
       <option value="selected">仅选中</option>
@@ -86,13 +92,28 @@
       <option value="off">关闭</option>
     </select>
   </label>
-  <div class="note">单击一个视点（绿/橙方块）看它的视场：参考点 → 光轴 → 工作距离处的矩形视场。
-    单击零件上的采样点，可以看哪些视点能扫到它。</div>
+  <div class="note">单击视点看它的视场锥，单击采样点看谁扫到它。亮色路径是扫描段（带），暗灰段是过渡/退刀；单击路径可从那里开始播放。</div>
   <div class="btnrow">
     <button id="btn-fit">适配</button>
     <button id="btn-iso">等轴</button>
     <button id="btn-top">俯视</button>
     <button id="btn-front">前视</button>
+  </div>
+  <div class="divider">
+    <h2>路径播放</h2>
+    <div class="btnrow" style="margin:0; padding:0; border-top:0">
+      <button id="btn-play">▶ 播放</button>
+      <button id="btn-play-reset">↺ 复位</button>
+    </div>
+    <label>速度<select id="play-speed">
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="4">4×</option>
+    </select></label>
+    <label><input type="checkbox" id="follow-camera" checked> 镜头跟随</label>
+    <input type="range" id="path-progress" min="0" max="0" value="0" step="1">
+    <div id="play-status">路径 0 / 0</div>
   </div>
 </div>
 
@@ -112,6 +133,9 @@
   <div><span class="sw" style="background:#2ecf74"></span>已覆盖采样</div>
   <div><span class="sw" style="background:#e5484d"></span>未覆盖采样</div>
   <div><span class="sw" style="background:#4ddcf0"></span>选中视点扫到的采样 / 能扫到所选采样的视点</div>
+  <div><span class="sw" style="background:#ffcf6b"></span>扫描路径（带）</div>
+  <div><span class="sw" style="background:#738599"></span>过渡 / 退刀路径</div>
+  <div><span class="sw" style="background:#1adbdf"></span>回放中已扫过的采样</div>
 </div>
 
 <div id="hint" class="panel">左键拖动旋转 · 滚轮缩放 · 右键或 Shift 拖动平移 · 单击视点看它的视场锥</div>
@@ -152,7 +176,12 @@
     samplePicked: [1.00, 0.86, 0.30],
     covered: [0.18, 0.78, 0.44],
     uncovered: [0.90, 0.28, 0.30],
-    tracker: [0.30, 0.60, 1.00]
+    tracker: [0.30, 0.60, 1.00],
+    pathScan: [1.00, 0.81, 0.42],
+    pathMove: [0.45, 0.52, 0.60],
+    reveal: [0.10, 0.86, 0.88],
+    playHead: [1.00, 0.94, 0.60],
+    playQuad: [1.00, 0.78, 0.35]
   };
 
   /* ---------- buffers ---------- */
@@ -239,6 +268,41 @@
   var selectedPointBuffer = gl.createBuffer();
   var selectedQuadBuffer = gl.createBuffer();
 
+  // The delivered records ARE the program order, so consecutive pairs are the moves the
+  // robot makes. A pair inside one stroke (same stroke_id, both scanning) is a sweep and
+  // is drawn bright; everything else is a connector and is drawn dim.
+  var scanPathSegments = [];
+  var movePathSegments = [];
+  for (var pathIndex = 0; pathIndex < VP.length - 1; pathIndex += 1) {
+    var pathFrom = VP[pathIndex];
+    var pathTo = VP[pathIndex + 1];
+    var sameStroke = pathFrom.stroke_id !== null && pathFrom.stroke_id !== undefined
+      && pathFrom.stroke_id === pathTo.stroke_id;
+    var sweeps = sameStroke && pathFrom.role === "coverage" && pathTo.role === "coverage";
+    pushSegment(sweeps ? scanPathSegments : movePathSegments,
+                pathFrom.position, pathTo.position);
+  }
+  var scanPathBuffer = upload(gl.ARRAY_BUFFER, toFloats(scanPathSegments));
+  var movePathBuffer = upload(gl.ARRAY_BUFFER, toFloats(movePathSegments));
+
+  function viewFrame(record) {
+    // The four corners are aim + u*halfU + v*halfV in order, so the edges give both the
+    // rotation and the size - which is what the animation has to interpolate.
+    var corners = record.corners || [];
+    if (corners.length < 4 || !record.aim) return null;
+    var across = sub(corners[0], corners[1]);
+    var down = sub(corners[1], corners[2]);
+    var acrossLength = Math.hypot(across[0], across[1], across[2]);
+    var downLength = Math.hypot(down[0], down[1], down[2]);
+    if (acrossLength < 1e-6 || downLength < 1e-6) return null;
+    return {
+      u: scale(across, 1 / acrossLength),
+      v: scale(down, 1 / downLength),
+      halfU: acrossLength / 2,
+      halfV: downLength / 2
+    };
+  }
+
   var target = DATA.target || null;
   var samplePositions = null, sampleCount = 0;
   var sampleCovered = null, sampleMask = null, sampleStride = 0;
@@ -279,6 +343,48 @@
       uncoveredBuffer = upload(gl.ARRAY_BUFFER, positionsOf(uncoveredIdx));
     }
   }
+
+  // "Which samples have been scanned so far" is a prefix of this order: bucket every
+  // sample under the FIRST path point that can measure it, then sort by that point. The
+  // playhead only moves forward, so revealing is a draw-range change, not a per-frame
+  // filter over a 100k-point cloud.
+  var revealOrderBuffer = null;
+  var revealCounts = null;
+  var revealTotal = 0;
+  var revealedCount = 0;
+
+  function buildRevealTimeline() {
+    if (!sampleMask || sampleStride <= 0 || !samplePositions || !VP.length) return;
+    var firstColumn = new Int32Array(sampleCount);
+    firstColumn.fill(-1);
+    for (var s = 0; s < sampleCount; s += 1) {
+      var row = s * sampleStride;
+      for (var b = 0; b < sampleStride && firstColumn[s] < 0; b += 1) {
+        var byte = sampleMask[row + b];
+        if (!byte) continue;
+        for (var bit = 0; bit < 8; bit += 1) {
+          if (!(byte & (1 << bit))) continue;
+          var column = (b << 3) + bit;
+          if (column < VP.length) { firstColumn[s] = column; break; }
+        }
+      }
+    }
+    var buckets = [];
+    for (var c = 0; c < VP.length; c += 1) buckets.push([]);
+    for (var i = 0; i < sampleCount; i += 1) {
+      if (firstColumn[i] >= 0) buckets[firstColumn[i]].push(i);
+    }
+    var ordered = [];
+    revealCounts = new Int32Array(VP.length);
+    for (var k = 0; k < VP.length; k += 1) {
+      for (var q = 0; q < buckets[k].length; q += 1) ordered.push(buckets[k][q]);
+      revealCounts[k] = ordered.length;
+    }
+    revealTotal = ordered.length;
+    if (revealTotal) revealOrderBuffer = upload(gl.ARRAY_BUFFER, positionsOf(ordered));
+  }
+
+  buildRevealTimeline();
 
   var tracker = DATA.tracker;
   var trackerLineBuffer = null, trackerPointBuffer = null;
@@ -516,7 +622,7 @@
     gl.drawElements(gl.TRIANGLES, mesh.count, mesh.type, 0);
   }
 
-  function drawFlat(buffer, mode, count, color, size, shift, alpha) {
+  function drawFlat(buffer, mode, count, color, size, shift, alpha, first) {
     if (!buffer || count <= 0) return;
     if (alpha === undefined) alpha = 1.0;
     if (alpha < 1.0) {
@@ -531,7 +637,7 @@
     gl.uniform1f(flatLoc.size, size);
     gl.uniform1f(flatLoc.shift, shift);
     gl.uniform1f(flatLoc.alpha, alpha);
-    gl.drawArrays(mode, 0, count);
+    gl.drawArrays(mode, first || 0, count);
   }
 
   function render() {
@@ -592,6 +698,13 @@
       }
     }
 
+    if (pathVisible()) {
+      drawFlat(movePathBuffer, gl.LINES, movePathSegments.length / 3,
+               COLORS.pathMove, 1, shift * 1.5, 0.55);
+      drawFlat(scanPathBuffer, gl.LINES, scanPathSegments.length / 3,
+               COLORS.pathScan, 1, shift * 2, 0.95);
+    }
+
     var fovMode = document.getElementById("fov-mode").value;
     if (fovMode === "all") {
       drawFlat(footprintBuffer, gl.LINES, footprints.length / 3, COLORS.footprintAll,
@@ -630,6 +743,24 @@
                  viewpointSize * 1.3, 0);
       }
       drawFlat(pickedSampleBuffer, gl.POINTS, 1, COLORS.samplePicked, pointSize * 2.2, 0);
+      gl.enable(gl.DEPTH_TEST);
+    }
+
+    if (playback.active) {
+      // Already swept: the leading slice of the reveal order. Drawn opaque so the
+      // growth of the scanned region is the thing the eye follows.
+      if (revealOrderBuffer && revealedCount > 0) {
+        drawFlat(revealOrderBuffer, gl.POINTS, revealedCount, COLORS.reveal,
+                 pointSize * 1.15, shift);
+      }
+      gl.disable(gl.DEPTH_TEST);
+      if (playback.quad) {
+        drawFlat(playQuadBuffer, gl.TRIANGLES, playback.fillVertices, COLORS.playQuad,
+                 1, 0, 0.16);
+        drawFlat(playQuadOutlineBuffer, gl.LINES, playback.outlineVertices,
+                 COLORS.playQuad, 1, 0, 0.95);
+      }
+      drawFlat(headBuffer, gl.POINTS, 1, COLORS.playHead, viewpointSize * 1.5, 0);
       gl.enable(gl.DEPTH_TEST);
     }
   }
@@ -717,6 +848,27 @@
     return { index: best, depth: bestDepth };
   }
 
+  // The path is a thin line, so a click is matched against a few points along each
+  // segment instead of a hitbox; it is tried last so it never steals a pose or sample.
+  function pickPath(cursor, project) {
+    if (!pathVisible() || VP.length < 2) return { index: -1, depth: Infinity };
+    var limit = pixelLimit(16);
+    var best = -1, bestDepth = Infinity;
+    for (var i = 0; i < VP.length - 1; i += 1) {
+      var a = VP[i].position, b = VP[i + 1].position;
+      for (var step = 1; step <= 3; step += 1) {
+        var t = step / 4;
+        var hit = project(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
+                          a[2] + (b[2] - a[2]) * t);
+        if (!hit) continue;
+        var dx = hit.x - cursor.x, dy = hit.y - cursor.y;
+        if (dx * dx + dy * dy > limit) continue;
+        if (hit.depth < bestDepth) { bestDepth = hit.depth; best = i; }
+      }
+    }
+    return { index: best, depth: bestDepth };
+  }
+
   function pick(event) {
     var cursor = cursorNdc(event);
     var project = projectionHelper();
@@ -727,6 +879,8 @@
       return { kind: "viewpoint", index: viewpoint.index };
     }
     if (sample.index >= 0) return { kind: "sample", index: sample.index };
+    var path = pickPath(cursor, project);
+    if (path.index >= 0) return { kind: "path", index: path.index };
     return { kind: "none", index: -1 };
   }
 
@@ -851,6 +1005,199 @@
     requestRender();
   }
 
+  /* ---------- path playback ---------- */
+
+  // Clicking a path segment (or pressing play) walks the head along the delivered
+  // sequence: the marker moves segment by segment at a constant visual speed, the field
+  // of view is rebuilt from the two end poses, and the samples whose first covering pose
+  // has been passed light up - so the scanned region grows the way the program sweeps it.
+  var playback = {
+    index: 0, t: 0, playing: false, speed: 1, follow: true, active: false,
+    last: 0, raf: 0, position: null, quad: false, outlineVertices: 0, fillVertices: 0
+  };
+  var headBuffer = gl.createBuffer();
+  var playQuadBuffer = gl.createBuffer();
+  var playQuadOutlineBuffer = gl.createBuffer();
+
+  function segmentTotal() { return Math.max(VP.length - 1, 0); }
+
+  function pathVisible() {
+    var box = document.getElementById("show-path");
+    return Boolean(box && box.checked);
+  }
+
+  function mix(value, other, t) { return value + (other - value) * t; }
+
+  function lerpPoint(a, b, t) {
+    return [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)];
+  }
+
+  function lerpDirection(a, b, t) {
+    if (dot(a, b) < -0.999) return [a[0], a[1], a[2]];
+    return unit([mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)]);
+  }
+
+  function poseAt(index, t) {
+    if (!VP.length) return null;
+    var last = VP.length - 1;
+    var i = clamp(Math.round(index), 0, last);
+    var from = VP[i];
+    var to = VP[Math.min(i + 1, last)];
+    var span = i < last ? t : 0;
+    var position = lerpPoint(from.position, to.position, span);
+    var axis = lerpDirection(from.axis, to.axis, span);
+    var startFrame = viewFrame(from);
+    var endFrame = i < last ? viewFrame(to) : null;
+    var quad = null;
+    if (startFrame) {
+      var u = lerpDirection(startFrame.u, endFrame ? endFrame.u : startFrame.u, span);
+      var v = lerpDirection(startFrame.v, endFrame ? endFrame.v : startFrame.v, span);
+      // Re-square the frame: interpolating two unit vectors lets them drift towards each
+      // other, and the rectangle would shear in the middle of a turn.
+      v = unit(sub(v, scale(u, dot(u, v))));
+      var halfU = mix(startFrame.halfU, endFrame ? endFrame.halfU : startFrame.halfU, span);
+      var halfV = mix(startFrame.halfV, endFrame ? endFrame.halfV : startFrame.halfV, span);
+      var standoff = (DATA.scanner && DATA.scanner.standoff_mm) || 0;
+      var aim = add(position, scale(axis, standoff));
+      quad = {
+        aim: aim,
+        corners: [
+          add(aim, add(scale(u, halfU), scale(v, halfV))),
+          add(aim, add(scale(u, -halfU), scale(v, halfV))),
+          add(aim, add(scale(u, -halfU), scale(v, -halfV))),
+          add(aim, add(scale(u, halfU), scale(v, -halfV)))
+        ]
+      };
+    }
+    return { position: position, axis: axis, quad: quad };
+  }
+
+  function revealedAt(index) {
+    if (!revealCounts || !revealCounts.length) return 0;
+    return revealCounts[clamp(Math.round(index), 0, revealCounts.length - 1)];
+  }
+
+  function syncPlaybackBuffers() {
+    var pose = poseAt(playback.index, playback.t);
+    if (!pose) return;
+    playback.position = pose.position;
+    gl.bindBuffer(gl.ARRAY_BUFFER, headBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pose.position), gl.DYNAMIC_DRAW);
+    playback.quad = Boolean(pose.quad);
+    if (!pose.quad) return;
+    var corners = pose.quad.corners;
+    var outline = [];
+    for (var i = 0; i < 4; i += 1) pushSegment(outline, corners[i], corners[(i + 1) % 4]);
+    pushSegment(outline, pose.position, pose.quad.aim);
+    for (var j = 0; j < 4; j += 1) pushSegment(outline, pose.quad.aim, corners[j]);
+    var fill = [];
+    for (var k = 1; k < 3; k += 1) {
+      fill.push(corners[0][0], corners[0][1], corners[0][2],
+                corners[k][0], corners[k][1], corners[k][2],
+                corners[k + 1][0], corners[k + 1][1], corners[k + 1][2]);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, playQuadOutlineBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, toFloats(outline), gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, playQuadBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, toFloats(fill), gl.DYNAMIC_DRAW);
+    playback.outlineVertices = outline.length / 3;
+    playback.fillVertices = fill.length / 3;
+  }
+
+  function syncPlaybackUI() {
+    var total = segmentTotal();
+    var slider = document.getElementById("path-progress");
+    slider.max = String(Math.max(total, 0));
+    slider.value = String(playback.index);
+    var point = VP[playback.index];
+    var head = "点 " + (VP.length ? playback.index + 1 : 0) + " / " + VP.length;
+    if (point) {
+      if (point.stroke_id !== null && point.stroke_id !== undefined) head += " · 带 " + point.stroke_id;
+      if (point.role && point.role !== "coverage") head += " · " + point.role;
+    }
+    var swept = revealCounts
+      ? "已扫采样 " + revealedCount.toLocaleString() + " / " + revealTotal.toLocaleString()
+      : "无覆盖关系数据";
+    document.getElementById("play-status").textContent = head + "\n" + swept;
+  }
+
+  function seek(index) {
+    var total = segmentTotal();
+    playback.index = clamp(Math.round(index), 0, Math.max(total, 0));
+    playback.t = 0;
+    playback.active = true;
+    revealedCount = revealedAt(playback.index);
+    syncPlaybackBuffers();
+    syncPlaybackUI();
+    requestRender();
+  }
+
+  function followHead(dt) {
+    if (!playback.position) return;
+    var k = 1 - Math.exp(-Math.max(dt, 0.001) * 7);
+    center = [
+      center[0] + (playback.position[0] - center[0]) * k,
+      center[1] + (playback.position[1] - center[1]) * k,
+      center[2] + (playback.position[2] - center[2]) * k
+    ];
+  }
+
+  function play() {
+    if (segmentTotal() < 1 || playback.playing) return;
+    if (playback.index >= segmentTotal()) seek(0);
+    playback.active = true;
+    playback.playing = true;
+    playback.last = performance.now();
+    document.getElementById("btn-play").textContent = "⏸ 暂停";
+    playback.raf = requestAnimationFrame(stepPlayback);
+  }
+
+  function pause() {
+    playback.playing = false;
+    document.getElementById("btn-play").textContent = "▶ 播放";
+  }
+
+  function resetPlayback() {
+    pause();
+    playback.active = false;
+    playback.index = 0;
+    playback.t = 0;
+    revealedCount = 0;
+    syncPlaybackUI();
+    requestRender();
+  }
+
+  function stepPlayback(now) {
+    if (!playback.playing) return;
+    var dt = Math.min(Math.max((now - playback.last) / 1000, 0), 0.12);
+    playback.last = now;
+    var total = segmentTotal();
+    var from = VP[playback.index];
+    var to = VP[Math.min(playback.index + 1, total)];
+    var span = Math.hypot(to.position[0] - from.position[0],
+                          to.position[1] - from.position[1],
+                          to.position[2] - from.position[2]);
+    // A fixed visual speed keeps a 700 mm sweep and a 5 mm nudge both readable; the
+    // clamps stop a zero-length move from flashing past.
+    var duration = clamp(span / 450, 0.12, 1.8) / Math.max(playback.speed, 0.1);
+    playback.t += dt / duration;
+    while (playback.t >= 1 && playback.index < total) {
+      playback.t -= 1;
+      playback.index += 1;
+    }
+    if (playback.index >= total) {
+      playback.index = total;
+      playback.t = 0;
+      pause();
+    }
+    revealedCount = revealedAt(playback.index);
+    syncPlaybackBuffers();
+    syncPlaybackUI();
+    if (playback.follow) followHead(dt);
+    requestRender();
+    if (playback.playing) playback.raf = requestAnimationFrame(stepPlayback);
+  }
+
   function panBy(dx, dy) {
     var cam = camera();
     var perPixel = 2 * distance * Math.tan(FOV / 2) / Math.max(canvas.clientHeight, 1);
@@ -904,7 +1251,12 @@
     var hit = pick(event);
     if (hit.kind === "viewpoint") select(hit.index);
     else if (hit.kind === "sample") selectSample(hit.index);
-    else {
+    else if (hit.kind === "path") {
+      // Clicking the path jumps there and runs forward from that point - the "watch the
+      // head sweep from here on" gesture.
+      seek(hit.index);
+      play();
+    } else {
       select(-1);
     }
   });
@@ -960,6 +1312,24 @@
     }
     requestRender();
   });
+  document.getElementById("show-path").addEventListener("change", function () {
+    if (!this.checked) resetPlayback();
+    requestRender();
+  });
+  document.getElementById("btn-play").addEventListener("click", function () {
+    if (playback.playing) pause();
+    else play();
+  });
+  document.getElementById("btn-play-reset").addEventListener("click", resetPlayback);
+  document.getElementById("play-speed").addEventListener("change", function () {
+    playback.speed = Number(this.value) || 1;
+  });
+  document.getElementById("follow-camera").addEventListener("change", function () {
+    playback.follow = this.checked;
+  });
+  document.getElementById("path-progress").addEventListener("input", function () {
+    seek(Number(this.value));
+  });
   if (!sampleMask) {
     var option = document.querySelector('#sample-mode option[value="selected"]');
     if (option) {
@@ -997,6 +1367,15 @@
                           pickAt: function (x, y) {
                             return pick({ clientX: x, clientY: y });
                           },
+                          play: play, pause: pause, seek: seek,
+                          playback: function () {
+                            return { index: playback.index, t: playback.t,
+                                     playing: playback.playing, active: playback.active,
+                                     revealed: revealedCount, revealedTotal: revealTotal,
+                                     points: VP.length,
+                                     position: playback.position
+                                       ? playback.position.slice() : null };
+                          },
                           sampleAt: function (index) {
                             return { picked: pickedSample, viewers: viewerColumns.slice(),
                                      info: document.getElementById("info-title").textContent };
@@ -1008,6 +1387,8 @@
 
   // Open on the first pose, so the field-of-view geometry is visible immediately
   // instead of the page starting with no cone at all.
+  syncPlaybackBuffers();
+  syncPlaybackUI();
   if (VP.length && document.getElementById("fov-mode").value !== "off") select(0);
   render();
 })();

@@ -236,6 +236,13 @@ def _viewpoint_payload(record, params: ScannerParams) -> dict:
 
     return {
         "id": int(_field(record, "id", 0) or 0),
+        # `order`, `stroke_id` and `role` are what turn a bag of poses into the program:
+        # the page draws the path between consecutive points and has to know which
+        # segment is a sweep and which one only moves the head.
+        "order": int(_field(record, "order", _field(record, "id", 0)) or 0),
+        "stroke_id": (None if _field(record, "stroke_id") is None
+                      else int(_field(record, "stroke_id"))),
+        "role": str(_field(record, "role", "coverage") or "coverage"),
         "position": _round(position),
         "axis": _round(axis, 9),
         "roll_deg": roll,
