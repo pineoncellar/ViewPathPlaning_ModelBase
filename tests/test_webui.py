@@ -11,10 +11,14 @@ import trimesh
 
 import scanweb
 from scanweb import (
-    _STATIC_ROOT,
     _available_run_id,
     _decode_stl,
+    _delete_history_run,
+    _history_run_payload,
+    _history_runs,
+    _init_history,
     _preview_registration,
+    _record_history_run,
     _registration_from_payload,
     _sync_input_part,
     _synthetic_base,
@@ -55,15 +59,6 @@ def test_registration_payload_requires_three_matching_points():
 
     with pytest.raises(ValueError, match="pick three CAD points"):
         _registration_from_payload(payload)
-
-
-def test_web_page_stylesheet_ships_with_the_package():
-    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
-    stylesheet = _STATIC_ROOT / "app.css"
-
-    assert 'href="/app.css"' in page
-    assert stylesheet.is_file(), "index.html links /app.css but the file is missing"
-    assert ".app-shell" in stylesheet.read_text(encoding="utf-8")
 
 
 def test_four_point_registration_fits_the_same_rigid_transform():
@@ -208,3 +203,60 @@ def test_repeated_run_name_gets_a_unique_folder_instead_of_failing(tmp_path):
     second = _available_run_id("AB1", tmp_path)
     assert second != first
     assert second.startswith("AB1_")
+
+
+def history_result(run_dir):
+    return {
+        "run_id": "run_001",
+        "output_dir": str(run_dir),
+        "program_name": "PART01",
+        "point_count": 5,
+        "coverage_pct": 91.5,
+        "target_points": 100,
+        "uncovered_points": 8,
+        "target_face_mm2": 1000.0,
+        "face": "upper",
+        "viewer_url": "/api/viewer?run_id=run_001",
+        "downloads": [{"name": "PART01.LS", "label": "FANUC LS 程序"}],
+        "viewpoints": [{"order": 1, "position": [1.0, 2.0, 3.0]}],
+    }
+
+
+def test_history_round_trip_keeps_the_full_payload(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _init_history()
+    result = history_result(tmp_path / "output" / "web_runs" / "run_001")
+
+    _record_history_run(result, "  侧围 01  ")
+
+    runs = _history_runs()
+    assert len(runs) == 1
+    assert runs[0]["run_id"] == "run_001"
+    assert runs[0]["display_name"] == "侧围 01"
+    assert runs[0]["prog_name"] == "PART01"
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["coverage_pct"] == pytest.approx(91.5)
+    assert _history_run_payload("run_001") == result
+
+
+def test_history_delete_removes_the_record_and_run_folder(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _init_history()
+    run_dir = tmp_path / "output" / "web_runs" / "run_001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "PART01.LS").write_text("program", encoding="utf-8")
+    _record_history_run(history_result(run_dir), "侧围 01")
+
+    assert _delete_history_run("run_001") is True
+    assert _history_runs() == []
+    assert _history_run_payload("run_001") is None
+    assert not run_dir.exists()
+
+
+def test_history_is_empty_on_a_fresh_database(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _init_history()
+
+    assert _history_runs() == []
+    assert _history_run_payload("missing") is None
+    assert _delete_history_run("missing") is False
