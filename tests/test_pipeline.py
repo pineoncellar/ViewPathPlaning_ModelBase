@@ -281,6 +281,39 @@ def test_the_3d_view_carries_the_planned_viewpoints(clamped_plate, quick_cfg, tm
     assert '"mask"' in page and '"points"' in page
 
 
+def test_the_3d_view_carries_the_program_order_of_the_delivered_points(clamped_plate,
+                                                                      quick_cfg):
+    from scanview.payload import build_payload
+    result = plan(clamped_plate.station, quick_cfg, face="upper")
+    records = build_payload(part=clamped_plate.station.part,
+                            viewpoints=result.viewpoints)["viewpoints"]
+    assert [record["order"] for record in records] == list(range(len(records)))
+    assert all(record["role"] == "coverage" for record in records)
+
+
+def test_stroke_metadata_reaches_the_3d_view():
+    import trimesh
+
+    from scanview.payload import build_payload
+    part = trimesh.creation.box(extents=[120.0, 90.0, 4.0])
+    pose = {"axis": [0.0, 0.0, -1.0], "roll_deg": 0.0, "n_points": 0, "area_mm2": 0.0}
+    viewpoints = [
+        dict(pose, id=0, order=0, stroke_id=4, role="coverage", position=[0.0, 0.0, 300.0]),
+        dict(pose, id=1, order=1, stroke_id=4, role="coverage",
+             position=[180.0, 0.0, 300.0]),
+        dict(pose, id=2, order=2, stroke_id=None, role="retract",
+             position=[180.0, 0.0, 420.0]),
+    ]
+
+    records = build_payload(part=part, viewpoints=viewpoints)["viewpoints"]
+
+    assert [record["order"] for record in records] == [0, 1, 2]
+    assert [record["stroke_id"] for record in records] == [4, 4, None]
+    assert [record["role"] for record in records] == ["coverage", "coverage", "retract"]
+    # the playback interpolates its field of view from the corners, so they must survive
+    assert all(len(record["corners"]) == 4 for record in records)
+
+
 def test_the_3d_view_can_be_switched_off(clamped_plate, quick_cfg, tmp_path):
     paths = write_outputs(plan(clamped_plate.station, quick_cfg, face="upper"), tmp_path,
                           write_3d=False)
