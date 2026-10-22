@@ -103,8 +103,10 @@
     "50 mm plus a fine re-check of both ends; including the ends makes the re-check unnecessary",
     "and 100 mm still overlaps by 80% - measured, the whole plan was 5.5x the v1 runtime at",
     "50 mm and is inside the 3x budget at 100.",
-    "enabled=false keeps the pool and the result exactly as v1: that is the regression",
-    "baseline, and max_stroke_mm=0 is the second way of saying the same thing.",
+    "enabled=true is the shipped default: the delivered program is a set of sweeps, so the",
+    "coverage figure describes what actually gets scanned rather than a set of stops.",
+    "Set it to false to get the v1 pool and result back unchanged (the regression baseline);",
+    "max_stroke_mm=0 is the second way of saying the same thing.",
     "overlap_ratio from the design is deliberately absent: it belongs to the G2 grid sweep,",
     "which is not implemented, and a knob nobody reads is worse than no knob.",
     "",
@@ -127,7 +129,7 @@
     "the round limit and not by the target. Pruning is pure counting, no rays."
   ],
   "stroke": {
-    "enabled": false,
+    "enabled": true,
     "max_stroke_mm": 800.0,
     "min_stroke_mm": 150.0,
     "extend_step_mm": 25.0,

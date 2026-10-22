@@ -1,8 +1,9 @@
 {
   "_comment": [
-    "Turn the continuous-path stage on (design 2026-10-19-continuous-scan-stroke-planning-design.md).",
-    "The shipped configuration leaves it off, so the default result stays identical to v1 and the",
-    "regression baseline keeps its meaning. Use it as an override:",
+    "Pin the continuous-path stage on (design 2026-10-19-continuous-scan-stroke-planning-design.md).",
+    "This is already the shipped default; the file is kept so a script that means 'sweeps, whatever",
+    "the default becomes' keeps meaning that. To get the v1 baseline back, either use",
+    "configs/lean.json or set stroke.enabled=false:",
     "",
     "  scanplan plan --station input/station.json --config configs/stroke_on.json --face auto",
     "",

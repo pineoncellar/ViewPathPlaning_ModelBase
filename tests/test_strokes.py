@@ -419,17 +419,15 @@ def test_exporting_a_stroke_plan_refuses_to_re_sort(tmp_path):
     assert contract["program"]["strokes"] == [0, 1]
 
 
-def test_the_shipped_configuration_delivers_single_poses_and_says_so(clamped_plate):
+def test_the_shipped_configuration_delivers_strokes_and_says_so(clamped_plate):
     shipped = load_config()
-    assert shipped.stroke.enabled is False, (
-        "the shipped default must reproduce v1: that is the regression baseline")
+    assert shipped.stroke.enabled is True, (
+        "the shipped default must deliver sweeps: a pose-only program reports a coverage "
+        "figure for stops the head never sweeps")
     quick = replace(shipped, scanner=replace(shipped.scanner, refine_rounds=0))
     result = plan(clamped_plate.station, quick, face="upper")
-    assert result.path is None
-    assert result.report["stroke_plan"]["enabled"] is False
-    assert result.report["viewpoints_transition"] == 0
-    assert result.report["viewpoints_greedy"] + result.report["viewpoints_repair"] \
-        == len(result.viewpoints)
+    assert result.report["stroke_plan"]["enabled"] is True
+    assert result.path is not None
 
 
 def test_a_stroke_run_writes_the_program_order_and_a_matching_3d_mask(

@@ -148,6 +148,16 @@
             </div>
             <p class="inline-hint">整车轴：X 前−后+，Y 左−、右+，Z 下−上+。自动推荐会统计模型主平整面的面积；推荐结果可随时手动修改。</p>
 
+            <div class="form-row">
+              <div><label class="field-label" for="scanMode">交付模式</label>
+                <select class="text-input" id="scanMode">
+                  <option value="stroke" selected>扫掠模式 · 连续扫描带</option>
+                  <option value="pose">纯位姿模式（旧版）</option>
+                </select>
+              </div>
+            </div>
+            <p class="inline-hint">扫掠模式把相邻视点连成连续扫描带，覆盖率描述的是真正扫过的区域，LS 里用 L 直线 + CNT0 连续走；纯位姿模式是旧版行为，只给孤立位姿，点与点之间的运动不做任何保证。</p>
+
             <div class="section-label config-title"><span>现场定位点</span><small>先在 3D 模型上点选，再输入实测坐标</small></div>
             <div class="axis-row">
               <span class="field-label" style="margin:0">定位点数量</span>
@@ -215,7 +225,7 @@
               <div><label class="field-label" for="errorLimit">配准最大误差限值（mm）</label><input class="text-input" id="errorLimit" type="number" value="50" min="0.001" step="0.1"></div>
             </div>
             <div class="privacy-note"><span>◆</span><span>程序名会成为 <b>.LS</b> 与配套 CSV / JSON 的文件名，必须以字母开头，仅含 A–Z、0–9 和下划线，最多 16 字符。</span></div>
-            <div class="warning-note"><b>!</b><span>生成的是笛卡尔位姿路径，不包含机器人逆解、关节限位和机械臂碰撞验证。导入 ROBOGUIDE 后必须复核 UFRAME、UTOOL、可达性与碰撞。</span></div>
+            <div class="warning-note"><b>!</b><span>生成的是笛卡尔路径：扫掠模式是连续直线段（L + CNT0），纯位姿模式是孤立位姿（J + FINE）。两者都不包含机器人逆解、关节限位和机械臂碰撞验证。导入 ROBOGUIDE 后必须复核 UFRAME、UTOOL、可达性与碰撞。</span></div>
             <button class="primary-button" id="solveButton" type="button" disabled><span>开始规划扫描路径</span><span class="button-arrow">→</span></button>
             <p class="form-feedback" id="formFeedback" role="status"></p>
           </div>
@@ -1090,6 +1100,7 @@
         scan_face_axis: SIDE_VECTORS[currentAxis()],
         max_registration_error_mm: Number($("errorLimit").value),
         prog_name: program,
+        delivery_mode: $("scanMode").value,
         run_id: $("runName").value.trim() || undefined
       };
       if (includeMeshes) {
@@ -1245,6 +1256,9 @@
       const details = [
         ["运行编号", result.run_id],
         ["LS 程序名", result.program_name],
+        ["交付模式", result.delivery_mode === "stroke"
+          ? "扫掠模式 · 连续扫描带"
+          : "纯位姿模式（旧版）"],
         ["扫描面外法向（整车）", "[" + result.scan_face_axis_vehicle.map((value) => Number(value).toFixed(3)).join(", ") + "]"],
         ["目标面面积", (Number(result.target_face_mm2) / 1e6).toFixed(4) + " m²"],
         ["配准 RMS / 最大误差", result.registration_rms_error_mm.toFixed(3) + " / " + result.registration_max_error_mm.toFixed(3) + " mm"],

@@ -196,12 +196,11 @@ def test_a_priced_selection_uses_its_corners_not_its_item_count():
     assert unpriced.cost_corners == 10
 
 
-def test_a_refinement_round_that_gains_nothing_leaves_the_viewpoint_set_alone(
-        clamped_plate, cfg):
-    # on this station the leak sits under the clamp, so refinement cannot raise the pool's
-    # ceiling. Re-selecting over the enlarged pool then only re-rolls the same answer, and
-    # greedy on more candidates can need MORE poses for the same coverage - which the design
-    # ranks as a worse result (coverage first, then viewpoint count).
+def test_a_refinement_round_never_makes_the_delivered_set_worse(clamped_plate, cfg):
+    # Refinement re-selects over a larger candidate pool, and the ranking rule protects the
+    # result: coverage first, then the point count. On this station an extra round now
+    # reaches further than the pose-only pool did, because the stroke stage can use the new
+    # candidates - so the invariant worth pinning is the ordering rule, not "nothing changes".
     coarse = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=0),
                      target=replace(cfg.target, coverage_target_pct=None))
     refined = replace(cfg, scanner=replace(cfg.scanner, refine_rounds=1),
@@ -210,10 +209,9 @@ def test_a_refinement_round_that_gains_nothing_leaves_the_viewpoint_set_alone(
     with_round = plan(clamped_plate.station, refined, face="upper")
     assert with_round.report["counters"]["refine_rounds"] == 1
     assert with_round.report["counters"]["refine_candidates"] > 0
-    assert len(with_round.viewpoints) == len(without.viewpoints)
-    assert [tuple(viewpoint.position) for viewpoint in with_round.viewpoints] \
-        == [tuple(viewpoint.position) for viewpoint in without.viewpoints]
-    assert with_round.selection.coverage_pct == without.selection.coverage_pct
+    assert with_round.selection.coverage_pct >= without.selection.coverage_pct - 1e-9
+    if with_round.selection.coverage_pct <= without.selection.coverage_pct + 1e-9:
+        assert len(with_round.viewpoints) <= len(without.viewpoints)
 
 
 def test_refinement_does_not_lower_the_coverage(clamped_plate, cfg):
@@ -283,12 +281,18 @@ def test_the_3d_view_carries_the_planned_viewpoints(clamped_plate, quick_cfg, tm
 
 def test_the_3d_view_carries_the_program_order_of_the_delivered_points(clamped_plate,
                                                                       quick_cfg):
+    from scanplan.path import (ROLE_COVERAGE, ROLE_REORIENT, ROLE_RETRACT,
+                               ROLE_TRAVERSE)
     from scanview.payload import build_payload
     result = plan(clamped_plate.station, quick_cfg, face="upper")
     records = build_payload(part=clamped_plate.station.part,
                             viewpoints=result.viewpoints)["viewpoints"]
     assert [record["order"] for record in records] == list(range(len(records)))
-    assert all(record["role"] == "coverage" for record in records)
+    # A stroke plan delivers transition corners too; the page has to know which points
+    # merely move the head so it can tell a sweep from a repositioning.
+    assert {record["role"] for record in records} <= {
+        ROLE_COVERAGE, ROLE_RETRACT, ROLE_TRAVERSE, ROLE_REORIENT}
+    assert any(record["role"] == ROLE_COVERAGE for record in records)
 
 
 def test_stroke_metadata_reaches_the_3d_view():

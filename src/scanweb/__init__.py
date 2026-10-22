@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 import numpy as np
 import trimesh
 
-from scanplan.config import load_config
+from scanplan.config import load_config, override
 from scanplan.pipeline import plan, write_outputs
 from scanplan.registration import RigidRegistration, fit_points
 from scanplan.roboguide.adapt import export as export_ls
@@ -283,6 +283,45 @@ def _download_entries(prog_name: str) -> list[dict[str, str]]:
     ]
 
 
+def _delivery_config(data: dict):
+    """The configuration for one job: the shipped file plus the page's delivery mode.
+
+    The two modes differ in the PLANNING unit, not only in the export: "pose" is the v1
+    deliverable of isolated stops, so it switches the stroke stage off. Re-sorting the
+    export order would not make a stroke plan pose-only.
+    """
+    config = load_config(data.get("config_path"))
+    mode = str(data.get("delivery_mode") or "stroke").strip().lower()
+    if mode not in ("stroke", "pose"):
+        raise ValueError("delivery mode must be 'stroke' or 'pose'")
+    if mode == "pose":
+        return override(config, stroke={"enabled": False})
+    return config
+
+
+def _export_options(config, viewpoints, data: dict) -> dict:
+    """Motion, termination and ordering for one deliverable.
+
+    A stroke plan's order IS the sweep: re-sorting it would split each stroke into two
+    unrelated moves. Its motion and termination come from the configuration for the same
+    reason - a sweep flown as J/FINE is not the sweep the coverage figure was computed for.
+    The pose-only deliverable keeps the permissive J move a reachability review is read with.
+    """
+    if any(point.stroke_id is not None for point in viewpoints):
+        return {
+            "motion": config.motion.type,
+            "speed": f"{config.motion.speed_mm_s:g} mm/sec",
+            "termination": config.motion.termination,
+            "order": False,
+        }
+    return {
+        "motion": str(data.get("motion", "J")),
+        "speed": str(data.get("speed", "100%")),
+        "termination": "FINE",
+        "order": True,
+    }
+
+
 def solve_job(data: dict) -> dict:
     """Register uploaded meshes, plan the selected side, and export FANUC files."""
     if not isinstance(data, dict):
@@ -375,7 +414,7 @@ def solve_job(data: dict) -> dict:
         output_uframe = frame_num
 
     try:
-        config = load_config(data.get("config_path"))
+        config = _delivery_config(data)
         description = StationDescription(
             part=part_path,
             fixture=support_path,
@@ -405,14 +444,15 @@ def solve_job(data: dict) -> dict:
             "scan_face_axis_measured_frame": axis_in_measured.tolist(),
         }
         write_outputs(result, output)
+        options = _export_options(config, result.viewpoints, data)
+        stroke_plan = not options["order"]
         contract = export_ls(
             result.viewpoints,
             output,
             prog_name=prog_name,
             uframe=output_uframe,
             utool=int(data.get("utool", 1)),
-            motion=str(data.get("motion", "J")),
-            speed=str(data.get("speed", "100%")),
+            **options,
         )
         contract["frame"]["axes"] = (
             f"Robot UFRAME {output_uframe} axes; CAD viewpoints were registered "
@@ -498,6 +538,7 @@ def solve_job(data: dict) -> dict:
         "output_dir": str(output),
         "program": str(output / f"{prog_name}.LS"),
         "program_name": prog_name,
+        "delivery_mode": "stroke" if stroke_plan else "pose",
         "point_count": len(result.viewpoints),
         "coverage_pct": float(result.report["coverage_pct"]),
         "target_points": int(result.report.get("target_points", 0)),

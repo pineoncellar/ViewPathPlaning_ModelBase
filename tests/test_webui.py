@@ -151,6 +151,45 @@ def test_uploaded_part_replaces_canonical_input_part(tmp_path):
     assert list(input_dir.iterdir()) == [part_path]
 
 
+def test_the_page_offers_both_delivery_modes_with_sweeps_as_the_default():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="scanMode"' in page
+    assert 'value="stroke" selected' in page
+    assert 'value="pose"' in page
+
+
+def test_delivery_mode_reaches_the_planner_not_only_the_exporter():
+    from scanweb import _delivery_config
+
+    assert _delivery_config({}).stroke.enabled is True, "sweeps are the shipped default"
+    assert _delivery_config({"delivery_mode": "stroke"}).stroke.enabled is True
+    assert _delivery_config({"delivery_mode": "pose"}).stroke.enabled is False
+    with pytest.raises(ValueError, match="delivery mode"):
+        _delivery_config({"delivery_mode": "fast"})
+
+
+def test_a_stroke_plan_is_exported_as_delivered_and_flown_as_configured():
+    from types import SimpleNamespace
+
+    from scanplan.config import load_config
+    from scanweb import _export_options
+
+    cfg = load_config()
+    stroke = [SimpleNamespace(stroke_id=3), SimpleNamespace(stroke_id=3)]
+    pose = [SimpleNamespace(stroke_id=None)]
+
+    options = _export_options(cfg, stroke, {})
+    assert options["order"] is False, "re-sorting would split each sweep in two"
+    assert options["motion"] == cfg.motion.type
+    assert options["termination"] == cfg.motion.termination
+    assert options["speed"].endswith("mm/sec")
+
+    legacy = _export_options(cfg, pose, {})
+    assert legacy["order"] is True
+    assert legacy["termination"] == "FINE"
+
+
 def test_repeated_run_name_gets_a_unique_folder_instead_of_failing(tmp_path):
     assert _available_run_id("AB1", tmp_path) == "AB1"
 
