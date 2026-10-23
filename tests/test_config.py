@@ -127,3 +127,118 @@ def test_a_runtime_override_is_validated_like_a_file():
     assert cfg.target.coverage_target_pct == 99.0          # the original is untouched
     with pytest.raises(ValueError, match="coverage_target_pct"):
         override(cfg, target={"coverage_target_pct": 0.0})
+
+
+# -- the surface-bias table (design 2026-10-22) ------------------------------------------
+
+
+def test_surface_profile_anchors_are_the_documented_ones():
+    from scanplan.config import surface_profile
+
+    zero = surface_profile(0.0)["stroke"]
+    half = surface_profile(0.5)["stroke"]
+    one = surface_profile(1.0)["stroke"]
+    assert zero == {"min_gain_mm2_per_step": 50.0, "min_stroke_mm": 60.0, "seed_dirs": 4.0,
+                    "order_axis_weight_mm_per_deg": 1.0, "parallel_weight": 1.0,
+                    "repair_budget_share": 0.35}
+    assert half == {"min_gain_mm2_per_step": 200.0, "min_stroke_mm": 150.0, "seed_dirs": 4.0,
+                    "order_axis_weight_mm_per_deg": 2.0, "parallel_weight": 1.0,
+                    "repair_budget_share": 0.20}
+    assert one == {"min_gain_mm2_per_step": 600.0, "min_stroke_mm": 300.0, "seed_dirs": 2.0,
+                   "order_axis_weight_mm_per_deg": 3.5, "parallel_weight": 1.3,
+                   "repair_budget_share": 0.05}
+
+
+def test_the_midpoint_profile_reproduces_the_shipped_values():
+    """0.5 is the contract: the four pre-existing knobs must not move."""
+    cfg = load_config()
+    assert (cfg.stroke.min_gain_mm2_per_step, cfg.stroke.min_stroke_mm,
+            cfg.stroke.seed_dirs, cfg.stroke.order_axis_weight_mm_per_deg) == \
+        (200.0, 150.0, 4, 2.0)
+    assert cfg.target.surface_bias == pytest.approx(0.5)
+    assert cfg.target.max_points is None
+
+
+def test_surface_profile_is_monotone_between_the_anchors():
+    from scanplan.config import surface_profile
+
+    values = [surface_profile(bias)["stroke"]["min_gain_mm2_per_step"]
+              for bias in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert values == sorted(values)
+
+
+def test_an_out_of_range_bias_is_refused_not_clamped(tmp_path):
+    for bad in (-0.1, 1.1):
+        path = tmp_path / "bias.json"
+        path.write_text(json.dumps({"target": {"surface_bias": bad}}), encoding="utf-8")
+        with pytest.raises(ValueError, match="surface_bias"):
+            load_config(path)
+
+
+def test_the_override_file_wins_over_the_profile(tmp_path):
+    """A key written by hand must beat the derived value, and say so in the report."""
+    path = tmp_path / "mixed.json"
+    path.write_text(json.dumps({"target": {"surface_bias": 1.0},
+                                "stroke": {"min_stroke_mm": 200.0}}), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.stroke.min_gain_mm2_per_step == pytest.approx(600.0)   # from the profile
+    assert cfg.stroke.min_stroke_mm == pytest.approx(200.0)           # written by hand
+    assert cfg.parameter_sources["stroke.min_stroke_mm"] == "override"
+    assert cfg.parameter_sources["stroke.min_gain_mm2_per_step"] == "profile(bias=1)"
+
+
+def test_the_legacy_profile_turns_the_new_gates_off():
+    """The regression profile must not inherit a behaviour change it cannot reproduce."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "configs"
+    legacy = load_config(root / "legacy_exhaust.json")
+    assert legacy.stroke.lock_roll is False
+    assert legacy.stroke.scan_gate is False
+    assert legacy.stroke.hard_gate is False
+
+
+@pytest.mark.parametrize("budget,match", [(1, "max_points"), (0, "max_points")])
+def test_a_budget_below_two_points_is_refused(tmp_path, budget, match):
+    path = tmp_path / "budget.json"
+    path.write_text(json.dumps({"target": {"max_points": budget}}), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        load_config(path)
+
+
+# -- the robot block ----------------------------------------------------------------------
+
+
+def test_the_robot_block_is_off_by_default_and_fully_typed():
+    cfg = load_config()
+    assert cfg.robot.enabled is False
+    assert cfg.robot.soft_limits_deg[4] == (-125.0, 125.0)
+    # nested tuples, not lists: the limit table is used as pairs by the kinematics
+    assert isinstance(cfg.robot.soft_limits_deg[0], tuple)
+    assert len(cfg.robot.mechanical_limits_deg) == 6
+
+
+def test_a_soft_limit_wider_than_the_arm_is_refused(tmp_path):
+    path = tmp_path / "robot.json"
+    path.write_text(json.dumps({"robot": {
+        "enabled": True,
+        "soft_limits_deg": [[-200, 200], [-60, 136], [-301, 301],
+                            [-720, 720], [-125, 125], [-360, 360]]}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="wider than the mechanical"):
+        load_config(path)
+
+
+def test_a_bad_joint_sign_is_refused(tmp_path):
+    path = tmp_path / "robot.json"
+    path.write_text(json.dumps({"robot": {"enabled": True, "j3_sign": 0}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="j3_sign"):
+        load_config(path)
+
+
+def test_j5_min_abs_must_leave_a_usable_band(tmp_path):
+    """`j5_min_abs_deg` at or past half the range leaves nothing to choose from."""
+    path = tmp_path / "robot.json"
+    path.write_text(json.dumps({"robot": {"enabled": True, "j5_min_abs_deg": 125.0}}),
+                    encoding="utf-8")
+    with pytest.raises(ValueError, match="j5_min_abs_deg"):
+        load_config(path)

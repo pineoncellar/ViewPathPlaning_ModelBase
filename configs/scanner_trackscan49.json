@@ -80,7 +80,28 @@
       "nothing about the motion between them. Same coverage either way."
     ],
     "coverage_target_pct": 99.0,
-    "delivery_mode": "path"
+    "delivery_mode": "path",
+
+    "_comment_surface_bias": [
+      "The one knob for a surface a constant-pose sweep cannot follow for long:",
+      "  0.0  coverage first  - keep growing into the low-yield tail (min_gain 50, min_stroke 60,",
+      "                         four direction families, cheap ordering, repair may spend 35%)",
+      "  0.5  shipped         - reproduces the pre-2026-10-22 numbers exactly",
+      "  1.0  regularity first - stop early (min_gain 600, min_stroke 300, two families, dearer",
+      "                         ordering, repair only 5%), accepting fewer percent on a strongly",
+      "                         curved face in exchange for fewer corners and more parallel bands",
+      "The derived values live in SURFACE_ANCHORS in config.py and are written back into the",
+      "report under `parameter_provenance.surface_profile`. Writing any of those keys in an",
+      "override file wins over the table, and the report says `override` when that happens.",
+      "Deliberately NOT derived from the bias: scanner.max_incidence_deg and scanner.range_mm.",
+      "Tuning those to buy coverage would make the report look better without the head being",
+      "able to scan any of it.",
+      "",
+      "max_points is the hard ceiling on delivered program points. null skips the whole budget",
+      "layer, so the selection path is exactly today's."
+    ],
+    "surface_bias": 0.5,
+    "max_points": null
   },
 
   "tracker": {
@@ -145,7 +166,14 @@
     "cost_model": "corners",
     "transition_corners_estimate": 1.0,
     "connector_level": 1,
-    "order_axis_weight_mm_per_deg": 2.0
+    "order_axis_weight_mm_per_deg": 2.0,
+    "lock_roll": true,
+    "scan_gate": true,
+    "hard_gate": true,
+    "parallel_weight": 1.0,
+    "repair_budget_share": 0.2,
+    "pool_mode": "full",
+    "side_scan_tilt_deg": 45.0
   },
 
   "_comment_motion": [
@@ -161,5 +189,65 @@
   },
 
   "occlusion_tol_mm": 2.0,
-  "seed": 7
+  "seed": 7,
+
+  "_comment_robot": [
+    "Arm, limits and tool for the J5 over-travel work (docs 2026-10-22-j5-overtravel-kinematics-gate-design).",
+    "DISABLED BY DEFAULT: enabled=false leaves every existing result untouched. Before turning it",
+    "on, three site facts still have to be read off the controller (the design's G1/G2/G3):",
+    "  G1 the real soft limits - the values below are INFERRED from captured data, where three",
+    "     joints sat exactly on J2=-60 / J5=-125 / J6=360, which no joystick produces;",
+    "  G2 the meaning of the CONFIG letters on this cell - only N/F varied in the six samples and",
+    "     the one at J5=-125 was still labelled T, so the letters are emitted as a hint only;",
+    "  G3 whether ROBOGUIDE is configured with the databook limits (+-250 on J5) instead of the",
+    "     controller's (+-125). If it is, every simulation verdict about reachability is void.",
+    "",
+    "Geometry is not from the datasheet: 312 / 1075 / 1730 / 225 were solved from six measured",
+    "poses (position residual <= 0.02 mm, attitude <= 0.002 deg) and then checked against four",
+    "drawing dimensions and two datasheet envelopes. This controller reports J3 as the ABSOLUTE",
+    "forearm pitch, not relative to J2 - hence j3_sign/j3_zero_deg rather than a DH chain.",
+    "wrist_identified=false forbids emitting absolute joint values; the gate may then only rank",
+    "branches against each other."
+  ],
+  "robot": {
+    "enabled": false,
+    "model": "FANUC R-2000iC/125L",
+
+    "base_offset_mm": 312.0,
+    "j2_height_mm": 0.0,
+    "upper_arm_mm": 1075.0,
+    "forearm_mm": 1730.0,
+    "forearm_offset_mm": 225.0,
+
+    "j1_sign": 1, "j1_zero_deg": 0.0,
+    "j2_sign": 1, "j2_zero_deg": 0.0,
+    "j3_sign": -1, "j3_zero_deg": 0.0,
+    "j4_sign": -1, "j4_zero_deg": 180.0,
+    "j5_sign": 1, "j5_zero_deg": 0.0,
+    "j6_sign": 1, "j6_zero_deg": 180.0,
+    "wrist_tilt_deg": [-90.0, -90.0],
+
+    "tool_xyz_mm": [337.342, 5.849, -557.613],
+    "tool_ypr_deg": [0.0, 49.9, 0.0],
+
+    "_comment_limits": [
+      "Two sets, on purpose. The planner uses the INTERSECTION and the report says which set",
+      "it used. soft = what the controller actually enforces (inferred, see G1);",
+      "mechanical = the datasheet envelope. Never widen soft to pass an acceptance check."
+    ],
+    "mechanical_limits_deg": [[-185, 185], [-136, 136], [-301, 301], [-720, 720], [-250, 250], [-720, 720]],
+    "soft_limits_deg":       [[-185, 185], [ -60, 136], [-301, 301], [-720, 720], [-125, 125], [-360, 360]],
+
+    "_comment_step": [
+      "max_step_deg is REPORTED, not enforced: the worst joint step between two delivered",
+      "points, and the count over this value, go into the kinematics block and the plan is",
+      "still delivered. No controller data supports a specific threshold here, and enforcing",
+      "an invented one would drop sweeps rather than make them reachable. Treat the count as",
+      "a review trigger: import the program and look at those moves."
+    ],
+    "joint_margin_deg": 5.0,
+    "j5_min_abs_deg": 8.0,
+    "max_step_deg": 40.0,
+    "wrist_identified": true
+  }
 }
