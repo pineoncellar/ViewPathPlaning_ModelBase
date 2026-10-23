@@ -83,9 +83,14 @@ def viewpoints_to_points(viewpoints) -> list[dict]:
                 "wpr_deg": wpr.rot_to_fanuc_wpr(rotation),
                 "stroke_id": _field(item, "stroke_id", None),
                 "role": _field(item, "role", "coverage"),
+                # Per-point joint evidence, when the kinematic gate ran. `config` is written
+                # into the P[n] block; `joints_deg` is what a joint-representation point
+                # needs, and is None otherwise.
+                "config": _field(item, "config", None),
+                "joints_deg": _field(item, "joints_deg", None),
             }
         )
-    return points
+    return wpr.unwrap_wpr(points)
 
 
 def apply_placement(
@@ -323,6 +328,7 @@ def export(
     speed="100%",
     termination="FINE",
     config="N U T, 0, 0, 0",
+    joint_blocks: bool = False,
     order=True,
 ) -> dict:
     """Write `<NAME>.LS`, `<NAME>_points.csv`, `<NAME>_frame.json` and return the contract.
@@ -351,6 +357,7 @@ def export(
     if place:
         rotation_place, translation_place = parse_pose(place)
         points = apply_placement(points, rotation_place, translation_place)
+    points = wpr.unwrap_wpr(points)
     if uframe is None:
         uframe = 0 if place else 1
 
@@ -388,6 +395,7 @@ def export(
         termination=termination,
         config=config,
         comment=_COMMENT,
+        joint_blocks=joint_blocks,
     )
     ls_path = out_dir / f"{name}.LS"
     csv_path = out_dir / f"{name}_points.csv"

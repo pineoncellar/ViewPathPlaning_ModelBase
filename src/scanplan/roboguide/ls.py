@@ -25,9 +25,40 @@ Two details change whether a point looks reachable:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from scanplan.roboguide.wpr import fanuc_num
+
+# What the controller accepts in the speed field of a motion instruction: a percentage, or a
+# rate with a unit. Anything else is a typo that would otherwise be written into the program
+# and rejected on the machine, so it is refused here where the message can say why.
+_SPEED = re.compile(
+    r"^\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>%|mm/sec|mm/s|deg/sec|deg/s|sec)?\s*$",
+    re.IGNORECASE)
+
+
+def check_speed(speed: str, motion: str = "J") -> str:
+    """Validate a FANUC speed field and return it normalised.
+
+    A percentage is the only form that means the same thing for both motion types; a rate
+    without a unit is ambiguous, so it is refused rather than guessed at.
+    """
+    text = str(speed).strip()
+    found = _SPEED.match(text)
+    if found is None:
+        raise ValueError(f"speed {speed!r} is not a FANUC speed: use e.g. '100%' or "
+                         "'250mm/sec'")
+    value = float(found.group("value"))
+    unit = (found.group("unit") or "").lower()
+    if value <= 0.0:
+        raise ValueError(f"speed {speed!r} must be positive")
+    if unit == "%" and value > 100.0:
+        raise ValueError(f"speed {speed!r} is over 100 percent")
+    if motion.upper() == "J" and unit in ("mm/sec", "mm/s"):
+        raise ValueError(f"a joint move cannot be given a linear speed ({speed!r}): "
+                         "use a percentage, or switch motion.type to L")
+    return text
 
 
 def _pos_block(index: int, kind: str, uframe: int, utool: int, config: str, payload) -> str:
@@ -67,6 +98,7 @@ def build_ls(
     comment: str = "scan viewpoints",
     constant: str = "",
     home_joints=None,
+    joint_blocks: bool = False,
     stamp: datetime | str | None = None,
 ) -> str:
     """Render the whole `.LS` program.
@@ -79,18 +111,28 @@ def build_ls(
     at `CNT0` it rounds the corner by (almost) nothing and keeps going. A stroke plan is
     only valid at `CNT0`-like termination, because the linear segment between two points
     - the thing the coverage was computed from - is what gets flown.
+
+    Per-point overrides. Each point may carry its own `config`, `motion`, `termination` and
+    `joints_deg`; the arguments here are the defaults. That is not a convenience: one
+    Cartesian pose has up to eight joint solutions and only some are inside the limits, so a
+    single CONFIG string for the whole program is exactly how every point ended up pinned to
+    the same branch. `joint_blocks=True` writes `P[n]` as joint angles for points that have
+    them, which removes the controller's choice altogether - the most direct fix, and the
+    one that needs the model to be right.
     """
     if isinstance(stamp, str):
         stamp_text = stamp
     else:
         stamp_text = (stamp or datetime.now()).strftime("%y-%m-%d  TIME %H:%M:%S")
+    speed = check_speed(speed, motion)
 
-    def command(index: int, is_joint: bool = False) -> str:
+    def command(index: int, point_motion: str, point_termination: str,
+                point_speed: str, is_joint: bool = False) -> str:
         # a joint representation point can only be reached with a joint move, and
         # FANUC takes a percentage speed for those
-        if motion.upper() == "L" and not is_joint:
-            return f"L P[{index}] {speed} {termination.upper()}"
-        return f"J P[{index}] {speed} FINE"
+        if point_motion.upper() == "L" and not is_joint:
+            return f"L P[{index}] {point_speed} {point_termination.upper()}"
+        return f"J P[{index}] {point_speed} FINE"
 
     mn_lines: list[str] = []
     pos_blocks: list[str] = []
@@ -103,18 +145,30 @@ def build_ls(
         pos_blocks.append(_pos_block(home_index, "joint", uframe, utool, config, home_joints))
 
     point_indices = []
+    point_specs: list[tuple[str, str, str, bool]] = []
     for pt in points:
         point_indices.append(next_index)
-        pos_blocks.append(
-            _pos_block(
-                next_index,
-                "cart",
-                uframe,
-                utool,
-                config,
-                (*pt["xyz_mm"].tolist(), *pt["wpr_deg"]),
+        point_config = pt.get("config") or config
+        point_motion = str(pt.get("motion") or motion)
+        point_termination = str(pt.get("termination") or termination)
+        point_speed = check_speed(str(pt.get("speed") or speed), point_motion)
+        joints = pt.get("joints_deg")
+        as_joint = bool(joint_blocks and joints is not None)
+        if as_joint:
+            pos_blocks.append(
+                _pos_block(next_index, "joint", uframe, utool, point_config, joints))
+        else:
+            pos_blocks.append(
+                _pos_block(
+                    next_index,
+                    "cart",
+                    uframe,
+                    utool,
+                    point_config,
+                    (*pt["xyz_mm"].tolist(), *pt["wpr_deg"]),
+                )
             )
-        )
+        point_specs.append((point_motion, point_termination, point_speed, as_joint))
         next_index += 1
 
     mn_lines.append(f"{len(mn_lines) + 1:>4}:  UFRAME_NUM={uframe} ;")
@@ -122,15 +176,22 @@ def build_ls(
     if constant:
         mn_lines.append(f"{len(mn_lines) + 1:>4}:  {constant} ;")
 
+    spec_for = dict(zip(point_indices, point_specs, strict=True))
     moves: list[tuple[int, bool]] = []
     if home_index:
         moves.append((home_index, True))
-    moves.extend((index, False) for index in point_indices)
+    # A joint-representation point can only be reached with a joint move; asking for `L`
+    # there is rejected by the controller, so the instruction follows the representation.
+    moves.extend((index, spec_for[index][3]) for index in point_indices)
     if home_index:
         moves.append((home_index, True))
 
     for index, is_joint in moves:
-        mn_lines.append(f"{len(mn_lines) + 1:>4}:{command(index, is_joint)}    ;")
+        point_motion, point_termination, point_speed, _written = spec_for.get(
+            index, (motion, termination, speed, is_joint))
+        mn_lines.append(
+            f"{len(mn_lines) + 1:>4}:"
+            f"{command(index, point_motion, point_termination, point_speed, is_joint)}    ;")
     # real FANUC programs simply end after the last instruction; there is no END
     # statement in the instruction list
 
