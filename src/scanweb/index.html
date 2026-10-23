@@ -1470,8 +1470,24 @@
       render();
     }
 
+    // Defaults come from the configuration the server will actually run, so the screen and
+    // the plan cannot disagree about which deliverable is being asked for. The page keeps
+    // working if the endpoint is unavailable: its own default stays in place.
+    async function applyServerDefaults() {
+      try {
+        const response = await fetch("/api/config");
+        if (!response.ok) return;
+        const config = await response.json();
+        const mode = document.getElementById("scanMode");
+        if (mode && config.delivery_mode) mode.value = config.delivery_mode;
+      } catch (_error) {
+        /* keep the built-in default */
+      }
+    }
+
     window.__scanplan = { state, glState, camera, projectPoint, pickScene };
     init();
+    applyServerDefaults();
   </script>
 </body>
 </html>
