@@ -19,7 +19,7 @@ from ..scene import Station
 from ..selection import Selection, select
 from ..strokes import StrokeBuilder, StrokeCoverage, combine, merge_stroke_coverage
 from ..target_surface import TargetSet
-from .delivery import _group_selection
+from .delivery import _group_selection, _joint_tie, _parallel_weights
 from .ranking import _better
 
 
@@ -37,7 +37,7 @@ class RefineState:
 
 def refine_rounds(state: RefineState, builder: StrokeBuilder | None, target: TargetSet,
                   station: Station, model: ScannerModel, cfg: PlannerConfig, gate,
-                  *, log=None) -> None:
+                  *, kin=None, log=None) -> None:
     """Run up to `cfg.scanner.refine_rounds` rounds against `state`, in place."""
     say = log or (lambda _message: None)
     for round_index in range(cfg.scanner.refine_rounds):
@@ -69,7 +69,8 @@ def refine_rounds(state: RefineState, builder: StrokeBuilder | None, target: Tar
         state.counters["refine_candidates"] += len(extra)
         state.coverage = merge(
             state.coverage,
-            evaluate(extra, target.samples, station, model, cfg, visible=gate, log=log))
+            evaluate(extra, target.samples, station, model, cfg, visible=gate,
+                     gate=kin, log=log))
         if builder is not None:
             # Re-grow on the enlarged pool: the design's refinement is not "add poses",
             # it is "the candidate generator was not good enough here".
@@ -79,12 +80,19 @@ def refine_rounds(state: RefineState, builder: StrokeBuilder | None, target: Tar
                                  aim_grid_mm=cfg.scanner.refine_aim_grid_mm,
                                  seed_offset=len(state.coverage.poses), log=log), log=log))
             state.combined = combine(state.coverage, state.stroke_cov)
-            offered = _group_selection(state.combined, state.coverage, state.stroke_cov,
-                                       cfg, log=log)
+            # The refinement re-selects, so it has to price the same preference the first
+            # selection did: the joint-room tie-break and the skeleton weight are part of
+            # the objective, not of the first pass.
+            offered = _group_selection(
+                state.combined, state.coverage, state.stroke_cov, cfg,
+                tie=_joint_tie(state.coverage, state.stroke_cov, kin),
+                weight=_parallel_weights(state.coverage, state.stroke_cov, cfg), log=log)
         else:
             state.combined = state.coverage
             offered = select(state.coverage, state.coverage.area_mm2,
-                             coverage_target_pct=cfg.target.coverage_target_pct, log=log)
+                             coverage_target_pct=cfg.target.coverage_target_pct,
+                             tie=_joint_tie(state.coverage, state.stroke_cov, kin)
+                             if state.stroke_cov is not None else None, log=log)
         state.selection = _better(
             _shift_rows(state.selection, state.selection_poses, len(state.coverage.poses)),
             offered, cfg.target.coverage_target_pct)
