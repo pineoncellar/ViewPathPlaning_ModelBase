@@ -31,9 +31,12 @@
 
 ## 它明确不做
 
-逆解、关节限位、机器人碰撞、运动时间优化。导出的 `.LS` **只含笛卡尔位姿**，由控制器 /
-ROBOGUIDE 求解。这也是本方案不需要机器人模型的原因，以及为什么交付物是视点集而不是
-机器人程序。
+机器人碰撞与运动时间优化。导出的 `.LS` 默认**只含笛卡尔位姿**，由控制器 / ROBOGUIDE 求解，
+所以交付物是视点集而不是机器人程序。
+
+逆解与关节限位有一个例外：`robot.enabled`（默认关闭）打开后，规划期会用一套由**实测位姿
+标定**的臂/腕模型先筛一遍，交付点逐点带 `CONFIG` 与 J5 余量。它只用来避免把明显不可行的
+位姿交出去，不替代 ROBOGUIDE 的可达性与碰撞判定。
 
 ## 目标面：拓扑定义
 
@@ -84,7 +87,66 @@ uv run pytest
 `embree` 是可选项，但强烈建议装：它把光线求交加速约三个数量级，直接决定真实零件
 "能不能在可接受时间内算完"。
 
-只有一个入口：
+### 用网页界面走完一次：配准 → 规划 → 出 LS
+
+```powershell
+uv run scanplan web                 # 默认 http://127.0.0.1:8765
+uv run scanplan web --port 9000     # 换端口；--host 只接受本机地址
+```
+
+浏览器打开提示的地址就是完整流程：导入数模 → 三点配准 → 跑规划 → 下载 `.LS`。服务只监听
+本机，全部计算在这个进程里做，STL 与产物不发送到任何外部服务；每次运行落在
+`output/web_runs/<运行名>/`。
+
+#### 1. 模型、扫描面与定位（第 01 步）
+
+- **本次运行名称**：留空则按时间自动命名。
+- **工位模型**：零件 STL 与夹具 STL 必填，底座可选（留空时服务自动生成一块位于零件下方的
+  参考平板作遮挡基准）。导入的 STL **当前坐标直接当整车坐标**，所以三份数模要先在 CAD 里按
+  装配关系摆好，单位毫米。
+- **整车主扫描面**：`±X` / `±Y` / `±Z` 六选一；也可以按「根据模型自动推荐扫描面」（统计模型
+  主平整面面积）或「在模型上点选扫描面」。整车轴固定为 X 前−后+、Y 左−右+、Z 下−上+。
+- **现场测量坐标系**：`机器人 UFRAME 1` 或 `机器人基坐标 / UFRAME 0`。它同时决定第二步现场
+  坐标以哪个坐标系量、以及导出的 `.LS` 写哪个 `UFRAME`。
+- **交付模式**：`扫掠模式 · 连续扫描带`（默认，`L` + `CNT0` 一路扫过去）或
+  `纯位姿模式（旧版）`（`J` + `FINE`，只给孤立位姿，不承诺点间运动）。
+- **定位点数量**：3 点或 4 点。
+
+#### 2. 在 3D 模型上点定位点，再填现场坐标（第 02 步）
+
+1. 在模型上按顺序点击零件表面的同一个物理基准特征，序号要与模型下方表格里的现场坐标一一对应。
+2. 右键或「撤销最后一点」回退，「清空选点」重来；`适配视图` / `沿扫描面观察` 用来摆视角，
+   3D 面板工具栏里的 `夹具` / `底座` 勾选框控制遮挡模型的显示。
+3. 在表格中逐行填入该点的现场坐标（mm，在第一步选的现场测量坐标系里量）。
+4. 点数到齐后自动计算配准，显示 `RMS` 与最大残差；超过「配准最大误差限值」（默认 50 mm）
+   时拒绝出结果——这时应回去核对点位，而不是放宽限值。
+
+#### 3. 规划并导出（第 03 步）
+
+- **LS 程序名**：会变成 `.LS` 与配套 CSV/JSON 的文件名，必须以字母开头、只含 `A–Z` / `0–9` /
+  下划线、最多 16 字符（例如 `PART01`）。
+- 点「开始规划扫描路径」，页面依次做配准、目标面分割、视点与扫描带规划，全部在本机完成。
+- 结果区显示目标面覆盖率、扫描视点数、目标采样点、漏扫点数，并可「查看扫描路径」把程序
+  顺序叠到模型上，或「打开 viewer.html 3D 分析」逐视点、逐采样核对。
+- 下载列表里 **`<程序名>.LS` 就是交给 ROBOGUIDE 的程序**；同批还有 `<程序名>_points.csv`
+  （点位表）、`<程序名>_frame.json`（帧契约）、`planning_report.html`、`coverage_report.json`、
+  `registration_report.json`、`summary.txt` 与三个 CSV。
+
+规划用的是本次界面导入的零件 STL：生成前会同步覆盖项目 `input/part.stl`，并把同一份副本按
+配准变换写进该次运行目录，不会误用其他运行遗留的模型。
+
+#### 4. 拿到 `.LS` 之后，在 ROBOGUIDE 里必须做的三件事
+
+1. 核对 `UFRAME`：与第二步选的现场测量坐标系一致（`UFRAME 1` 或 `UFRAME 0`）。
+2. 核对 `UTOOL`：按**扫描头测量参考点**教，工具 `+Z` 沿光轴（见下面"帧契约"）。
+3. 判可达性与碰撞；报不可达时先换 `CONFIG` 构型再试。
+
+网页端只做几何规划，不替代机器人仿真与现场安全确认。
+
+### 命令行等价路径
+
+`scanplan` 有五个子命令：`plan` / `ls` / `view` / `pick-datums` / `web`。网页端做的是同一套
+事，不开界面时用这三条：
 
 ```bash
 uv run scanplan plan --station input/<工位>.json \
@@ -113,6 +175,8 @@ uv run scanplan view --viewpoints output/<零件>/viewpoints.json \
 `plan` 与 `.LS` 导出**刻意分开**：ROBOGUIDE 的坐标系契约（用哪个 `UFRAME`、原点落在
 哪里）需要与现场商定，可能只要求重新导出而不必重跑规划。所以 `ls` 只读视点文件，
 **不需要数模**。
+
+### 命令行配准：`pick-datums`
 
 现场可用零件上的三个定位基准点，把 CAD 路径配准到实测的机器人基坐标系。每个基准点必须提供一对
 坐标：CAD/视点文件坐标中的点，以及现场在机器人基坐标系中测得的点（mm）。
@@ -157,7 +221,7 @@ uv run scanplan pick-datums --station input/<工位>.json \
 `robot_base_mm`；也兼容 `measured_coordinate_frame: "robot base"` 配合 `cad_points_mm`、
 `measured_points_mm` 这种数组格式。写成 `UFRAME 1`–`UFRAME 9` 的配准文件会被拒绝并提示
 用基坐标重新量点——现场用 UFRAME 量点时请改用浏览器界面（`scanplan web`），那里可以直接
-选择机器人基坐标或 `UFRAME 1`–`UFRAME 9`。
+选择 `机器人 UFRAME 1` 或 `机器人基坐标 / UFRAME 0`。
 
 ```bash
 uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
@@ -171,35 +235,168 @@ uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
 三个定位点必须不共线、对应同一组 CAD 特征，且现场坐标必须是机器人基坐标，不能与其他
 坐标系混用。程序因此固定使用 `UFRAME 0`；导出后仍须在 ROBOGUIDE/现场核对点位。
 
-### 本机浏览器工位界面
+## 参数说明与修改指南
 
-```powershell
-uv run scanplan web
+[`configs/scanner_trackscan49.json`](configs/scanner_trackscan49.json) 是唯一的出厂配置。
+参数的出处分四档，文件里的注释与报告里的 `parameter_provenance` 按同一套分档写：
+**数据表直接给出**（基准距、景深、最大面幅、跟踪距离）、**由数据表推导**（量程、
+跟踪器半角 25°）、**仍未实测**（入射角上限、扫描头外形包络、视场锚点距离、标记点朝向）、
+**设计取值**（距离/倾角/滚转阶梯、扫描带步长）。读覆盖率数字之前先看**仍未实测**那一档：
+`max_incidence_deg` 的敏感度远高于其他任何一项，而 `fov_anchor_distance_mm` 一动就会
+让视点数变两成。
+
+### 怎么改：三层合并
+
+优先级从低到高：
+
+1. **出厂文件** [`configs/scanner_trackscan49.json`](configs/scanner_trackscan49.json)；
+2. **派生表** `config.py` 的 `SURFACE_ANCHORS`——只有 `target.surface_bias` 派生出的六个
+   `stroke` 键走这一层；
+3. **覆盖文件**：`--config <json>` 指定的那份。网页端不传覆盖件，它的默认值来自
+   `load_config()` 读到的出厂配置。
+
+写进覆盖文件的键永远赢，所以"把某个派生值钉死"的写法就是显式写上它。报告里的
+`parameter_provenance.surface_profile.sources` 逐键标明最终来源是 `base`、
+`profile(bias=x)` 还是 `override`；未知键直接报错，拼错不会静默失效。
+
+现成的覆盖件：
+
+| 文件 | 用途 |
+|---|---|
+| [`configs/lean.json`](configs/lean.json) | 位姿优先（`delivery_mode: lean`），不生成连接点 |
+| [`configs/stroke_on.json`](configs/stroke_on.json) | 把扫描带钉住（现在就是默认，留着防默认值再变） |
+| [`configs/legacy_exhaust.json`](configs/legacy_exhaust.json) | 回归金标：毫米计价、L2 连接、跑到耗尽，三道门全关 |
+| [`configs/robot_gate.json`](configs/robot_gate.json) | 只打开机器人关节门（`robot.enabled: true`） |
+
+### 曲面取舍：一个旋钮管六项（合并方案 A）
+
+`target.surface_bias ∈ [0, 1]`，默认 `0.5`。它表达"覆盖率优先"还是"规整优先"：
+
+- `0.0` 覆盖优先——继续往低产出的尾巴里长（`min_gain 50`、`min_stroke 60`、两个切线方向
+  都试、排序便宜、修补可花 35% 预算）；
+- `0.5` 出厂值——与合并前的数字**逐项相等**；
+- `1.0` 规整优先——早停（`min_gain 600`、`min_stroke 300`、只沿一个切线方向、排序更贵、
+  修补只 5%），在强曲面上牺牲几个百分点，换更少的拐角与更多平行带。
+
+它派生的正是下面六项，三档取值抄自 `SURFACE_ANCHORS`：
+
+| 派生键 | 作用 | bias=0.0 | bias=0.5 | bias=1.0 |
+|---|---|---|---|---|
+| `stroke.min_gain_mm2_per_step` | 延伸一步至少多扫多少面积才值得 | 50 | 200 | 600 |
+| `stroke.min_stroke_mm` | 一条带短于这个长度就不收 | 60 | 150 | 300 |
+| `stroke.seed_dirs` | 每条带允许沿几个切线方向生长（≤2 只用第一个轴，>2 两个轴都试） | 4 | 4 | 2 |
+| `stroke.order_axis_weight_mm_per_deg` | 60° 换向折合多少毫米绕行 | 1.0 | 2.0 | 3.5 |
+| `stroke.parallel_weight` | "与已有骨架同向"的偏好权重：只做 tie-break，最多挪动 30% 分数，修补阶段不用 | 1.0 | 1.0 | 1.3 |
+| `stroke.repair_budget_share` | 收尾修补最多花掉 `max_points` 的多少比例（只在设了上限时生效） | 0.35 | 0.20 | 0.05 |
+
+中间值按段线性插值（`seed_dirs` 取整）。刻意**不**进派生表的两个数是
+`scanner.max_incidence_deg` 与 `scanner.range_mm`：让扫描头"看得更远"不是口味问题，用它们
+换覆盖率只会让报告好看、扫描头却扫不到。
+
+改法一：只给 bias，六项跟着走。
+
+```json
+{"target": {"surface_bias": 0.8}}
 ```
 
-浏览器访问 `http://127.0.0.1:8765`。界面可导入零件与夹具 STL（底座可选；未导入时服务会
-自动生成一块位于零件下方的参考平板），导入后在可旋转、缩放的 3D 模型上依次点选 3 个或
-4 个定位点，再填写与它们对应的现场坐标。每对点按相同序号配对，三点或四点到齐后自动计算
-并显示从整车 CAD 坐标到所选机器人坐标系的安装平移和旋转矩阵。配准最大误差限值默认为
-50 mm，超过该限值时拒绝输出。
+改法二：显式钉死某一项（钉了就不再跟着 bias 动，报告里记作 `override`）。
 
-扫描面按整车坐标 ±X/±Y/±Z 选择，也可根据模型主平整面面积自动推荐，或直接在模型上点选
-表面。**交付模式**有「扫掠模式 · 连续扫描带」（默认）和「纯位姿模式（旧版）」两种：前者把
-相邻视点连成扫描带，覆盖率描述的是真正扫过的区域，`.LS` 用 `L` 直线 + `CNT0` 连续走；后者
-与旧版一致，只交孤立位姿、不承诺点间运动，`.LS` 用 `J` + `FINE`。确认安装姿态与扫描面后，
-按所选方向分割目标面、运行路径规划并生成 FANUC `.LS`。
-LS 程序名可在界面中自行命名；规划完成后页面显示覆盖率、视点数、目标采样点和漏扫点，
-并可选择在零件 3D 模型上叠加显示扫描路径。结果与工位设置在同一页面，可直接下载
-`.LS`、帧契约、规划报告、
-覆盖报告等文件，也可一键跳转到 `viewer.html` 做逐视点、逐采样的可视化分析。所有 STL
-和输出都只在本机处理，不发送到外部服务。
+```json
+{"stroke": {"min_stroke_mm": 220}}
+```
 
-路径规划使用本次界面导入的零件 STL，生成前同步覆盖项目 `input/part.stl`，同时将相同的
-STL 副本保存为该次运行目录中的 `part.stl` 并应用配准变换；不会使用其他运行遗留的
-零件模型。模型视图中可按鼠标右键或按钮撤销最后一个 CAD 选点。
+### 点数硬上限与 λ 搜索
 
-整车轴向固定为 X 前负后正、Y 左负右正、Z 下负上正。浏览器工具生成的路径仍需在
-ROBOGUIDE 核实 UFRAME/UTOOL、可达性与碰撞；它不替代机器人仿真和现场安全确认。
+`target.max_points`（默认 `null`，整层跳过）是交付点数的硬上限。设了以后选择器在 λ 上搜
+一遍：λ 是"多覆盖一点面积愿意多付几个拐角"的汇率，按固定网格 `0 / 0.5 / 1 / 2 / 4 / 8 /
+16 / 32` **递增**，第一个超预算就停。判据是 `build_path` **之后**的真实转角数，不是估算。
+
+报告 `budget` 块的 `verdict`：`target_bound`（先到覆盖率目标）、`budget_bound`（先撞点数
+上限）、`exhausted`（池子没得可给了），`max_points` 为 `null` 时是 `unbudgeted`——没有第四
+种答案。`trials` 记录每档 λ 试出来的点数与覆盖率，`dropped_by_hard_gate` 是被关节门丢掉的
+条目数。
+
+```json
+{"target": {"max_points": 120}}
+```
+
+把上面那段存成文件（例如 `configs/budget120.json`）再 `--config`（`--config` 只吃路径，不吃
+内联 JSON）：
+
+```bash
+uv run scanplan plan --station input/<工位>.json \
+                     --config configs/budget120.json --out output/<零件>/
+```
+
+覆盖率目标本身是现场旋钮，可以逐次覆盖：`--coverage-target 97.5`，或 `--coverage-target none`
+跑到耗尽（对应配置里的 `target.coverage_target_pct`，默认 99.0）。
+
+### 候选池与扫描带侧的三道门
+
+`stroke.pool_mode`（`full` / `grid` / `rails`）决定候选池怎么铺：
+
+- `full`（默认）= 瞄准网格 + 导轨线 + 侧扫族；
+- `grid` = 只有瞄准网格，历史行为（`legacy_exhaust` 用这一档）；
+- `rails` = 只铺导轨线，候选池最小，适合先出一份草稿。
+
+`stroke.side_scan_tilt_deg`（默认 45）是侧扫族的倾角：正对扫描时曲面陡的地方会掉出量程，
+侧着扫能把它们捞回来。
+
+三道门都在 `stroke` 段，默认全开：
+
+| 键 | 关掉之后 |
+|---|---|
+| `lock_roll` | 种子生成时滚转自由，相邻点的姿态框架不再统一 |
+| `scan_gate` | 生长只看"能不能连上"，不看"连上之后还看得见东西吗" |
+| `hard_gate` | 连不进去的带不再被丢掉重选，只写一行 violation 继续交付 |
+
+`configs/legacy_exhaust.json` 把三项全关、`pool_mode` 设成 `grid`，这是它能继续当回归金标
+的前提。
+
+### 机器人关节门（合并方案 B）
+
+`robot` 段默认 `enabled: false`，关着与合并前逐项一致。打开后规划期就用实测的臂/腕模型
+筛位姿：候选点要在限位里留出余量、过渡点要有逆解，交付点逐点带 CONFIG 与 J5 余量。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `robot.enabled` | `false` | 总开关 |
+| `robot.joint_margin_deg` | `5.0` | 每个关节离限位至少留这么多度 |
+| `robot.j5_min_abs_deg` | `8.0` | 腕奇异保护：`\|J5\|` 不小于这个值 |
+| `robot.max_step_deg` | `40.0` | **只报不拦**：相邻交付点的最大关节步，超限计数进报告 |
+| `robot.soft_limits_deg` / `mechanical_limits_deg` | 见文件 | 两套限位取交集，报告写明用了哪套 |
+| `robot.wrist_identified` | `true` | 关掉后禁止输出绝对关节值，门只能做分支排序 |
+
+两条要记住的语义：
+
+- **硬门只对两件事丢条目**：间隙 ≤ 0，或过渡点解不出逆解。`stroke.max_rot_deg_per_mm` 是
+  未标定常数，**只报不拦**——拿它丢带会把覆盖率从 99% 打到 82%。
+- 丢掉的条目走**排除重选**，不是只过滤；只过滤不重选同样会把覆盖率打下去。
+
+`--joint-blocks` 让 `.LS` 的 `P[n]` 直接写关节角，**只对带 `joints_deg` 的点生效**（也就是打开
+`robot.enabled` 跑出来的视点文件），没有关节值的点仍写笛卡尔位姿。三个现场缺口（软限位准确
+值、CONFIG 字母在本工位的含义、ROBOGUIDE 是否配了数据表限位）没补齐之前，别把 `enabled`
+打开当验收用。
+
+```bash
+uv run scanplan plan --station input/<工位>.json \
+                     --config configs/robot_gate.json --out output/<零件>/
+uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
+                   --prog-name PART01 --joint-blocks --out output/<零件>/
+```
+
+### 改完看哪里
+
+- `coverage_report.json`：`parameter_provenance`（每个参数的出处）、`surface_profile`
+  （bias、派生出的有效值、逐键来源）、`kinematics`（限位来源、J5 直方图、分支直方图、
+  min margin、最大步长与超限点数）、`budget`（verdict、每档 λ 的试验记录）；
+- `summary.txt`：Joints 与 Budget 两行（没开关节门时不出现 Joints）；
+- 一条守着的不变量：`coverage_pct` **等于**路径里所有覆盖点的并集；`swept_coverage_pct`
+  另算过渡段顺手扫到的面积，只作参考、不参与验收；
+- 网页端显示的默认值来自 `GET /api/config`，也就是服务端**实际会用的**那份配置——页面说
+  扫掠，跑的就是扫掠。
+
+## 交付物与 3D 视图
 
 ### 交付物
 
@@ -207,11 +404,11 @@ ROBOGUIDE 核实 UFRAME/UTOOL、可达性与碰撞；它不替代机器人仿真
 
 | 文件 | 内容 |
 |---|---|
-| `viewpoints.json` | 视点集：位置 + 光轴 + 滚转 + 覆盖点数/面积 + 入射角 + `tracker_ok` + 来源，以及程序顺序 `order` / 所属带 `stroke_id` / 角色 `role` |
+| `viewpoints.json` | 视点集：位置 + 光轴 + 滚转 + 覆盖点数/面积 + 入射角 + `tracker_ok` + 来源，以及程序顺序 `order` / 所属带 `stroke_id` / 角色 `role`；关节门打开时另带 `config` / `branch` / `joints_deg` / `j5_margin_deg` |
 | `viewpoints.csv` | 同一份数据，便于 Excel 目视 |
 | `exempt_points.csv` | 被夹持区豁免的点云（供人工核对 CAD 夹持区与实物是否一致） |
-| `unreachable_points.csv` | 漏扫点云，**每点带原因**（`blocked_by_part` / `blocked_by_fixture` / `blocked_by_base` / `blocked_by_tracker` / `never_in_view` / `only_poses_that_collide`） |
-| `coverage_report.json` | 覆盖报告：覆盖率、视点数、入射角分布、漏扫聚类、参数出处（数据表 / 推导 / 未实测）、路径与中断统计、以及**它没有建模什么** |
+| `unreachable_points.csv` | 漏扫点云，**每点带原因**（`blocked_by_part` / `blocked_by_fixture` / `blocked_by_base` / `blocked_by_tracker` / `never_in_view` / `only_poses_that_collide` / `unreachable_joint_limit` / `no_line` / `not_facing`） |
+| `coverage_report.json` | 覆盖报告：覆盖率、视点数、入射角分布、漏扫聚类、参数出处（数据表 / 推导 / 未实测）、路径与中断统计、以及**它没有建模什么**；另含 `surface_profile` / `budget` / `kinematics` 三块（见"改完看哪里"） |
 | `summary.txt` | 上面那些数字的人读版本 |
 | `viewpoints_3d.html` | **单文件 3D 视图**：零件/夹具/底座 + 视点位置、光轴与视场锥 + 已覆盖/未覆盖采样 + 程序路径与回放 |
 | `target_samples.npz` | 采样点 + 逐点覆盖位掩码，供 3D 视图回答“哪些视点能扫到这个点”；`scanplan view` 重新渲染时读它 |
@@ -283,46 +480,6 @@ base64 缓冲区嵌在页面里，用页面自带的小型 WebGL 渲染器画出
 把零件、夹具、底座的 CAD 放进 `input/`，并保证它不进版本控制——那是客户几何。
 如果数模是**逐个文件导出**的 IGES，装配位姿会丢失，所以工位建模里包含一个显式、
 带自检的对齐步骤，而不是直接信任文件。
-
-## 配置
-
-[`configs/scanner_trackscan49.json`](configs/scanner_trackscan49.json) 存放扫描仪参数。
-参数的出处分四档，文件里的注释与报告里的 `parameter_provenance` 按同一套分档写：
-**数据表直接给出**（基准距、景深、最大面幅、跟踪距离）、**由数据表推导**（量程、
-跟踪器半角 25°）、**仍未实测**（入射角上限、扫描头外形包络、视场锚点距离、标记点朝向）、
-**设计取值**（距离/倾角/滚转阶梯、扫描带步长）。读覆盖率数字之前先看**仍未实测**那一档：
-`max_incidence_deg` 的敏感度远高于其他任何一项，而 `fov_anchor_distance_mm` 一动就会
-让视点数变两成。
-
-[`configs/stroke_on.json`](configs/stroke_on.json) 现在只是把扫描带（连续路径）**显式钉住**：
-它已经是默认值，这份覆盖件留着是为了让引用它的脚本在默认值再变时仍然表达同一个意思。
-
-### 2026-10-22 合并进来的两组参数
-
-**曲面取舍（一个旋钮）** `target.surface_bias ∈ [0,1]`。0.0 覆盖优先、0.5 与合并前的出厂值
-逐项相等、1.0 规整优先。它派生 `stroke` 段的六项（`min_gain_mm2_per_step`、
-`min_stroke_mm`、`seed_dirs`、`order_axis_weight_mm_per_deg`、`parallel_weight`、
-`repair_budget_share`），派生表在 `config.py` 的 `SURFACE_ANCHORS`，优先级是
-**出厂文件 < 派生表 < 覆盖文件**——覆盖件里写了的键永远赢，报告里的
-`surface_profile.sources` 逐个键标明它是 `base` / `profile(bias=x)` / `override`。
-
-**点数硬上限** `target.max_points`（默认 `null` 表示整层跳过）。设了以后选择器在 λ 上
-搜一遍：λ 是"多覆盖一点面积愿意多付几个拐角"的汇率，取值区间 0–32（拐角单位）。
-报告里的 `budget.verdict` 只有三种：`target_bound` / `budget_bound` / `exhausted`。
-
-**机器人段** `robot`（默认 `enabled: false`，关掉即回到合并前的行为）。打开后
-规划期就用实测的臂/腕模型筛位姿，交付点逐点带 CONFIG；`--joint-blocks` 让 `.LS`
-直接写关节值。三个现场缺口（软限位准确值、CONFIG 字母映射、ROBOGUIDE 是否配了
-数据表限位）没补齐之前，别把 `enabled` 打开当验收用。
-
-**扫描带生成侧的三道门**（都在 `stroke` 段）：`lock_roll` 在生成种子时把滚转定死；
-`scan_gate` 用"这个位置还能看到量程内的样本吗"判生长合法性；`hard_gate` 让连不进去的
-带**被丢掉并重选**，而不是写一行 violation 继续交付。`configs/legacy_exhaust.json`
-把这三项都关掉，这是它能继续当回归金标的前提。
-
-**候选池** `stroke.pool_mode`（`full` / `grid` / `rails`）与 `stroke.side_scan_tilt_deg`：
-`full` = 瞄准网格 + 导轨线 + 侧扫族；`grid` = 只有瞄准网格（历史行为，`legacy_exhaust` 用这一档）；
-`rails` 只铺导轨线，是"十分钟出草稿"那一档，仍是同一套算法的一个更小的池。
 
 ## 数据保密
 
@@ -447,11 +604,7 @@ uv run python scripts/check_repo_hygiene.py
 - 报告里的 `coverage_pct` 现在**等于**路径里所有覆盖点的并集（有一条测试守着这个不变量），
   `swept_coverage_pct` 另外算上过渡段顺手扫到的面积，只作参考、不参与验收。
 
-| 配置档 | 用途 |
-|---|---|
-| [`configs/stroke_on.json`](configs/stroke_on.json) | 扫描带（现在就是默认，这份用于显式钉住） |
-| [`configs/lean.json`](configs/lean.json) | 位姿优先、不生成连接点 |
-| [`configs/legacy_exhaust.json`](configs/legacy_exhaust.json) | 复现旧口径（毫米计价、L2 连接、跑到耗尽） |
+三份覆盖件（`stroke_on` / `lean` / `legacy_exhaust`）各自的用途见[参数说明与修改指南](#参数说明与修改指南)里的"现成的覆盖件"表。
 
 ### 工位自检在真实数模上报出来的问题
 
@@ -471,13 +624,42 @@ uv run python scripts/check_repo_hygiene.py
 [`scene.py`](src/scanplan/scene.py) 的注释里：整块零件完全埋在夹具体内，以及夹具网格法线
 整体反号。
 
+### 合并后的三档实测（2026-10-23）
+
+两份设计合并落地后，在同一份真实数模上（上表面、`face=auto`、3 mm 采样网格）跑了三档：
+
+| 档位 | 覆盖率 | 点数 | 条带 | 关键指标 |
+|---|---|---|---|---|
+| 出厂 `scanner_trackscan49.json` | 99.07% | 33 | 7 / 386 候选 | 池上限 99.63%，约 12 min |
+| 加 `configs/robot_gate.json` | 99.03% | 66 | — | 0 个点无解、每点离限位 ≥5.00°、J5 全在 40–120°、11 种 CONFIG、约 10 min |
+| `configs/legacy_exhaust.json`（回归） | 99.75% | 438 | 32 / 489 候选 | 与合并前的记录同量级 |
+
+四条读数：
+
+- **打开关节门几乎不花覆盖率**：99.07% → 99.03%，池上限两边都是 99.63%。
+- **但点数翻倍**（覆盖点 33 → 66，过渡点 13 → 33）：关节可行把可选位姿压窄了，覆盖同一张
+  面要用更多交付点。这是"用点数换真实可达性"，不是回归。
+- **66 个点全部有逆解**（`points_without_solution: 0`），关节离限位最近的还有 5.00°，J5 全部
+  落在 40–120° 这一带里。代价是 **14 段**相邻关节步超过 `max_step_deg = 40`（最大 171°）——
+  这条按设计**只报不拦**（阈值没有现场依据），导入 ROBOGUIDE 时重点看
+  `kinematics.steps_over_limit` 指出的那几段。
+- 这一次硬门**没有丢任何条目**（`dropped_by_hard_gate: 0`）：把"过渡点解得出逆解"折进抬刀
+  高度搜索之后，长扫描带的抬刀点也在可达空间里找到了位置。调参过程中曾出现丢 10 个条目的
+  中间状态，根因是抬刀方向沿 `-axis`（背离零件）——这条路径仍值得下一步改成朝零件中心退。
+
+运动学本身是用 6 组实测位姿标定的（位置残差 ≤0.02 mm、姿态 ≤0.002°），逆解在 300 组随机
+位姿上往返全通过；`legacy_exhaust` 仍是可用的回归金标（438 点 / 99.75%，与合并前记录的
+405 点 / 99.74% 同一量级）。
+
 ## 报告里必须一起读的三条声明
 
 覆盖面**只是几何可达性**。报告里会显式写明下面三件事，任何引用覆盖率数字的场合都应带上：
 
-1. **不含机器人可达性**：逆解、关节限位、机器人碰撞由现场在 ROBOGUIDE 里判，所以交付的
+1. **机器人可达性默认不在内**：逆解、关节限位、机器人碰撞由现场在 ROBOGUIDE 里判，所以交付的
    `.LS` **可能包含 ROBOGUIDE 判为不可达的点位**——这是预期，不是缺陷。ROBOGUIDE 报
-   不可达时**先换 `CONFIG` 构型再试**。
+   不可达时**先换 `CONFIG` 构型再试**。打开 `robot.enabled` 后规划期会先用实测标定的臂/腕
+   模型筛一遍并按分支排 `CONFIG`，但那仍然只是参考：它不替代 ROBOGUIDE，也不代表现场软限位
+   已经标定。
 2. **不含机械臂对跟踪器的遮挡**：本阶段没有机器人模型，`tracker_ok` 只对零件/夹具/底座
    判遮挡。现场架设时请同时避开机械臂的常态工作扇区。
 3. **哪些参数还是占位值**：报告逐条列出，`max_incidence_deg` 排在最前。
