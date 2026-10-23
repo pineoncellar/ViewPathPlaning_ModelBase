@@ -39,8 +39,10 @@ from .scene import Station
 from .target_surface import SampleSet
 
 REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by_base",
-           "blocked_by_tracker", "only_poses_that_collide", "candidate_found")
-_COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_no_points", "rays")
+           "blocked_by_tracker", "only_poses_that_collide", "unreachable_joint_limit",
+           "candidate_found")
+_COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_kinematics",
+                 "rejected_no_points", "rays")
 
 
 @dataclass
@@ -94,12 +96,19 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
              model: ScannerModel, cfg: PlannerConfig, *,
              visible: Callable[[np.ndarray], np.ndarray] | None = None,
              obstacles: dict | None = None,
+             gate=None,
              log: Callable[[str], None] | None = None) -> CoverageResult:
     """Evaluate every pose against the target samples, returning sparse coverage sets.
 
     `visible(positions) -> bool mask` is the optional tracker gate: candidates it
     rejects keep an empty coverage set, so the tracker constraint flows into the
     selection problem instead of being applied to the result afterwards.
+
+    `gate` is the optional kinematic gate (`kinematics.KinematicGate`). It sits in the same
+    rejection chain, and for the same reason: a pose the arm cannot hold is not a pose that
+    covers less, it is a pose that cannot be commanded, so it must not enter the selection
+    and then be discovered at export time. Rejecting it here is what makes the reported
+    coverage and the program agree.
     """
     say = log or (lambda _message: None)
     points = np.asarray(samples.points, dtype=float).reshape(-1, 3)
@@ -126,6 +135,10 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
         elif not tracker_ok[index]:
             counters["rejected_tracker"] += 1
             rejected = "tracker"
+        elif gate is not None and gate.active and not gate.check(
+                pose.position, pose.axis, pose.roll_deg).ok:
+            counters["rejected_kinematics"] += 1
+            rejected = "kinematics"
         if rejected is not None:
             sets.append(np.zeros(0, dtype=np.int64))
             quality.append(np.zeros(0))
@@ -174,7 +187,7 @@ def merge(first: CoverageResult, second: CoverageResult) -> CoverageResult:
 def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
                         station: Station, model: ScannerModel, cfg: PlannerConfig,
                         *, obstacles: dict | None = None,
-                        tracker_ok=None) -> np.ndarray:
+                        tracker_ok=None, gate=None) -> np.ndarray:
     """Say why each uncovered sample is uncovered, one reason per sample.
 
     `only_poses_that_collide` is kept separate from `blocked_by_*`: it means the part is
@@ -200,6 +213,9 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
     casters = station.obstacles() if obstacles is None else obstacles
     resolved = np.zeros(count, dtype=bool)
     only_colliding = np.zeros(count, dtype=bool)
+    only_limited = np.zeros(count, dtype=bool)
+    faced = np.zeros(count, dtype=bool)
+    reached = np.zeros(count, dtype=bool)
     pending = np.arange(count)
     base_positions = np.array([pose.position for pose in poses], dtype=float) if poses \
         else np.zeros((0, 3))
@@ -222,11 +238,21 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
         if len(candidates) == 0:
             break
         geometry = model.geometry_mask(pose, points[candidates], normals[candidates])
+        reached[candidates[geometry]] = True
+        offset_all = points[candidates] - np.asarray(pose.position, dtype=float)
+        distance_all = np.linalg.norm(offset_all, axis=1)
+        cosines = model.incidence_cos(offset_all / np.maximum(distance_all, 1e-9)[:, None],
+                                      normals[candidates])
+        faced[candidates[cosines >= model.cos_incidence_limit]] = True
         index_set = candidates[geometry]
         if len(index_set) == 0:
             continue
         if not model.body_fits(pose.position, clearances[index]):
             only_colliding[index_set] = True
+            continue
+        if gate is not None and gate.active and not gate.check(
+                pose.position, pose.axis, pose.roll_deg).ok:
+            only_limited[index_set] = True
             continue
 
         offset = points[index_set] - np.asarray(pose.position, dtype=float)
@@ -243,5 +269,14 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
                 reasons[target] = "candidate_found" if visible[index] else "blocked_by_tracker"
             resolved[target] = True
 
-    reasons[~resolved & only_colliding] = "only_poses_that_collide"
+    reasons[~resolved & only_limited] = "unreachable_joint_limit"
+    reasons[~resolved & only_colliding & ~only_limited] = "only_poses_that_collide"
+    if poses:
+        # Two more, and they point at different fixes: a sample no pose's footprint ever
+        # covers is a candidate-generation problem (add a rail / lower the standoff), while
+        # one that is inside the footprint but turned away from every candidate is a
+        # direction-family problem. Reporting both as "never in view" hides which.
+        unclaimed = ~resolved & (reasons == "never_in_view")
+        reasons[unclaimed & ~reached & ~faced] = "not_facing"
+        reasons[unclaimed & ~reached & faced] = "no_line"
     return reasons
