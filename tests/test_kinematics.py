@@ -88,11 +88,15 @@ def test_solutions_are_sorted_by_j5_room(robot):
 
 
 def test_config_string_reads_the_joint_values(robot):
-    """The letters come from the solution, not from a constant."""
+    """The letters come from the solution, not from a constant.
+
+    The T/F letter is `T` for NEGATIVE J5: on the 2026-10-23 bank all eight poses sat at
+    J5 between -9 and -124 and the pendant called every one of them `T`.
+    """
     positive = robot.config_string((0, 0, 0, 0, 40, 0), "F", "D")
     negative = robot.config_string((0, 0, 0, 0, -40, 0), "F", "D")
-    assert positive.startswith("F D T")
-    assert negative.startswith("F D F")
+    assert positive.startswith("F D F")
+    assert negative.startswith("F D T")
     assert positive.endswith(", 0, 0, 0")
 
 

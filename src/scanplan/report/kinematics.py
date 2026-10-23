@@ -52,9 +52,10 @@ def kinematics_block(config: PlannerConfig, viewpoints, path, kinematics=None) -
         "steps_over_limit": len(getattr(assignment, "broken", [])),
         "cache": (kinematics.summary() if kinematics is not None else None),
         "config_note": (
-            "the CONFIG letters are derived from the chosen joint solution, but they have "
-            "not been verified against this controller: only N/F varied in the measured "
-            "samples, and a pose at J5 = -125 was still labelled T"),
+            "the CONFIG letters are derived from the chosen joint solution. The T/F letter was "
+            "verified on the 2026-10-23 bank of eight poses (T for negative J5, 8 of 8); the "
+            "elbow letter saw only U samples and the turn digits match nothing the pendant "
+            "showed, so both stay hints"),
     }
     if not config.robot.wrist_identified:
         block["joint_values_withheld"] = (
