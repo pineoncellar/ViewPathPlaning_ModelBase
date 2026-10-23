@@ -32,7 +32,15 @@
     "those connections did not exist in it: 5 routes keep negative clearance, 7 cannot spread a",
     "90-136 deg flip over the largest lift within max_rot_deg_per_mm. That is why scenario 'deliver",
     "every chosen item' and scenario 'price the choice in corners and order it by pose' are not",
-    "alternatives: the second is what makes the first survive a clearance check."
+    "alternatives: the second is what makes the first survive a clearance check.",
+    "",
+    "`lock_roll: false` belongs to the same list. Fixing the roll at seed time from the axis",
+    "changes which samples a constant-pose sweep can reach (the footprint is 600 x 500, not a",
+    "disc), so it cannot be part of a faithful v1 reproduction - even though it is the right",
+    "behaviour for the shipped profile.",
+    "`pool_mode: grid` is on that list too: the shipped profile now also lays rail lines and a",
+    "tilted side-scan family, and this profile has to use the aim grid alone to stay comparable",
+    "with the 405-point baseline it was measured against."
   ],
   "target": {
     "coverage_target_pct": null,
@@ -43,6 +51,11 @@
     "cost_model": "millimetres",
     "connector_level": 2,
     "order_axis_weight_mm_per_deg": 0.0,
-    "max_prune_rounds": 8
+    "max_prune_rounds": 8,
+    "lock_roll": false,
+    "scan_gate": false,
+    "hard_gate": false,
+    "pool_mode": "grid",
+    "side_scan_tilt_deg": 0.0
   }
 }
