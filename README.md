@@ -297,6 +297,33 @@ base64 缓冲区嵌在页面里，用页面自带的小型 WebGL 渲染器画出
 [`configs/stroke_on.json`](configs/stroke_on.json) 现在只是把扫描带（连续路径）**显式钉住**：
 它已经是默认值，这份覆盖件留着是为了让引用它的脚本在默认值再变时仍然表达同一个意思。
 
+### 2026-10-22 合并进来的两组参数
+
+**曲面取舍（一个旋钮）** `target.surface_bias ∈ [0,1]`。0.0 覆盖优先、0.5 与合并前的出厂值
+逐项相等、1.0 规整优先。它派生 `stroke` 段的六项（`min_gain_mm2_per_step`、
+`min_stroke_mm`、`seed_dirs`、`order_axis_weight_mm_per_deg`、`parallel_weight`、
+`repair_budget_share`），派生表在 `config.py` 的 `SURFACE_ANCHORS`，优先级是
+**出厂文件 < 派生表 < 覆盖文件**——覆盖件里写了的键永远赢，报告里的
+`surface_profile.sources` 逐个键标明它是 `base` / `profile(bias=x)` / `override`。
+
+**点数硬上限** `target.max_points`（默认 `null` 表示整层跳过）。设了以后选择器在 λ 上
+搜一遍：λ 是"多覆盖一点面积愿意多付几个拐角"的汇率，取值区间 0–32（拐角单位）。
+报告里的 `budget.verdict` 只有三种：`target_bound` / `budget_bound` / `exhausted`。
+
+**机器人段** `robot`（默认 `enabled: false`，关掉即回到合并前的行为）。打开后
+规划期就用实测的臂/腕模型筛位姿，交付点逐点带 CONFIG；`--joint-blocks` 让 `.LS`
+直接写关节值。三个现场缺口（软限位准确值、CONFIG 字母映射、ROBOGUIDE 是否配了
+数据表限位）没补齐之前，别把 `enabled` 打开当验收用。
+
+**扫描带生成侧的三道门**（都在 `stroke` 段）：`lock_roll` 在生成种子时把滚转定死；
+`scan_gate` 用"这个位置还能看到量程内的样本吗"判生长合法性；`hard_gate` 让连不进去的
+带**被丢掉并重选**，而不是写一行 violation 继续交付。`configs/legacy_exhaust.json`
+把这三项都关掉，这是它能继续当回归金标的前提。
+
+**候选池** `stroke.pool_mode`（`full` / `grid` / `rails`）与 `stroke.side_scan_tilt_deg`：
+`full` = 瞄准网格 + 导轨线 + 侧扫族；`grid` = 只有瞄准网格（历史行为，`legacy_exhaust` 用这一档）；
+`rails` 只铺导轨线，是"十分钟出草稿"那一档，仍是同一套算法的一个更小的池。
+
 ## 数据保密
 
 工位数模、由它派生的一切（网格、点云、视点坐标）以及设计文档**绝不入库**。
