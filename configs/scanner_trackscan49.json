@@ -194,17 +194,20 @@
   "_comment_robot": [
     "Arm, limits and tool for the J5 over-travel work (docs 2026-10-22-j5-overtravel-kinematics-gate-design).",
     "DISABLED BY DEFAULT: enabled=false leaves every existing result untouched. Before turning it",
-    "on, three site facts still have to be read off the controller (the design's G1/G2/G3):",
+    "on, two site facts still have to be read off the controller (the design's G1/G3):",
     "  G1 the real soft limits - the values below are INFERRED from captured data, where three",
-    "     joints sat exactly on J2=-60 / J5=-125 / J6=360, which no joystick produces;",
-    "  G2 the meaning of the CONFIG letters on this cell - only N/F varied in the six samples and",
-    "     the one at J5=-125 was still labelled T, so the letters are emitted as a hint only;",
+    "     joints sat exactly on J2=-60 / J5=-125 / J6=360, which no joystick produces; the",
+    "     2026-10-23 bank adds two poses sitting 0.68 deg inside the J5 floor, i.e. the SRVO-115",
+    "     pose, which corroborates -125 but says nothing about the other axes;",
     "  G3 whether ROBOGUIDE is configured with the databook limits (+-250 on J5) instead of the",
     "     controller's (+-125). If it is, every simulation verdict about reachability is void.",
+    "G2 (the CONFIG letters) was settled on 2026-10-23 for T/F - see tool_ypr_deg below and",
+    "docs/robot-calibration.md; the turn digits are still emitted as a hint.",
     "",
-    "Geometry is not from the datasheet: 312 / 1075 / 1730 / 225 were solved from six measured",
-    "poses (position residual <= 0.02 mm, attitude <= 0.002 deg) and then checked against four",
-    "drawing dimensions and two datasheet envelopes. This controller reports J3 as the ABSOLUTE",
+    "Geometry is not from the datasheet: 312 / 1075 / 1730 / 225 were solved from measured poses",
+    "(position residual <= 0.02 mm, attitude <= 0.002 deg) and then checked against four",
+    "drawing dimensions and two datasheet envelopes. The 2026-10-23 bank (8 poses) reproduces",
+    "the same five numbers and moves only the tool. This controller reports J3 as the ABSOLUTE",
     "forearm pitch, not relative to J2 - hence j3_sign/j3_zero_deg rather than a DH chain.",
     "wrist_identified=false forbids emitting absolute joint values; the gate may then only rank",
     "branches against each other."
@@ -227,8 +230,17 @@
     "j6_sign": 1, "j6_zero_deg": 180.0,
     "wrist_tilt_deg": [-90.0, -90.0],
 
-    "tool_xyz_mm": [337.342, 5.849, -557.613],
-    "tool_ypr_deg": [0.0, 49.9, 0.0],
+    "_comment_tool": [
+      "UTOOL 1 as fitted from the 2026-10-23 pose bank (8 poses, docs/robot-calibration.md).",
+      "The ARM numbers above came back unchanged from that fit; only the tool moved, which",
+      "is what a re-taught UTOOL looks like - do not read it as a model correction.",
+      "Cross-check on the pendant: UTOOL 1 should read X -247.9, Y 12.0, Z -584.7,",
+      "W 179.3, P -45.9, R 172.8 (the equivalent W -0.7 / P -134.1 / R -7.2 is the same",
+      "rotation). The scanner frame's +Z, which the planner treats as the optical axis, is",
+      "(-0.711, 0.103, -0.695) in flange coordinates."
+    ],
+    "tool_xyz_mm": [-248.001, -26.674, 584.158],
+    "tool_ypr_deg": [179.279, -45.934, 172.758],
 
     "_comment_limits": [
       "Two sets, on purpose. The planner uses the INTERSECTION and the report says which set",

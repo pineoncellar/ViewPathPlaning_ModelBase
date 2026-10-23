@@ -4,14 +4,16 @@ Why a hand-written model instead of a DH table or a numerical solver. Three fact
 this machine are not the textbook ones, and each was measured rather than assumed:
 
 * **J3 is the absolute pitch of the forearm**, not its angle relative to the upper arm.
-  Fitting both hypotheses to six measured poses gives 0.004 mm for the absolute reading
+  Fitting both hypotheses to the measured poses gives 0.004 mm for the absolute reading
   and 519.7 mm for the relative one - five orders of magnitude apart, so there is nothing
   to interpret.
 * **The wrist centre sits 225 mm off the forearm axis.** The forearm is described by a
   length (`forearm_mm`) and a perpendicular offset (`forearm_offset_mm`), which is exactly
   the 7.411 deg tilt the attitude fit needed and missed on its first two attempts.
-* **The tool is long and pitched** (|v| = 651.7 mm at 49.9 deg). That vector moves the
-  wrist centre, hence shifts |J5|, which is the joint that actually over-travels.
+* **The tool is long and folded back** (|v| = 635.2 mm, frame W 179.3 / P -45.9 / R 172.8).
+  That vector moves the wrist centre, hence shifts |J5|, which is the joint that actually
+  over-travels. The 2026-10-23 pose bank moved this and nothing else - the arm numbers came
+  back identical, which is what makes a tool change separable from a model error.
 
 So the model is written in the machine's own quantities (`j3_sign`, `j3_zero_deg`, the
 measured tool pose) and not translated into DH terms that would hide all three.
@@ -87,10 +89,12 @@ def rotation_angle_deg(first, second) -> float:
 class Solution:
     """One complete joint solution for a Cartesian pose, with the numbers that judge it.
 
-    `config` is a HINT, not a verdict: the letters were never verified on this cell (only
-    N/F varied in the captured samples, and the one pose at J5 = -125 was still labelled T),
-    so the caller must not treat a mismatch as an error. `singular` says the wrist was at
-    J4/J6 collinearity, where the two angles are only known as a sum.
+    `config` is a HINT, not a verdict: the letters were read off the pendant on one bank of
+    eight poses (2026-10-23), where all eight said `T` while J5 was negative and the first
+    letter matched the shoulder on seven of the eight. What that bank CANNOT settle is the
+    elbow letter (no `D` sample) and the turn digits. So the caller must not treat a
+    mismatch as an error. `singular` says the wrist was at J4/J6 collinearity, where the
+    two angles are only known as a sum.
     """
 
     joints_deg: tuple[float, ...]
@@ -332,7 +336,11 @@ class Robot:
                 yield shoulder, elbow, {"a1x": a1x, "a2": a2, "b": forearm_pitch}
 
     def _wrist_solutions(self, a1x: float, b: float, flange: np.ndarray):
-        """The two wrist branches for a fixed arm, as (T/F, (z4, z5, z6), singular)."""
+        """The two wrist branches for a fixed arm, as (T/F, (z4, z5, z6), singular).
+
+        `T` is the negative-J5 branch, matching what the pendant calls `T` - see
+        `config_string` for the measurement that settled it.
+        """
         tilt = float(self.params.wrist_tilt_deg[0])
         if abs(abs(tilt) - 90.0) > 1e-6 or abs(self.params.wrist_tilt_deg[1] - tilt) > 1e-6:
             raise ValueError(
@@ -343,7 +351,7 @@ class Robot:
         inner = (_rz(a1x) @ _ry(b)).T @ flange
         cosine = float(np.clip(-inner[2, 2], -1.0, 1.0))
         magnitude = float(np.arccos(cosine))
-        for flip, z5 in (("T", magnitude), ("F", -magnitude)):
+        for flip, z5 in (("F", magnitude), ("T", -magnitude)):
             sine = float(np.sin(z5))
             if abs(sine) < _SINGULAR_SIN:
                 # J4 and J6 are collinear: only z4 + z6 is defined. Put the whole turn on
@@ -376,10 +384,16 @@ class Robot:
         so a point whose best branch is `F D` is written as `F D`, not as the constant
         `N U T` that locked every point onto one branch in the first place. Note that the
         T letter only reflects the sign of J5; it cannot move |J5|.
+
+        The T/F letter is `T` for NEGATIVE J5. That is the one letter the 2026-10-23 bank
+        settles: eight poses with J5 between -9 and -124 were all labelled `T` on the
+        pendant, so the previous rule (`T` for positive J5) got every one of them wrong.
+        A wrong letter is not cosmetic - it tells the controller to take the other wrist
+        branch, which is the same pose turned 180 degrees.
         """
         values = np.asarray(joints, dtype=float).reshape(6)
         turns = [int(np.floor(values[index] / 360.0 + 1e-9)) for index in (0, 3, 5)]
-        flip = "T" if values[4] >= 0.0 else "F"
+        flip = "T" if values[4] < 0.0 else "F"
         return f"{shoulder} {elbow} {flip}, {turns[0]}, {turns[1]}, {turns[2]}"
 
     def reproduces(self, joints, position, rotation) -> bool:

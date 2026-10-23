@@ -214,14 +214,18 @@ class RobotParams:
     Not standard DH and deliberately not written that way: on this controller J3 reports
     the absolute pitch of the forearm, so `j3_zero_deg`/`j3_sign` mean what the machine
     means, and the wrist is described by its measured axis order and fixed tilts rather
-    than by a textbook ball-wrist assumption. The numbers below were solved from six
-    measured poses (position residual <= 0.02 mm, attitude <= 0.002 deg) and then checked
-    against four drawing dimensions, so they are measurements, not datasheet guesses.
+    than by a textbook ball-wrist assumption. The numbers below were solved from eight
+    measured poses (position residual <= 0.015 mm, attitude <= 0.001 deg, leave-one-out
+    at the same level) and then checked against four drawing dimensions, so they are
+    measurements, not datasheet guesses. The arm numbers came back unchanged when the
+    pose bank was replaced - only the tool did, which is what a re-taught UTOOL looks
+    like. `docs/robot-calibration.md` is the procedure.
 
     `soft_limits_deg` is what the controller actually enforces. It is inferred, not read
     off the machine yet (three joints sat exactly on integer values in the captured
-    samples), so it is kept separate from the mechanical envelope: the planner uses the
-    intersection, and `limits_source` in the report says so.
+    samples, and the 2026-10-23 bank has two poses sitting 0.68 deg inside the J5 floor,
+    which is the SRVO-115 pose), so it is kept separate from the mechanical envelope: the
+    planner uses the intersection, and `limits_source` in the report says so.
 
     `enabled=False` skips the whole gate, which is what keeps the pre-2026-10-22 result
     reproducible bit for bit.
@@ -272,7 +276,8 @@ class RobotParams:
             j3_sign=-1, j3_zero_deg=0.0, j4_sign=-1, j4_zero_deg=180.0,
             j5_sign=1, j5_zero_deg=0.0, j6_sign=1, j6_zero_deg=180.0,
             wrist_tilt_deg=(-90.0, -90.0),
-            tool_xyz_mm=(337.342, 5.849, -557.613), tool_ypr_deg=(0.0, 49.9, 0.0),
+            tool_xyz_mm=(-248.001, -26.674, 584.158),
+            tool_ypr_deg=(179.279, -45.934, 172.758),
             mechanical_limits_deg=((-185.0, 185.0), (-136.0, 136.0), (-301.0, 301.0),
                                    (-720.0, 720.0), (-250.0, 250.0), (-720.0, 720.0)),
             soft_limits_deg=((-185.0, 185.0), (-60.0, 136.0), (-301.0, 301.0),
