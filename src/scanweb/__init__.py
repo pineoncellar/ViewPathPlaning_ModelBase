@@ -15,6 +15,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import time
 import traceback
 import uuid
 import zlib
@@ -330,6 +331,7 @@ def _export_options(config, viewpoints, data: dict) -> dict:
 
 def solve_job(data: dict) -> dict:
     """Register uploaded meshes, plan the selected side, and export FANUC files."""
+    started = time.perf_counter()
     if not isinstance(data, dict):
         raise ValueError("request body must be a JSON object")
     registration, resets = _registration_from_payload(data)
@@ -558,6 +560,7 @@ def solve_job(data: dict) -> dict:
         "registration_rms_error_mm": registration.rms_error_mm,
         "registration_max_error_mm": registration.max_error_mm,
         "datum_count": int(len(registration.cad_points)),
+        "elapsed_seconds": round(time.perf_counter() - started, 2),
         "base_supplied": base_supplied,
         "viewpoints": delivered,
         "viewer_url": f"/api/viewer?run_id={run_id}",

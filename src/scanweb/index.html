@@ -173,7 +173,24 @@
 
           <div class="empty-state" id="emptyState"><div class="empty-illustration"><div class="empty-cube">◇</div><span>NO RESULT YET</span></div><h3>等待规划任务</h3><p>完成模型导入和定位点配准后，在上方填写 LS 程序名并点击「开始规划扫描路径」。</p><button class="secondary-button" id="goSetup" type="button">＋ 回到模型与定位</button></div>
 
-          <div class="progress-state hidden" id="progressState"><div class="spinner"></div><h3 id="progressTitle">正在准备模型</h3><p id="progressMessage">正在上传模型并执行配准、目标面分割与视点规划，请勿关闭页面。</p><div class="progress-track"><i></i></div><span class="progress-caption">GEOMETRY ANALYSIS IN PROGRESS</span></div>
+          <div class="progress-state hidden" id="progressState">
+            <div class="spinner"></div>
+            <h3 id="progressTitle">正在准备模型</h3>
+            <p id="progressMessage">正在上传模型并执行配准、目标面分割与视点规划，请勿关闭页面。</p>
+            <div class="plan-progress" id="planProgress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="规划进度">
+              <div class="plan-progress-head"><span id="progressStage">上传模型</span><b id="progressPercent">0<small>%</small></b></div>
+              <div class="plan-progress-track"><i id="progressFill"></i></div>
+              <ol class="plan-progress-steps" id="progressSteps">
+                <li data-stage="upload">上传模型</li>
+                <li data-stage="registration">坐标配准</li>
+                <li data-stage="segmentation">目标面分割</li>
+                <li data-stage="candidates">候选视点</li>
+                <li data-stage="occlusion">遮挡计算</li>
+                <li data-stage="export">交付导出</li>
+              </ol>
+            </div>
+            <span class="progress-caption" id="progressCaption">GEOMETRY ANALYSIS IN PROGRESS</span>
+          </div>
 
           <div class="result-state hidden" id="resultState">
             <div class="result-project"><span class="result-icon">✓</span><div><b id="resultName">项目</b><small id="resultSubtitle">规划完成</small></div><span class="completion-pill">已完成</span></div>
@@ -182,6 +199,7 @@
               <div class="metric"><span>扫描视点</span><b id="metricViewpoints">—</b><i>建议位姿总数</i></div>
               <div class="metric"><span>目标采样点</span><b id="metricPoints">—</b><i>离散表面样本</i></div>
               <div class="metric"><span>漏扫点</span><b id="metricUncovered">—</b><i>需要人工复核</i></div>
+              <div class="metric"><span>规划耗时</span><b id="metricElapsed">—</b><i>本次规划计算时长</i></div>
             </div>
             <div class="result-details" id="resultDetails"></div>
             <div class="warning-note" style="margin-top:12px"><b>!</b><span>结果不包含机器人可达性与碰撞验证。导入 ROBOGUIDE 前，请确认 UFRAME、UTOOL 与扫描头测量参考点契约。</span></div>

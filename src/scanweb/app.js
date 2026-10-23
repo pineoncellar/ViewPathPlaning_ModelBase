@@ -952,6 +952,162 @@ async function fetchJson(url, body) {
   return data;
 }
 
+// 规划请求体可能带有几十 MB 的 base64 网格，用 XHR 才能拿到上传字节进度。
+function postJsonWithUpload(url, body, handlers = {}) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", url);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable && handlers.onUpload) {
+        handlers.onUpload(event.loaded / event.total);
+      }
+    });
+    request.upload.addEventListener("load", () => {
+      if (handlers.onUploaded) handlers.onUploaded();
+    });
+    request.addEventListener("load", () => {
+      let data;
+      try {
+        data = JSON.parse(request.responseText);
+      } catch (_) {
+        reject(new Error("服务返回了无法解析的响应（HTTP " + request.status + "）"));
+        return;
+      }
+      if (request.status < 200 || request.status >= 300 || !data.ok) {
+        reject(new Error((data && data.error) || "请求失败"));
+        return;
+      }
+      resolve(data);
+    });
+    request.addEventListener("error", () => reject(new Error("无法连接本机规划服务，请确认命令行仍在运行")));
+    request.addEventListener("abort", () => reject(new Error("规划请求已取消")));
+    request.send(JSON.stringify(body));
+  });
+}
+
+/* ---------- planning progress bar ---------- */
+
+// 每个阶段的天花板百分比：阶段标签跟着进度走，进度由真实上传字节数和服务端估算时间共同驱动。
+const PLAN_STAGES = [
+  { key: "upload", label: "上传模型", ceiling: 22 },
+  { key: "registration", label: "坐标配准", ceiling: 40 },
+  { key: "segmentation", label: "目标面分割", ceiling: 58 },
+  { key: "candidates", label: "候选视点", ceiling: 76 },
+  { key: "occlusion", label: "遮挡计算", ceiling: 92 },
+  { key: "export", label: "交付文件导出", ceiling: 99 }
+];
+
+const planProgress = {
+  timer: 0,
+  value: 0,
+  stage: 0,
+  uploadRatio: 0,
+  solveStart: 0,
+
+  start() {
+    this.stop();
+    this.value = 0;
+    this.stage = -1;
+    this.uploadRatio = 0;
+    this.solveStart = 0;
+    const node = $("planProgress");
+    if (!node) return;
+    node.classList.remove("is-done", "is-failed");
+    document.querySelectorAll("#progressSteps li").forEach((item) => {
+      item.classList.remove("done", "active");
+    });
+    $("progressCaption").textContent = "GEOMETRY ANALYSIS IN PROGRESS";
+    this.markStage(0);
+    this.render();
+    this.timer = window.setInterval(() => this.tick(), 140);
+  },
+
+  stop() {
+    if (this.timer) window.clearInterval(this.timer);
+    this.timer = 0;
+  },
+
+  markStage(index) {
+    const stage = PLAN_STAGES[index];
+    if (!stage) return;
+    if (index === this.stage && $("progressStage").textContent === stage.label) return;
+    this.stage = index;
+    $("progressStage").textContent = stage.label;
+    document.querySelectorAll("#progressSteps li").forEach((item, position) => {
+      item.classList.toggle("done", position < index);
+      item.classList.toggle("active", position === index);
+    });
+  },
+
+  render() {
+    const value = Math.max(0, Math.min(100, this.value));
+    const fill = $("progressFill");
+    if (!fill) return;
+    fill.style.width = value.toFixed(1) + "%";
+    $("progressPercent").innerHTML = Math.round(value) + "<small>%</small>";
+    $("planProgress").setAttribute("aria-valuenow", String(Math.round(value)));
+  },
+
+  tick() {
+    if (this.solveStart) {
+      // 服务端阶段无法逐个回报，用带渐近上限的估算曲线：约 26 s 走一半，越接近完成越慢。
+      const seconds = (Date.now() - this.solveStart) / 1000;
+      const estimate = 24 + 75 * (1 - Math.exp(-seconds / 26));
+      this.value = Math.max(this.value, Math.min(99, estimate));
+    } else {
+      // 上传阶段：真实上传字节比为主，读文件 / 转 base64 时缓慢爬升。
+      const estimate = Math.min(PLAN_STAGES[0].ceiling, 2 + this.uploadRatio * 20);
+      this.value = Math.max(this.value + 0.15, estimate);
+    }
+    const index = PLAN_STAGES.findIndex((stage) => this.value < stage.ceiling);
+    this.markStage(index === -1 ? PLAN_STAGES.length - 1 : index);
+    this.render();
+  },
+
+  setUploadRatio(ratio) {
+    if (!Number.isFinite(ratio)) return;
+    this.uploadRatio = Math.max(this.uploadRatio, Math.min(1, ratio));
+    if (!this.solveStart) {
+      this.value = Math.max(this.value, Math.min(PLAN_STAGES[0].ceiling, 2 + this.uploadRatio * 20));
+      this.render();
+    }
+  },
+
+  beginSolve() {
+    this.solveStart = this.solveStart || Date.now();
+    this.value = Math.max(this.value, 24);
+    this.render();
+  },
+
+  complete() {
+    this.stop();
+    this.value = 100;
+    this.markStage(PLAN_STAGES.length - 1);
+    document.querySelectorAll("#progressSteps li").forEach((item) => {
+      item.classList.remove("active");
+      item.classList.add("done");
+    });
+    $("progressStage").textContent = "规划完成";
+    $("planProgress").classList.remove("is-failed");
+    $("planProgress").classList.add("is-done");
+    $("progressCaption").textContent = "PLANNING COMPLETE";
+    this.render();
+  },
+
+  fail() {
+    this.stop();
+    $("planProgress").classList.remove("is-done");
+    $("planProgress").classList.add("is-failed");
+    $("progressStage").textContent = "规划中断";
+    $("progressCaption").textContent = "PLANNING FAILED";
+    document.querySelectorAll("#progressSteps li.active").forEach((item) => {
+      item.classList.remove("active");
+    });
+    this.render();
+  }
+};
+
 async function solve() {
   if (state.solving) return;
   try {
@@ -975,7 +1131,11 @@ async function solve() {
   $("progressMessage").textContent = "正在执行配准、目标面分割、候选视点与遮挡计算。零件复杂时可能需要几分钟，请勿关闭页面。";
   try {
     await prepareMeshPayload();
-    const body = await fetchJson("/api/solve", payload(true));
+    const body = await postJsonWithUpload("/api/solve", payload(true), {
+      onUpload: (ratio) => planProgress.setUploadRatio(ratio),
+      onUploaded: () => planProgress.beginSolve()
+    });
+    planProgress.complete();
     state.result = body.result;
     state.resultSource = "live";
     state.showPath = true;
@@ -983,15 +1143,16 @@ async function solve() {
     $("showPath").disabled = false;
     buildPathBuffers();
     renderResult(body.result);
+    await delay(520);
     showResultState("result");
     requestRender();
     scrollToId("resultPanel");
     toast("扫描路径规划完成");
   } catch (error) {
+    planProgress.fail();
     $("progressTitle").textContent = "规划未能完成";
     $("progressMessage").textContent = error.message;
     $("progressState").querySelector(".spinner").style.display = "none";
-    $("progressState").querySelector(".progress-caption").textContent = "PLANNING FAILED";
     toast(error.message);
   } finally {
     state.solving = false;
@@ -1022,6 +1183,23 @@ function buildPathBuffers() {
   glState.pathPointCount = points.length;
 }
 
+function formatElapsed(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return "—";
+  // 先整体取整再拆分/秒，否则 239.6 s 会先算成 3 分再四舍五入成 60 秒。
+  const rounded = Math.round(value * 10) / 10;
+  if (rounded < 60) return rounded.toFixed(1) + "<small>秒</small>";
+  const total = Math.round(rounded);
+  const minutes = Math.floor(total / 60);
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const restMinutes = String(minutes - hours * 60).padStart(2, "0");
+    return hours + "<small>时</small>" + restMinutes + "<small>分</small>";
+  }
+  const rest = String(total - minutes * 60).padStart(2, "0");
+  return minutes + "<small>分</small>" + rest + "<small>秒</small>";
+}
+
 function renderResult(result) {
   $("resultName").textContent = result.program_name + " · 扫描路径规划";
   $("resultSubtitle").textContent = "目标面 " + (result.face || "—") + " · " + result.datum_count + " 点配准 · " + result.measured_frame;
@@ -1029,6 +1207,7 @@ function renderResult(result) {
   $("metricViewpoints").textContent = result.point_count;
   $("metricPoints").textContent = Number(result.target_points).toLocaleString();
   $("metricUncovered").textContent = Number(result.uncovered_points).toLocaleString();
+  $("metricElapsed").innerHTML = formatElapsed(result.elapsed_seconds);
   const reasons = Object.entries(result.uncovered_by_reason || {})
     .map(([key, value]) => key + " " + value).join(" · ") || "无";
   const details = [
@@ -1083,7 +1262,9 @@ function showResultState(name) {
   $("resultState").classList.toggle("hidden", name !== "result");
   if (name === "progress") {
     $("progressState").querySelector(".spinner").style.display = "";
-    $("progressState").querySelector(".progress-caption").textContent = "GEOMETRY ANALYSIS IN PROGRESS";
+    planProgress.start();
+  } else {
+    planProgress.stop();
   }
 }
 
@@ -1101,6 +1282,10 @@ function toast(message) {
   node.classList.add("show");
   window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => node.classList.remove("show"), 2800);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function scrollToId(id) {

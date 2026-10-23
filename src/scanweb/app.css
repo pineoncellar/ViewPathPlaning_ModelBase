@@ -750,28 +750,122 @@ select.text-input {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.progress-track {
-  width: min(320px, 80%);
-  height: 4px;
-  margin-top: 8px;
+.plan-progress {
+  width: min(520px, 100%);
+  margin-top: 10px;
+}
+
+.plan-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 5px;
+  padding: 0 1px;
+  text-align: left;
+}
+
+.plan-progress-head > span {
+  color: #4b6b88;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.plan-progress-head b {
+  color: #1f5f95;
+  font: 700 13px/1 Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-progress-head b small {
+  margin-left: 1px;
+  color: #7e95ab;
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.plan-progress-track {
+  position: relative;
+  height: 8px;
   overflow: hidden;
-  border-radius: 2px;
-  background: #e2ebf3;
+  border-radius: 999px;
+  background: #e3ecf4;
+  box-shadow: inset 0 1px 2px rgba(16, 36, 61, .09);
 }
 
-.progress-track i {
+.plan-progress-track i {
+  position: relative;
   display: block;
-  width: 38%;
+  width: 0;
   height: 100%;
-  border-radius: 2px;
-  background: linear-gradient(90deg, #3b82c4, #60c4e0);
-  animation: slide 1.4s ease-in-out infinite;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #3b82c4, #5cb8e6);
+  transition: width .32s cubic-bezier(.4, 0, .2, 1);
 }
 
-@keyframes slide {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(300%); }
+.plan-progress-track i::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(115deg,
+    rgba(255, 255, 255, .42) 25%, transparent 25%, transparent 50%,
+    rgba(255, 255, 255, .42) 50%, rgba(255, 255, 255, .42) 75%, transparent 75%);
+  background-size: 18px 18px;
+  animation: plan-stripes .8s linear infinite;
 }
+
+@keyframes plan-stripes { to { background-position: 18px 0; } }
+
+.plan-progress-steps {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px 6px;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plan-progress-steps li {
+  padding: 2px 7px;
+  border: 1px solid #e1eaf2;
+  border-radius: 999px;
+  background: #fff;
+  color: #9dabba;
+  font-size: 9px;
+  letter-spacing: .2px;
+}
+
+.plan-progress-steps li.done {
+  border-color: #cfe6da;
+  background: #f2faf6;
+  color: #4a9c76;
+}
+
+.plan-progress-steps li.active {
+  border-color: #a9cbe8;
+  background: #eef6fd;
+  color: #2a6ba1;
+  font-weight: 700;
+}
+
+.plan-progress.is-done .plan-progress-track i {
+  background: linear-gradient(90deg, #43b07f, #6fd0a3);
+}
+
+.plan-progress.is-done .plan-progress-track i::after { animation: none; opacity: 0; }
+
+.plan-progress.is-done .plan-progress-head b { color: #35a173; }
+
+.plan-progress.is-failed .plan-progress-track i {
+  background: linear-gradient(90deg, #c0504d, #e08a86);
+}
+
+.plan-progress.is-failed .plan-progress-track i::after { animation: none; opacity: .3; }
+
+.plan-progress.is-failed .plan-progress-head b { color: #c0504d; }
+
+.plan-progress.is-failed .plan-progress-head > span { color: #c0504d; }
 
 .progress-caption {
   color: #9dabba;
@@ -830,7 +924,7 @@ select.text-input {
 
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 8px;
   margin-top: 12px;
 }
