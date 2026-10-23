@@ -55,11 +55,21 @@ ROLE_RETRACT = "retract"
 ROLE_TRAVERSE = "traverse"
 ROLE_REORIENT = "reorient"
 
-# The three connector routes, cheapest first. Reported per transition so "the connector
-# got cheaper" is a measurement rather than a claim.
+# The connector routes, cheapest first. Reported per transition so "the connector got
+# cheaper" is a measurement rather than a claim.
 LEVEL_STRAIGHT = "L0-straight"
 LEVEL_ONE_CORNER = "L1-retract"
 LEVEL_TWO_CORNERS = "L2-retract-through"
+LEVEL_SAFE_PLANE = "L3-safe-plane"
+
+# Two successive sweeps whose optical axes differ by more than this belong to different
+# scan directions, and the transfer between them has to leave through the common plane
+# rather than slide from one to the other. Sixty degrees is chosen so that a merely tilted
+# neighbour (the usual case on a curved panel) still uses the cheap local route; what this
+# is meant to catch is a genuinely different side of the part.
+_GROUP_DEG = 60.0
+# Sweeps whose outward directions agree to within this belong to one direction group.
+_GROUP_MERGE_DEG = 30.0
 
 
 @dataclass(frozen=True)
@@ -98,6 +108,20 @@ class PathPlan:
     # Which connector route each transition actually took. Reported because "the
     # connector got cheaper" is otherwise an unfalsifiable claim.
     connector_levels: dict[str, int] = field(default_factory=dict)
+    # Items the hard gate refused to deliver. They are removed from the path, and the
+    # caller re-runs the selection without them; keeping the list here is what lets the
+    # report say "these sweeps were dropped and why" instead of quietly shortening the plan.
+    dropped: list[int] = field(default_factory=list)
+    # The largest joint change between two consecutive delivered points, when a kinematic
+    # gate supplied the joint values. Reported, and used by the acceptance criteria.
+    max_step_deg: float | None = None
+    # The branch assignment (`path.assign_branches`) that produced the per-point CONFIG
+    # strings, kept here so the viewpoint records and the report read one source.
+    branches: object | None = None
+    # (lambda, delivered points, coverage) for every budget trial, so "four times the
+    # points bought this much" is a number in the report rather than an impression.
+    budget_history: list[tuple[float, int, float]] = field(default_factory=list)
+    verdict: str = ""
 
     @property
     def turns(self) -> int:
@@ -175,14 +199,22 @@ def _rotation(axis, angle: float) -> np.ndarray:
 
 def order_strokes(strokes: Sequence[Stroke], start_near, *,
                   max_passes: int = 2,
-                  axis_weight: float = 0.0) -> list[tuple[int, bool]]:
+                  axis_weight: float = 0.0,
+                  two_opt_limit: int = 40) -> list[tuple[int, bool]]:
     """Order the strokes and choose an end for each: `(index, reversed)` in path order.
 
-    Greedy nearest neighbour, then single-stroke relocation. The relocation pass is
-    what a 2-opt cannot be here: reversing a run of strokes also reverses each of them,
-    which changes every connector inside the run, so the usual "only two edges change"
-    argument does not hold. Moving one stroke keeps the rest of the sequence intact and
-    the improvement can be priced exactly.
+    Greedy nearest neighbour, then single-stroke relocation, then 2-opt.
+
+    The relocation pass is what a 2-opt cannot be *alone*: reversing a run of strokes also
+    reverses each of them, which changes every connector inside the run, so the textbook
+    "only two edges change" argument needs the reversal to be reflected in each item's
+    direction flag - which is exactly what `_two_opt` does. Moving one stroke keeps the
+    rest of the sequence intact and its improvement can be priced exactly; reversing a run
+    undoes a crossing that relocation cannot.
+
+    Both passes are capped: the number of candidate items grows with the pool, and an
+    ordering pass that takes minutes would be paid again on every budget trial. Past the
+    cap the result is the relocation answer, which is the design's stated fallback.
 
     `axis_weight` (mm per degree) prices a pose change into the same cost as travel.
     Distance alone rates a 60 degree re-orientation at whatever the two endpoints happen
@@ -218,7 +250,64 @@ def order_strokes(strokes: Sequence[Stroke], start_near, *,
         remaining.remove(index)
 
     order = _relocate(order, starts, ends, anchor, max_passes, gaps, axis_weight)
-    return order
+    return _two_opt(order, starts, ends, anchor, gaps, axis_weight,
+                    limit=int(two_opt_limit))
+
+
+def _two_opt(order, starts, ends, anchor, gaps, axis_weight: float, *, limit: int = 40,
+             max_passes: int = 8) -> list[tuple[int, bool]]:
+    """Undo crossings by reversing a run of strokes, flipping each one as it turns round.
+
+    A reversed run is still the same physical plan: every stroke inside it is traversed the
+    other way (free - a stroke is undirected), so the connectors inside the run are the same
+    two endpoints in the other order and only the two edges at the cut change. That is what
+    makes the usual 2-opt delta argument valid here, provided the flip flags are toggled with
+    the order rather than left alone.
+    """
+    n = len(order)
+    if n < 4 or n > limit:
+        return order
+    plan = list(order)
+    for _ in range(max_passes):
+        entry = np.array([ends[i] if flip else starts[i] for i, flip in plan])
+        leave = np.array([starts[i] if flip else ends[i] for i, flip in plan])
+        index = [i for i, _ in plan]
+
+        def edge(from_point, to_point, from_index: int, to_index: int) -> float:
+            cost = float(np.linalg.norm(np.asarray(to_point, dtype=float)
+                                        - np.asarray(from_point, dtype=float)))
+            if gaps is not None and axis_weight > 0.0:
+                cost += axis_weight * float(gaps[from_index, to_index])
+            return cost
+
+        improved = False
+        for left in range(n - 1):
+            for right in range(left + 1, n):
+                before = 0.0
+                after = 0.0
+                if left == 0:
+                    before += float(np.linalg.norm(np.asarray(entry[0], dtype=float) - anchor))
+                    after += float(np.linalg.norm(np.asarray(leave[right], dtype=float)
+                                                  - anchor))
+                else:
+                    before += edge(leave[left - 1], entry[left], index[left - 1], index[left])
+                    after += edge(leave[left - 1], leave[right], index[left - 1],
+                                  index[right])
+                if right + 1 < n:
+                    before += edge(leave[right], entry[right + 1], index[right],
+                                   index[right + 1])
+                    after += edge(entry[left], entry[right + 1], index[left],
+                                  index[right + 1])
+                if after < before - 1e-9:
+                    plan[left:right + 1] = [(item, not flip)
+                                            for item, flip in reversed(plan[left:right + 1])]
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+    return plan
 
 
 def _pose_gaps(strokes: Sequence[Stroke]) -> np.ndarray:
@@ -295,6 +384,8 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
                model: ScannerModel, coverage_index=None, sources=None,
                start_near=None,
                visible: Callable[[np.ndarray], np.ndarray] | None = None,
+               strict: bool | None = None,
+               kin=None,
                log: Callable[[str], None] | None = None) -> PathPlan:
     """Order `strokes`, insert the transitions, and account for the result.
 
@@ -306,14 +397,21 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
     it is delivered as ONE corner because that is what it is. Leaving it out - or delivering
     both of its identical ends - is how the reported coverage and the program came apart in
     the first place.
+
+    `strict` decides what an unconnectable item means. With it on (the configured
+    `stroke.hard_gate`), no legal route means the item is removed and listed in
+    `plan.dropped`, so the caller can re-run the selection without it; the alternative is
+    recording a violation and delivering it anyway, which makes "legality first" a slogan.
     """
     say = log or (lambda _message: None)
     if not strokes:
         return PathPlan(points=[], ordering="empty")
+    hard = bool(cfg.stroke.hard_gate) if strict is None else bool(strict)
     if start_near is None:
         start_near = np.asarray(strokes[0].start, dtype=float)
     order = order_strokes(strokes, start_near,
                           axis_weight=float(cfg.stroke.order_axis_weight_mm_per_deg))
+    normal, plane = _safe_plane(strokes, cfg)
     points: list[PathPoint] = []
     plan = PathPlan(points=points, ordering=(
         "nearest neighbour + single-stroke relocation over stroke endpoints, priced by "
@@ -332,8 +430,16 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
                           role=ROLE_COVERAGE, source=source, stroke_id=int(index),
                           coverage_index=row)
         if previous is not None:
-            points.extend(_connector(previous, entry, cfg, plan, station, model,
-                                     visible=visible))
+            routed = _connector(previous, entry, cfg, plan, station, model,
+                                visible=visible, strict=hard, normal=normal, plane=plane,
+                                kin=kin)
+            if routed is None:
+                plan.dropped.append(int(index))
+                plan.violations.append(
+                    f"stroke {index} dropped: no route into it keeps clearance and rate "
+                    f"({rotation_text(previous, entry)})")
+                continue
+            points.extend(routed)
         points.append(entry)
         # A zero-length stroke IS a pose: appending its "end" as well would deliver two
         # identical corners, which the point count and the .LS program would both carry.
@@ -348,8 +454,52 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
     say(f"  path: {len(strokes)} items ({plan.coverage_strokes} strokes) -> "
         f"{plan.turns} corners ({plan.transition_points} transitions), "
         f"{plan.path_length_mm:.0f} mm, {plan.interrupts_a} translation interrupts, "
-        f"{plan.interrupts_b} re-orientations")
+        f"{plan.interrupts_b} re-orientations"
+        + (f", {len(plan.dropped)} dropped by the hard gate" if plan.dropped else ""))
     return plan
+
+
+def rotation_text(previous: PathPoint, entry: PathPoint) -> str:
+    """A short phrase for a violation line: how far the head has to turn."""
+    return f"{_rotation_deg(previous, entry):.0f} deg"
+
+
+def _safe_plane(strokes: Sequence[Stroke], cfg: PlannerConfig):
+    """One plane every waiting point can sit on, and its outward normal.
+
+    A retract that only knows the head's own axis puts the waiting point 50 mm behind that
+    axis, which is the right place for one direction and the wrong place for the next: on a
+    cell scanned from two sides, the two planes face opposite ways and the straight line
+    between two waiting points cuts through the part. A single plane with one normal fixes
+    that by construction, because both ends of the traverse satisfy `n . p >= plane` and the
+    whole chord between them does too (the dot product is linear).
+
+    The normal is the outward direction of the DOMINANT group, not the mean of all of them.
+    A mean would cancel to zero on a two-sided part - which is exactly the case the plane
+    exists for - and then every transfer would quietly fall back to the local route. Groups
+    whose own outward is nearly perpendicular to the dominant one (cosine below 0.35) keep
+    the local route by design; a plane they do not face is not a place to wait.
+    """
+    if not strokes:
+        return None, None
+    limit = float(np.cos(np.deg2rad(_GROUP_MERGE_DEG)))
+    groups: list[list] = []
+    for stroke in strokes:
+        outward = -unit(stroke.axis)
+        weight = max(float(stroke.length_mm), 1.0)
+        for group in groups:
+            if float(np.dot(unit(group[0]), outward)) >= limit:
+                group[0] = np.asarray(group[0], dtype=float) + outward * weight
+                group[1] = float(group[1]) + weight
+                break
+        else:
+            groups.append([outward * weight, weight])
+    normal = unit(max(groups, key=lambda group: float(group[1]))[0])
+    lifts = max(float(cfg.stroke.retract_clearance_mm), float(cfg.scanner.standoff_mm))
+    reach = max(max(float(np.dot(normal, np.asarray(stroke.start, dtype=float))),
+                    float(np.dot(normal, np.asarray(stroke.end, dtype=float))))
+                for stroke in strokes)
+    return normal, reach + lifts
 
 
 def _travel(points: Sequence[PathPoint]) -> float:
@@ -381,12 +531,16 @@ def _segment_margin(first: PathPoint, second: PathPoint, cfg: PlannerConfig,
 
 def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: PathPlan,
                station: Station, model: ScannerModel, *,
-               visible=None) -> list[PathPoint]:
+               visible=None, strict: bool = False, normal=None, plane=None, kin=None
+               ) -> list[PathPoint] | None:
     """The points that take the head from `previous` to `entry` without cutting a corner.
 
-    Three routes, cheapest first, and `stroke.connector_level` says how far down the
-    planner may go:
+    Routes, cheapest first, and `stroke.connector_level` says how far down the planner may
+    go:
 
+    * **L3** - leave through the common safe plane and come back in on the other side. Used
+      only when the two sweeps look in different directions, because that is the case the
+      per-axis retract gets wrong.
     * **L0** - straight there, no corner at all. Only for two identical poses, and only
       when that line keeps its clearance. Off by default: the "body" in this model is a
       sphere, which does not rotate with the head, so the model cannot see the part of a
@@ -402,10 +556,21 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
     upper face is the base, behind the lower face is the floor side of the fixture. So the
     lift is raised until the moves are clear AND the rotation is spread over enough travel
     to stay inside the rate limit.
+
+    Returns None when no route qualifies and `strict` is set - that is the hard gate, and
+    the caller turns it into "this item is not delivered" rather than a line in a report.
     """
     same = _same_pose(previous, entry)
     rotation = _rotation_deg(previous, entry)
     limit = int(cfg.stroke.connector_level)
+
+    if normal is not None and _crosses_direction(previous, entry):
+        found = _cross_group(previous, entry, cfg, station, model, rotation,
+                             normal=normal, plane=plane, visible=visible)
+        if found is not None and _route_allowed(found[0], kin):
+            route, margin = found
+            _record(plan, same, margin, rotation, 0.0, LEVEL_SAFE_PLANE, entry, cfg)
+            return route
 
     if limit <= 0 and same:
         margin, seen = _segment_margin(previous, entry, cfg, station, model,
@@ -415,16 +580,95 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
             return []
 
     if limit <= 1:
-        found = _one_corner(previous, entry, cfg, station, model, rotation, visible=visible)
-        if found is not None:
+        found = _one_corner(previous, entry, cfg, station, model, rotation,
+                            visible=visible, kin=kin)
+        if found is not None and _route_allowed(found[0], kin):
             points, margin = found
             _record(plan, same, margin, rotation, 0.0, LEVEL_ONE_CORNER, entry, cfg)
             return points
 
     points, margin, rate = _two_corners(previous, entry, cfg, station, model, rotation,
-                                        same, visible=visible)
+                                        same, visible=visible, kin=kin)
+    # The hard gate refuses on CLEARANCE and on joint feasibility. It does not refuse on
+    # `rate`: how much rotation one millimetre of flight can absorb is a modelling
+    # assumption whose constant (`max_rot_deg_per_mm`) has never been calibrated on this
+    # cell, and turning an unmeasured heuristic into a dropped sweep makes the plan look
+    # legal by making it worse. Rate failures are still recorded as violations and counted
+    # in the report, so they stay visible rather than accepted.
+    legal = margin > 0.0 and _route_allowed(points, kin)
     _record(plan, same, margin, rotation, rate, LEVEL_TWO_CORNERS, entry, cfg)
+    if strict and not legal:
+        return None
     return points
+
+
+def _route_allowed(points, kin) -> bool:
+    """Whether the arm can hold every transition corner a route would insert.
+
+    Only the corners are tested, not the segments between them: a `J` move between two
+    reachable poses is not a pose problem, and pretending to check an interpolated joint
+    path that this library does not model would be worse than saying so. What this catches
+    is the real failure - a retract point behind the head that is inside the robot's own
+    base, where no branch exists.
+    """
+    if kin is None or not kin.active:
+        return True
+    for point in points:
+        if not kin.check(point.position, point.axis, point.roll_deg).ok:
+            return False
+    return True
+
+
+def _crosses_direction(previous: PathPoint, entry: PathPoint) -> bool:
+    """Whether two corners belong to different scan directions."""
+    cosine = float(np.clip(np.dot(unit(previous.axis), unit(entry.axis)), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine))) > _GROUP_DEG
+
+
+def _cross_group(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
+                 station: Station, model: ScannerModel, rotation: float, *,
+                 normal, plane: float, visible=None
+                 ) -> tuple[list[PathPoint], float] | None:
+    """L3: retract to the common plane, traverse on it, dive back in.
+
+    The report's rule, and the reason it is a separate route rather than a bigger lift: two
+    waiting points that both satisfy `n . p >= plane` are joined by a segment that satisfies
+    it everywhere, so a transfer between two scan directions stays outside whatever the
+    plane was built to clear. Retracting along each axis separately has no such property -
+    on a two-sided part the two retract points face opposite ways and the line between them
+    runs through the part.
+
+    The `n . outward < 0.35` case falls back to the local routes on purpose: when the sweep
+    faces sideways relative to the plane, the plane is not a good place to wait.
+    """
+    cosine = min(float(np.dot(unit(-previous.axis), normal)),
+                 float(np.dot(unit(-entry.axis), normal)))
+    if cosine < 0.35:
+        return None
+    base = float(cfg.stroke.retract_clearance_mm)
+    lift_out = max(base, plane - float(np.dot(normal, previous.position)))
+    lift_in = max(base, plane - float(np.dot(normal, entry.position)))
+    wait_out = PathPoint(
+        position=np.asarray(previous.position, dtype=float) + normal * lift_out,
+        axis=previous.axis, roll_deg=float(previous.roll_deg), role=ROLE_RETRACT,
+        source=str(previous.source), stroke_id=previous.stroke_id)
+    wait_in = PathPoint(
+        position=np.asarray(entry.position, dtype=float) + normal * lift_in,
+        axis=entry.axis, roll_deg=float(entry.roll_deg), role=ROLE_TRAVERSE,
+        source=str(entry.source), stroke_id=entry.stroke_id)
+    reach = float(np.linalg.norm(wait_in.position - wait_out.position))
+    if reach <= 0.0 or rotation / reach > cfg.stroke.max_rot_deg_per_mm:
+        return None
+    margin = np.inf
+    seen = True
+    for first, second in ((previous, wait_out), (wait_out, wait_in), (wait_in, entry)):
+        found, tracker_ok = _segment_margin(first, second, cfg, station, model,
+                                            visible=visible)
+        margin = min(margin, found)
+        seen = seen and tracker_ok
+    if margin <= 0.0 or not seen:
+        return None
+    return [wait_out, wait_in], float(margin)
 
 
 def _count_level(plan: PathPlan, level: str) -> None:
@@ -464,13 +708,19 @@ def _retract_point(previous: PathPoint, lift: float) -> PathPoint:
 
 def _one_corner(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
                 station: Station, model: ScannerModel, rotation: float, *,
-                visible=None) -> tuple[list[PathPoint], float] | None:
+                visible=None, kin=None) -> tuple[list[PathPoint], float] | None:
     """L1: retract, then fly straight to the next entry. None when no lift works."""
     for factor in _LIFT_FACTORS:
         retract = _retract_point(previous, float(cfg.stroke.retract_clearance_mm) * factor)
         reach = float(np.linalg.norm(np.asarray(entry.position, dtype=float)
                                      - np.asarray(retract.position, dtype=float)))
         if reach <= 0.0 or rotation / reach > cfg.stroke.max_rot_deg_per_mm:
+            continue
+        if not _route_allowed([retract], kin):
+            # A smaller lift is worth trying: the retract point only has to be reachable,
+            # and 50 mm is far more likely to be than 400 mm. Testing the gate INSIDE the
+            # lift search is what keeps the hard gate from rejecting a sweep whose only
+            # problem was that the first lift it tried was too greedy.
             continue
         margin = np.inf
         seen = True
@@ -486,7 +736,7 @@ def _one_corner(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
 
 def _two_corners(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
                  station: Station, model: ScannerModel, rotation: float, same: bool, *,
-                 visible=None) -> tuple[list[PathPoint], float, float]:
+                 visible=None, kin=None) -> tuple[list[PathPoint], float, float]:
     """L2, the original route: retract, traverse behind the next entry, dive in."""
     best: tuple[float, list[PathPoint], float] | None = None
     for factor in _LIFT_FACTORS:
@@ -510,8 +760,9 @@ def _two_corners(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
             margin = min(margin, found)
             seen = seen and tracker_ok
         rate_ok = same or rate <= cfg.stroke.max_rot_deg_per_mm
+        reachable = _route_allowed([retract, through], kin)
         points = [retract, through]
-        if margin > 0.0 and rate_ok and seen:
+        if margin > 0.0 and rate_ok and seen and reachable:
             return points, float(margin), 0.0
         # keep the roomiest attempt seen so far: a bigger lift is not monotonically safer,
         # because retracting away from the part can walk towards the base behind it
@@ -519,6 +770,104 @@ def _two_corners(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
             best = (float(margin), points, float(rate if not rate_ok else 0.0))
     margin, points, rate = best
     return points, margin, rate
+
+
+@dataclass
+class BranchAssignment:
+    """One joint solution per delivered point, chosen as a SEQUENCE rather than one by one.
+
+    `failed` lists the point indices the assignment could not place at all (no feasible
+    solution), and `broken` the indices where the best available sequence still exceeds
+    `max_step_deg`. They are separate because they mean different things: "the arm cannot be
+    there" is a reachability problem, "the arm cannot get there from the previous point in
+    one move" is an ordering problem.
+    """
+
+    solutions: list = field(default_factory=list)
+    failed: list[int] = field(default_factory=list)
+    broken: list[int] = field(default_factory=list)
+    max_step_deg: float = 0.0
+    max_step_at: int | None = None
+    min_margin_deg: float | None = None
+    histogram: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed and not self.broken
+
+
+def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
+                    ) -> BranchAssignment:
+    """Pick a joint branch for every delivered point so the sequence jumps as little as it can.
+
+    Picking the locally best branch at every point is the mistake this exists to prevent:
+    each point may be fine on its own while the pair is not, because a `J` move interpolates
+    in joint space. The search is a small dynamic programme - at most eight branches per
+    point, a few hundred points - minimising the total joint travel subject to a hard limit
+    on each step.
+
+    Points without any feasible solution are reported, never silently filled in with
+    something plausible.
+    """
+    if gate is None or not gate.active:
+        return BranchAssignment()
+    candidates = [gate.solutions(point.position, point.axis, point.roll_deg)
+                  for point in points]
+    if not points:
+        return BranchAssignment()
+    failed = [index for index, options in enumerate(candidates) if not options]
+    # `total[i][j]` is the cheapest joint travel that ends on option j of point i;
+    # `parent[i][j]` remembers which option of point i-1 got there.
+    total = [[0.0] * len(options) for options in candidates]
+    parent: list[list[int]] = [[0] * len(options) for options in candidates]
+    for index in range(1, len(candidates)):
+        for j, option in enumerate(candidates[index]):
+            best = (float("inf"), 0)
+            for k, previous in enumerate(candidates[index - 1]):
+                cost = total[index - 1][k] + _step_between(previous, option)
+                if cost < best[0]:
+                    best = (cost, k)
+            total[index][j] = best[0]
+            parent[index][j] = best[1]
+    choice = int(np.argmin(total[-1])) if candidates[-1] else 0
+    picked: list = [None] * len(points)
+    for index in range(len(candidates) - 1, -1, -1):
+        if not candidates[index]:
+            continue
+        picked[index] = candidates[index][choice]
+        if index > 0:
+            choice = parent[index][choice]
+
+    steps = [_step_between(picked[index - 1], picked[index])
+             for index in range(1, len(picked))]
+    broken = [index + 1 for index, step in enumerate(steps) if step > max_step_deg]
+    worst = max(steps) if steps else 0.0
+    margins = [item.min_margin_deg for item in picked if item is not None]
+    histogram: dict[str, int] = {}
+    for item in picked:
+        if item is not None:
+            key = item.config.split(",")[0].strip()
+            histogram[key] = histogram.get(key, 0) + 1
+    return BranchAssignment(
+        solutions=picked, failed=failed, broken=broken, max_step_deg=float(worst),
+        max_step_at=(int(np.argmax(steps)) + 1 if steps else None),
+        min_margin_deg=(float(min(margins)) if margins else None),
+        histogram=histogram)
+
+
+def _step_between(first, second) -> float:
+    """Largest single-axis joint change between two solutions, in degrees.
+
+    Circular: a reading of +179 and one of -181 are two degrees apart, not 360. The
+    controller takes the shortest path per axis, so the sequence has to be judged the same
+    way - otherwise a wrist sitting near the wrap is reported as a 358 degree jump and the
+    continuity constraint looks violated when it is not.
+    """
+    if first is None or second is None:
+        return 0.0
+    delta = (np.asarray(second.joints_deg, dtype=float)
+             - np.asarray(first.joints_deg, dtype=float))
+    return float(np.max(np.abs((delta + 180.0) % 360.0 - 180.0)))
 
 
 def transition_poses(plan: PathPlan, cfg: PlannerConfig) -> list[ScannerPose]:
