@@ -10,8 +10,9 @@ the *index and HEAD*, not the working tree.
 
 Why this exists at all: the customer hands over CAD of the part, the fixture and
 the base, and everything derived from it carries real dimensions and coordinates.
-That material lives under ``input/``, ``output/`` and ``reference/00_Output Collection/``
-and must never be tracked.  The source code, in contrast, is meant to be public.
+That material lives under ``input/``, ``output/``, ``reference/00_Output Collection/``
+and ``docs/superpowers/`` and must never be tracked.  The source code and the
+public documents under ``docs/``, in contrast, are meant to be public.
 """
 
 from __future__ import annotations
@@ -27,8 +28,9 @@ FORBIDDEN_SUBSTRINGS = (
     "output/",
     "00_Output Collection/",
     "spike/",
-    # design notes quote customer dimensions, so they must not be tracked either
-    "docs/",
+    # private design notes quote customer dimensions, so they must not be tracked;
+    # the rest of `docs/` is public documentation and is versioned on purpose
+    "docs/superpowers/",
 )
 
 FORBIDDEN_SUFFIXES = (
