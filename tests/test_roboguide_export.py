@@ -70,6 +70,77 @@ def test_the_uframe_default_follows_the_placement(tmp_path):
     assert "UFRAME_NUM=0 ;" in text
 
 
+def test_a_speed_without_a_known_unit_is_refused():
+    """A typo in the speed field would otherwise be written into the program."""
+    with pytest.raises(ValueError, match="speed"):
+        ls.check_speed("fast")
+    with pytest.raises(ValueError, match="positive"):
+        ls.check_speed("0%")
+    with pytest.raises(ValueError, match="100 percent"):
+        ls.check_speed("150%")
+    with pytest.raises(ValueError, match="joint move"):
+        ls.check_speed("250mm/sec", motion="J")
+    assert ls.check_speed("250mm/sec", motion="L") == "250mm/sec"
+    assert ls.check_speed("100%") == "100%"
+
+
+def test_each_point_carries_its_own_config_string(tmp_path):
+    """One CONFIG for the whole program is how every point got pinned to one branch."""
+    points = viewpoints()
+    for index, point in enumerate(points):
+        point["config"] = f"F D T, {index}, 0, 0"
+    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0")
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    for index in range(len(points)):
+        assert f"CONFIG : 'F D T, {index}, 0, 0'" in text
+    assert "CONFIG : 'N U T, 0, 0, 0'" not in text
+
+
+def test_a_point_without_a_config_falls_back_to_the_program_default(tmp_path):
+    points = viewpoints()
+    points[0]["config"] = "F D F, 0, 0, 0"
+    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0")
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert "CONFIG : 'F D F, 0, 0, 0'" in text
+    assert text.count("CONFIG : 'N U T, 0, 0, 0'") == len(points) - 1
+
+
+def test_joint_blocks_are_written_when_asked_for(tmp_path):
+    """The most direct fix for the branch problem: the controller has nothing to solve."""
+    points = viewpoints()
+    for point in points:
+        point["joints_deg"] = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0)
+    adapt.export(points, tmp_path, prog_name=PROG, joint_blocks=True, motion="L")
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert text.count("J1=") == len(points)
+    assert "X =" not in text
+    # a joint-representation point cannot be reached with an L move
+    assert text.count("J P[") == len(points)
+    assert "L P[" not in text
+
+
+def test_joint_blocks_are_ignored_without_joint_values(tmp_path):
+    adapt.export(viewpoints(), tmp_path, prog_name=PROG, joint_blocks=True)
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert "J1=" not in text
+    assert text.count("X =") == len(viewpoints())
+
+
+def test_wpr_is_unwrapped_along_the_delivered_order():
+    """Two consecutive poses must not be written 358 degrees apart."""
+    points = [
+        {"id": 1, "position": (0.0, 0.0, 300.0), "axis": (0.0, 0.0, -1.0), "roll_deg": 179.0},
+        {"id": 2, "position": (1.0, 0.0, 300.0), "axis": (0.0, 0.0, -1.0), "roll_deg": 181.0},
+    ]
+    converted = adapt.viewpoints_to_points(points)
+    first, second = (np.asarray(item["wpr_deg"], dtype=float) for item in converted)
+    assert abs(second[2] - first[2]) < 10.0
+    # the rotation is unchanged by the whole turns that were added
+    for item, source in zip(converted, points, strict=True):
+        assert np.allclose(wpr.wpr_to_rot(*item["wpr_deg"]),
+                           scanner_frame(source["axis"], source["roll_deg"]), atol=1e-9)
+
+
 def test_the_exported_frame_is_the_single_scanner_frame_definition():
     points = adapt.viewpoints_to_points(viewpoints())
     for point, vp in zip(points, viewpoints(), strict=True):

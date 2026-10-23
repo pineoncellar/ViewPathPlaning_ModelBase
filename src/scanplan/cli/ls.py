@@ -48,6 +48,9 @@ def configure(subparsers) -> None:
     exporter.add_argument("--config", help="configuration override (JSON); it is authoritative "
                                           "for motion, termination and speed when the "
                                           "viewpoint file is a stroke plan")
+    exporter.add_argument("--joint-blocks", action="store_true",
+                          help="write P[n] as joint angles where the viewpoint file has "
+                               "them; the controller then has no branch to choose")
 
 
 def run(args, parser: argparse.ArgumentParser) -> int:
@@ -117,6 +120,7 @@ def run(args, parser: argparse.ArgumentParser) -> int:
                                      else args.uframe),
                              utool=args.utool,
                              motion=motion, speed=speed, termination=termination,
+                             joint_blocks=bool(args.joint_blocks),
                              order=order)
     except ValueError as error:
         parser.error(str(error))
