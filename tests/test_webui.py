@@ -38,6 +38,19 @@ def valid_payload():
     }
 
 
+def test_the_page_defaults_come_from_the_shipped_configuration():
+    """`GET /api/config` is the single source for "which deliverable is the default"."""
+    config = scanweb._public_config()
+    assert config["delivery_mode"] == "stroke"
+    assert config["surface_bias"] == pytest.approx(0.5)
+    assert config["robot_enabled"] is False
+    assert config["motion"] in ("J", "L")
+    assert set(config["parameter_sources"]) == {
+        "stroke.min_gain_mm2_per_step", "stroke.min_stroke_mm", "stroke.seed_dirs",
+        "stroke.order_axis_weight_mm_per_deg", "stroke.parallel_weight",
+        "stroke.repair_budget_share"}
+
+
 def test_preview_registration_reports_exact_measured_transform():
     result = _preview_registration(valid_payload())
 

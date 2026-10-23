@@ -283,6 +283,29 @@ def _download_entries(prog_name: str) -> list[dict[str, str]]:
     ]
 
 
+def _public_config() -> dict:
+    """What the page is allowed to know about the shipped configuration, as defaults.
+
+    Only settings a page control can express, and the mode in the page's own vocabulary
+    (`stroke` / `pose`) rather than the config's (`path` / `lean`). Everything here is a
+    default: the page can still ask for something else, and the run reports what it used.
+    """
+    config = load_config()
+    return {
+        "delivery_mode": "pose" if config.target.delivery_mode == "lean" else "stroke",
+        "coverage_target_pct": config.target.coverage_target_pct,
+        "surface_bias": float(config.target.surface_bias),
+        "max_points": config.target.max_points,
+        "pool_mode": config.stroke.pool_mode,
+        "robot_enabled": bool(config.robot.enabled),
+        "motion": config.motion.type,
+        "termination": config.motion.termination,
+        "speed_mm_s": float(config.motion.speed_mm_s),
+        "config_source": config.source,
+        "parameter_sources": dict(config.parameter_sources),
+    }
+
+
 def _delivery_config(data: dict):
     """The configuration for one job: the shipped file plus the page's delivery mode.
 
@@ -578,6 +601,12 @@ class _Handler(BaseHTTPRequestHandler):
         if route.path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
+            return
+        if route.path == "/api/config":
+            # The page's defaults come from the configuration the server will actually use,
+            # not from a `selected` attribute in the HTML: two sources for "which deliverable"
+            # is how the screen says sweep and the run plans poses.
+            self._json_response(200, _public_config())
             return
         if route.path == "/api/viewer":
             query = parse_qs(route.query)
