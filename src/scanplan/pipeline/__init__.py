@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from ..candidates import generate
 from ..config import PlannerConfig
 from ..coverage import CoverageResult, evaluate
+from ..kinematics import KinematicGate
 from ..path import PathPlan
 from ..raycast import backend_name
 from ..report import (
@@ -129,6 +130,23 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
     return _plan_face(station, cfg, split, requested, tracker, checks, started, log)
 
 
+def _pose_tie(coverage: CoverageResult, kin) -> list[float] | None:
+    """Per-pose joint room, or None when the gate is off.
+
+    Used only to separate candidates whose covered area is equal: the choice of which of two
+    equally good poses to deliver should prefer the one further from a limit, not the one
+    that happened to be generated first.
+    """
+    if kin is None or not kin.active:
+        return None
+    values: list[float] = []
+    for pose in coverage.poses:
+        verdict = kin.check(pose.position, pose.axis, pose.roll_deg)
+        values.append(verdict.solution.j5_margin_deg
+                      if verdict.ok and verdict.solution is not None else -1e9)
+    return values
+
+
 def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: str,
                tracker: Tracker | None, checks: dict, started: float,
                log: Callable[[str], None] | None) -> PlanResult:
@@ -144,17 +162,25 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
         obstacles = station.obstacles()
         gate = lambda positions: visible_mask(tracker, positions, obstacles)  # noqa: E731
 
+    # The joint-limit gate. Off by default (`robot.enabled=false`), and when off every call
+    # below is a no-op, which is what keeps the pre-2026-10-22 result reproducible.
+    kin = KinematicGate(cfg.robot)
+    if kin.active:
+        say(f"kinematic gate on: {cfg.robot.model}, limits {kin.robot.limits_source}")
+
     say(f"generating candidates for the {face} face")
     poses = generate(target.samples.points, target.samples.normals, cfg.scanner,
                      seed=cfg.seed, log=log)
     mark = time.time()
-    coverage = evaluate(poses, target.samples, station, model, cfg, visible=gate, log=log)
+    coverage = evaluate(poses, target.samples, station, model, cfg, visible=gate,
+                        gate=kin, log=log)
     say(f"  pose coverage took {time.time() - mark:.0f} s")
     mark = time.time()
 
     pose_selection = select(coverage, coverage.area_mm2,
-                            coverage_target_pct=cfg.target.coverage_target_pct, log=log)
-    builder = _stroke_builder(cfg, target, station, model, gate)
+                            coverage_target_pct=cfg.target.coverage_target_pct,
+                            tie=(_pose_tie(coverage, kin)), log=log)
+    builder = _stroke_builder(cfg, target, station, model, gate, kin)
     if builder is None:
         say("  stroke planning is off: the delivered set is single poses")
     stroke_cov: StrokeCoverage | None = None
@@ -184,7 +210,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     state = RefineState(coverage=coverage, combined=combined, stroke_cov=stroke_cov,
                         selection=selection, selection_poses=selection_poses,
                         counters=counters)
-    refine_rounds(state, builder, target, station, model, cfg, gate, log=log)
+    refine_rounds(state, builder, target, station, model, cfg, gate, kin=kin, log=log)
     coverage, combined = state.coverage, state.combined
     stroke_cov, selection = state.stroke_cov, state.selection
     counters = state.counters
@@ -194,7 +220,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     if builder is not None and stroke_cov is not None:
         selection, path, swept_pct = _finish_stroke_plan(
             combined, coverage, stroke_cov, selection, pose_selection, target, station,
-            model, cfg, gate, log=log)
+            model, cfg, gate, kin=kin, log=log)
     counters.update({key: value for key, value in combined.counters.items()})
 
     if path is not None:
@@ -206,6 +232,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
                           target=target, coverage=combined, selection=selection,
                           viewpoints=viewpoints, tracker=tracker, checks=checks,
                           path=path, strokes=stroke_cov,
+                          kinematics=kin,
                           swept_coverage_pct=swept_pct,
                           pose_only_coverage_pct=pose_selection.coverage_pct,
                           runtime={"seconds": round(time.time() - started, 1),

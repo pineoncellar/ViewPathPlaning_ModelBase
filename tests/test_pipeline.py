@@ -51,6 +51,39 @@ def test_same_config_and_seed_give_the_same_viewpoint_set(clamped_plate, quick_c
     assert first.report["coverage_pct"] == second.report["coverage_pct"]
 
 
+def test_a_point_budget_is_respected_and_reported(clamped_plate, quick_cfg):
+    """`max_points` is a hard ceiling on delivered points, and the report says why it hit."""
+    tight = replace(quick_cfg, target=replace(quick_cfg.target, max_points=12))
+    result = plan(clamped_plate.station, tight, face="upper")
+    assert result.path is not None
+    assert result.path.turns <= 12
+    assert result.report["budget"]["verdict"] in ("target_bound", "budget_bound", "exhausted")
+    assert result.report["budget"]["delivered_points"] == result.path.turns
+    assert result.report["budget"]["trials"]          # the frontier was sampled
+
+
+def test_an_unbudgeted_run_says_so(clamped_plate, quick_cfg):
+    result = plan(clamped_plate.station, quick_cfg, face="upper")
+    assert result.report["budget"]["max_points"] is None
+    assert result.report["budget"]["verdict"] == "unbudgeted"
+
+
+def test_the_surface_profile_is_reported_with_its_sources(clamped_plate, quick_cfg):
+    result = plan(clamped_plate.station, quick_cfg, face="upper")
+    block = result.report["surface_profile"]
+    assert block["surface_bias"] == pytest.approx(0.5)
+    assert block["sources"]["stroke.min_stroke_mm"] == "base"
+    assert block["anchors"]["0.5"]["min_stroke_mm"] == pytest.approx(150.0)
+
+
+def test_the_kinematics_block_is_present_and_off_by_default(clamped_plate, quick_cfg):
+    result = plan(clamped_plate.station, quick_cfg, face="upper")
+    block = result.report["kinematics"]
+    assert block["enabled"] is False
+    assert block["points_without_solution"] == 0
+    assert result.report["evaluation"]["rejected_kinematics"] == 0
+
+
 def test_the_target_excludes_the_clamped_region_but_not_the_opposite_face(clamped_plate,
                                                                         quick_cfg):
     result = plan(clamped_plate.station, quick_cfg, face="upper")
