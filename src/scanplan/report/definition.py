@@ -15,11 +15,14 @@ from ..tracker import Tracker
 EXEMPT_REASON = "fixture_contact"
 
 SCOPE_NOTE = (
-    "Coverage is GEOMETRIC reachability only. Robot reachability, joint limits and "
-    "robot collision are NOT modelled here: they are decided later in ROBOGUIDE, so "
-    "this viewpoint set deliberately contains poses ROBOGUIDE may reject. That is "
-    "expected, not a defect - import the .LS, try another CONFIG before calling a "
-    "pose unreachable, and feed the rejected poses back."
+    "Coverage is GEOMETRIC reachability. Joint limits are screened HERE when the "
+    "`kinematics` block reports the gate as enabled - a pose the arm cannot hold is "
+    "rejected before the selection, and the delivered points are inside the configured "
+    "envelope with margin. Collision and final reachability are still decided by "
+    "ROBOGUIDE and the controller. With the gate disabled this set deliberately "
+    "contains poses the robot may reject, which is the old behaviour and not a defect: "
+    "import the .LS, try another CONFIG before calling a pose unreachable, and feed the "
+    "rejected poses back."
 )
 
 TRACKER_CAVEAT = (
