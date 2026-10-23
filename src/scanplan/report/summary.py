@@ -46,12 +46,27 @@ def summary_lines(report: dict) -> list[str]:
                      f"{strokes['swept_coverage_pct']:.2f}%")
         for violation in path.get("constraint_violations", []):
             lines.append(f"CONSTRAINT             {violation}")
+    kinematics = report.get("kinematics", {})
     lines += [
         f"ray backend            {report['runtime']['ray_backend']}",
-        "NOTE: coverage is geometric reachability only - robot reachability, joint limits "
-        "and robot collision are checked in ROBOGUIDE, and robot-arm occlusion of the "
-        "tracker is not modelled.",
+        ("NOTE: joint limits were screened here (see the kinematics block); collision and "
+         "final reachability are still decided by ROBOGUIDE and the controller, and "
+         "robot-arm occlusion of the tracker is not modelled."
+         if kinematics.get("enabled") else
+         "NOTE: coverage is geometric reachability only - robot reachability, joint limits "
+         "and robot collision are checked in ROBOGUIDE, and robot-arm occlusion of the "
+         "tracker is not modelled."),
     ]
+    if kinematics.get("enabled"):
+        lines.append(
+            f"joints                 min margin {kinematics.get('min_margin_deg')} deg, "
+            f"worst step {kinematics.get('max_step_deg')} deg "
+            f"(limit {kinematics.get('max_step_deg_limit')}), "
+            f"branches {kinematics.get('branch_histogram')}")
+    budget = report.get("budget", {})
+    if budget.get("max_points") is not None:
+        lines.append(f"budget                 {budget.get('verdict')} at "
+                     f"{budget.get('delivered_points')} of {budget['max_points']} points")
     return lines
 
 

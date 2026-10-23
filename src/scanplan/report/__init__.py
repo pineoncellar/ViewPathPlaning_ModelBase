@@ -54,6 +54,7 @@ from .definition import (
     placeholders_block,
     provenance,
 )
+from .kinematics import budget_block, kinematics_block, surface_profile_block
 from .program import program_block
 from .strokes import stroke_block, write_strokes_json
 from .summary import summary_lines, summary_text
@@ -81,6 +82,7 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
                  selection: Selection, viewpoints,
                  tracker: Tracker | None = None, checks: dict | None = None,
                  path: PathPlan | None = None, strokes: StrokeCoverage | None = None,
+                 kinematics=None,
                  swept_coverage_pct: float | None = None,
                  pose_only_coverage_pct: float | None = None,
                  runtime: dict | None = None, log=None) -> dict:
@@ -98,7 +100,10 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
         "stroke_plan": stroke_block(strokes, path, swept_coverage_pct,
                                     pose_only_coverage_pct),
         "angle_diversity": angle_diversity_block(coverage, selection.chosen, path),
+        "kinematics": kinematics_block(config, viewpoints, path, kinematics),
+        "budget": budget_block(config, path),
         "parameter_provenance": provenance(config),
+        "surface_profile": surface_profile_block(config),
         "viewpoint_records": [viewpoint.as_dict() for viewpoint in viewpoints],
         "tracker": tracker.describe() if tracker is not None else {
             "name": None, "position_mm": None,

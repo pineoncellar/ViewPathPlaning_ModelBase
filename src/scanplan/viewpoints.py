@@ -50,6 +50,13 @@ class Viewpoint:
     order: int | None = None
     stroke_id: int | None = None
     role: str = "coverage"
+    # Joint evidence, present only when the kinematic gate ran. `config` is what the `.LS`
+    # writer puts in the P[n] block; the rest is what makes it reviewable. `branch` is the
+    # N/F, U/D, T/F triple the config string starts with.
+    config: str | None = None
+    branch: str | None = None
+    joints_deg: tuple[float, ...] | None = None
+    j5_margin_deg: float | None = None
 
     def as_dict(self) -> dict:
         """A plain JSON-ready mapping under the documented field names."""
@@ -67,6 +74,12 @@ class Viewpoint:
             "max_incidence_deg": round(float(self.max_incidence_deg), 3),
             "tracker_ok": bool(self.tracker_ok),
             "source": str(self.source),
+            "config": None if self.config is None else str(self.config),
+            "branch": None if self.branch is None else str(self.branch),
+            "joints_deg": (None if self.joints_deg is None
+                           else [round(float(v), 3) for v in self.joints_deg]),
+            "j5_margin_deg": (None if self.j5_margin_deg is None
+                              else round(float(self.j5_margin_deg), 3)),
         }
 
 
@@ -106,10 +119,26 @@ def viewpoints_from_path(plan, coverage: CoverageResult,
     moves through them, so leaving them out would make the file and the record disagree
     about what the robot does. A transition corner carries no coverage of its own, and
     that is shown as zero rather than hidden.
+
+    When the kinematic gate ran, each record also carries the joint solution chosen for it
+    by `path.assign_branches`. That is where the `.LS` CONFIG string comes from - one value
+    per point, decided by the sequence rather than assumed - so the record and the program
+    cannot disagree about which branch a point belongs to.
     """
     areas = np.asarray(samples.area_mm2, dtype=float)
+    solutions = list(getattr(getattr(plan, "branches", None), "solutions", []) or [])
     records: list[Viewpoint] = []
     for order, point in enumerate(plan.points):
+        solution = solutions[order] if order < len(solutions) else None
+        extra = {
+            "config": (solution.config if solution is not None else None),
+            "branch": (solution.config.split(",")[0].strip()
+                       if solution is not None else None),
+            "joints_deg": (tuple(float(value) for value in solution.joints_deg)
+                           if solution is not None else None),
+            "j5_margin_deg": (float(solution.j5_margin_deg)
+                              if solution is not None else None),
+        }
         row = point.coverage_index
         if row is None or len(coverage.sets[row]) == 0:
             records.append(Viewpoint(
@@ -118,7 +147,7 @@ def viewpoints_from_path(plan, coverage: CoverageResult,
                 roll_deg=float(point.roll_deg), n_points=0, area_mm2=0.0,
                 mean_incidence_deg=0.0, max_incidence_deg=0.0, tracker_ok=True,
                 source=str(point.source), order=order, stroke_id=point.stroke_id,
-                role=str(point.role)))
+                role=str(point.role), **extra))
             continue
         covered = coverage.sets[row]
         angles = np.degrees(np.arccos(np.clip(coverage.quality[row], -1.0, 1.0)))
@@ -129,5 +158,5 @@ def viewpoints_from_path(plan, coverage: CoverageResult,
             mean_incidence_deg=float(angles.mean()),
             max_incidence_deg=float(angles.max()),
             tracker_ok=bool(coverage.tracker_ok[row]), source=str(point.source),
-            order=order, stroke_id=point.stroke_id, role=str(point.role)))
+            order=order, stroke_id=point.stroke_id, role=str(point.role), **extra))
     return records
