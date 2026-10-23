@@ -27,7 +27,7 @@
 | 三角网格与几何 | trimesh | 3.12.7 |
 | 空间索引与稀疏矩阵 | SciPy | 1.8.1（`cKDTree`、`csr_matrix`） |
 | 光线求交 | Embree，经 embreex | 4.4.0（可选 extra），缺失时退化到 trimesh 纯 Python |
-| 机器人运动学 | 自研解析正逆解 | 几何由 6 组实测位姿标定（≤0.02 mm / 0.002°）；默认关闭 |
+| 机器人运动学 | 自研解析正逆解 | 几何由 8 组实测位姿标定（≤0.02 mm / 0.002°，见 [robot-calibration.md](robot-calibration.md)）；默认关闭 |
 | 2D 交互点选 | Matplotlib | 3.5.3（交互后端） |
 | 3D 视图 | 手写 WebGL + 原生 JS | 单文件 `viewer.html`，无 three.js、无 CDN 依赖 |
 | 本机 Web 界面 | Python 标准库 `http.server` | `ThreadingHTTPServer`，仅监听 `127.0.0.1:8765` |
@@ -386,6 +386,6 @@ v1 行为。
 | Matplotlib 3.5.3 | 交互点选窗口老旧，且必须有图形后端 | 也用于 `reference/` 出图，升级要两边一起看 |
 | 手写 WebGL 渲染器 | 3D 视图与 Web UI 无框架、无构建，改动靠读代码 | 换来的是单文件分发、零安装 |
 | 扫描仪/跟踪器参数仍是占位值 | 覆盖率数字只能作指示性参考 | 配置内自带出处注释与两处已知偏差 |
-| 机器人段未标定 | `robot.enabled` 打开后仍是"参考可达性" | 三个现场缺口：软限位准确值、CONFIG 字母含义、ROBOGUIDE 是否用数据表限位 |
+| 机器人段未标定 | `robot.enabled` 打开后仍是"参考可达性" | 两个现场缺口：软限位准确值、ROBOGUIDE 是否用数据表限位 |
 | 私密设计笔记与 `spike/` 不入版本控制 | 设计笔记随工作副本走，换机器会丢 | 合规要求，不是疏漏；`docs/` 其余文档入库 |
 | 无库 API 稳定承诺 | 内部模块互调频繁，对外只有 CLI | 对外入口是 `scanplan` 子命令与文件契约 |

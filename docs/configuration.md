@@ -131,6 +131,8 @@ uv run scanplan plan --station input/<工位>.json \
 | `robot.max_step_deg` | `40.0` | **只报不拦**：相邻交付点的最大关节步，超限计数进报告 |
 | `robot.soft_limits_deg` / `mechanical_limits_deg` | 见文件 | 两套限位取交集，报告写明用了哪套 |
 | `robot.wrist_identified` | `true` | 关掉后禁止输出绝对关节值，门只能做分支排序 |
+| `robot.tool_xyz_mm` / `robot.tool_ypr_deg` | 见文件 | `UTOOL 1`：法兰 → 扫描头参考点。换了工具就重标，流程见 [robot-calibration.md](robot-calibration.md) |
+| `robot.base_offset_mm` / `upper_arm_mm` / `forearm_mm` / `forearm_offset_mm` / `j2_height_mm` | 见文件 | 臂几何，与图纸互证的实测值；新数据只会复现它，不会改写它 |
 
 两条要记住的语义：
 
@@ -140,8 +142,8 @@ uv run scanplan plan --station input/<工位>.json \
 
 `--joint-blocks` 让 `.LS` 的 `P[n]` 直接写关节角，**只对带 `joints_deg` 的点生效**（也就是打开
 `robot.enabled` 跑出来的视点文件），没有关节值的点仍写笛卡尔位姿。三个现场缺口（软限位准确
-值、CONFIG 字母在本工位的含义、ROBOGUIDE 是否配了数据表限位）没补齐之前，别把 `enabled`
-打开当验收用。
+值、CONFIG 圈数位的含义、ROBOGUIDE 是否配了数据表限位）没补齐之前，别把 `enabled`
+打开当验收用；`T/F` 字母已在 2026-10-23 那批 8 组数据上核对过（`T` ↔ J5 < 0）。
 
 ```bash
 uv run scanplan plan --station input/<工位>.json \
