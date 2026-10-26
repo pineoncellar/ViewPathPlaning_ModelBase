@@ -144,8 +144,8 @@ def _tessellate(shape, deflection: float) -> tuple[np.ndarray, np.ndarray]:
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.TopAbs import TopAbs_FACE
     from OCP.TopExp import TopExp_Explorer
-    from OCP.TopoDS import TopoDS
     from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
 
     BRepMesh_IncrementalMesh(shape, deflection, False, _ANGLE, True)
 

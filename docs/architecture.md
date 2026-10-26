@@ -8,7 +8,7 @@
 |---|---|---|
 | [`src/scanplan/`](../src/scanplan) | 规划器。每个模块的 docstring 写明职责与坑点。 | 是 |
 | [`src/scanview/`](../src/scanview) | 3D 视图：把一次规划结果写成单文件网页（含 `viewer.html` 渲染器与逐点覆盖关系）。与规划算法解耦，只读取 `scanplan` 的扫描头坐标系与视场定义。 | 是 |
-| [`src/scanweb/`](../src/scanweb) | 本机浏览器工位界面：`scanplan web` 启动的 HTTP 服务与 `index.html`。只调用 `scanplan` 的公开入口（`plan` / `write_outputs` / 配准 / 导出），页面随包分发。 | 是 |
+| [`src/scanweb/`](../src/scanweb) | 本机浏览器工位界面：`scanplan web` 启动的 HTTP 服务、页面资产（`index.html` / `app.css` / `app.js`）、CAD 导入转换（`cad_import.py`）与项目历史库（SQLite）。只调用 `scanplan` 的公开入口（`plan` / `write_outputs` / 配准 / 导出），页面随包分发。 | 是 |
 | [`configs/`](../configs) | 配置，含扫描仪参数。 | 是 |
 | [`tests/`](../tests) | 测试。夹具数据全部是**合成**的，不含客户几何。 | 是 |
 | [`scripts/`](../scripts) | 仓库工具，含数据合规自检。 | 是 |

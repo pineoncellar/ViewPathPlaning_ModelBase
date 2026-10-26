@@ -90,10 +90,11 @@ uv run scanplan plan --station input/<工位>.json --face auto --out output/<零
 `matplotlib` 只在执行 `pick-datums` 时才会被 import，所以没有图形后端的环境照样能跑 `plan`；
 交互点选窗口才需要它。
 
-### 3.2 可选加速：embree
+### 3.2 可选 extras：embree 与 CAD 导入
 
 ```toml
 embree = ["rtree==1.0.0", "embreex==4.4.0", "setuptools<70"]
+cad = ["cadquery-ocp>=7.7"]
 ```
 
 - 装了 Embree，光线求交快约**三个数量级**；没装，规划器照样能跑，只是真实零件基本等不起。
@@ -103,6 +104,9 @@ embree = ["rtree==1.0.0", "embreex==4.4.0", "setuptools<70"]
   因为两者耗时不可比。
 - 一个踩过的坑写在 `raycast.py` 里：`import trimesh` 会顺带 import `trimesh.ray`，把"Embree
   加载失败"缓存成一个异常模块，之后即使补装了也不生效（实测慢 1600 倍）。
+- `cad` 只有网页端的 CAD 导入用：`scanweb/cad_import.py` 拿它在服务端把 STEP / IGES / BREP
+  三角化成 STL（做法沿用 `reference/IGES_to_STL.py`）。OpenCASCADE 连带 VTK、体积很大，
+  而规划本身一次都不会 import 它；没装时网页端只接受 STL / OBJ / PLY / OFF / 3MF / GLB。
 
 ### 3.3 为冻结基线保留的依赖
 
@@ -120,8 +124,9 @@ embree = ["rtree==1.0.0", "embreex==4.4.0", "setuptools<70"]
 ### 3.4 不在 pyproject 里的依赖
 
 `reference/IGES_to_STL.py`（IGES 转网格）用到 `cadquery-ocp`（`OCP.*`）、`gmsh`、
-`fast_simplification`，这些**没有写进 `pyproject.toml`**，因为主包不 import 它们。官方跑法是用
-独立环境，避免污染主环境：
+`fast_simplification`。`cadquery-ocp` 现在已经作为可选 extra `cad` 写进 `pyproject.toml`
+（见 3.2，网页端 CAD 导入需要它）；`gmsh` 与 `fast_simplification` **没有**写进去，因为主包
+不 import 它们。冻结基线仍建议用独立环境跑，避免污染主环境：
 
 ```bash
 uv run --no-project --python 3.11 \
@@ -341,8 +346,9 @@ v1 行为。
 
 ### 9.4 CAD 交付
 
-- `trimesh` 读不了 IGES，也读不了 NX `.prt`，所以数模交接必须先转 STL（OpenCASCADE 或 gmsh，
-  见 3.4）。
+- `trimesh` 读不了 IGES，也读不了 NX `.prt`。命令行流程仍要求先转 STL（OpenCASCADE 或
+  gmsh，见 3.4）；浏览器界面装了可选 extra `cad` 后可以直接导入 STEP / IGES / BREP，由服务端
+  三角化（见[网页界面](web-ui.md)）。
 - 逐个文件导出的 IGES 会丢装配位姿，因此 `scene.py` 有一个显式、带自检的对齐步骤：读工位文件里
   的 4×4 变换把零件与夹具摆回底座坐标系，再跑一遍自检（包围盒、最小间距、穿透、接触面积），
   不盲信文件。

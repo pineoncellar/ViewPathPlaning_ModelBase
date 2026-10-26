@@ -104,7 +104,7 @@ uv run scanplan web                 # 浏览器工位界面，默认 http://127.
 | [docs/configuration.md](docs/configuration.md) | 参数四档出处、`surface_bias` 派生、`robot` 段、扫描带三道门、`pool_mode`。 |
 | [docs/validation.md](docs/validation.md) | 验证主表、抽样波动的论证、已知局限。 |
 | [docs/stroke-history.md](docs/stroke-history.md) | 记账缺陷、点数骤减四轮表、取舍记录。 |
-| [docs/web-ui.md](docs/web-ui.md) | 浏览器工位界面完整流程。 |
+| [docs/web-ui.md](docs/web-ui.md) | 浏览器工位界面：完整流程、CAD 导入、项目历史、局域网访问。 |
 | [docs/viewer.md](docs/viewer.md) | 3D 视图的图层、回放与查询。 |
 | [docs/prior-work.md](docs/prior-work.md) | 原项目 vs 本仓库对比表与致谢。 |
 | [docs/tech-stack.md](docs/tech-stack.md) | 全项目技术栈。 |

@@ -12,6 +12,30 @@ wheels = [
 ]
 
 [[package]]
+name = "cadquery-ocp"
+version = "7.9.3.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cadquery-ocp-proxy" },
+    { name = "vtk" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/35/b4f7c77af6c5a3d193a1c42872e243a523378a1b8df7af89662402e8f1e8/cadquery_ocp-7.9.3.1.1-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:c7b2f64b8e5168cdfb7dbf6258d4c5a5389c793b1948df1861b587824f3b8ee3", size = 62040609 },
+    { url = "https://files.pythonhosted.org/packages/d4/67/ed4d9d7c06d40fe68baaae888c1efb54be0ed3c4d97e96e7e3b124b5b5a9/cadquery_ocp-7.9.3.1.1-cp310-cp310-macosx_11_0_x86_64.whl", hash = "sha256:cf284122599f6540689bbaea7bc56b83b7196ab9a28e821d19de6fae748738c1", size = 66675405 },
+    { url = "https://files.pythonhosted.org/packages/de/54/f27fc47949382c6202db8fe640369759872a8d51c81232b26fa3cdedaa0f/cadquery_ocp-7.9.3.1.1-cp310-cp310-manylinux_2_31_aarch64.whl", hash = "sha256:1b71ed845ff2c2e8994c01b4807ac9d3b46e2529c1c1d45468e28dd52f00d4cb", size = 62441856 },
+    { url = "https://files.pythonhosted.org/packages/98/18/2c93d5310838ae47e839479dd1b33742458972960df77bd4d2828bc7fa32/cadquery_ocp-7.9.3.1.1-cp310-cp310-manylinux_2_31_x86_64.whl", hash = "sha256:0a0137229929e50b59b28606b2958e68f50bdad2595a3987093c85a9a457286c", size = 67911372 },
+    { url = "https://files.pythonhosted.org/packages/05/ff/b43cddb85acb89ce0836fd278d9aa4334cf0cad03f6ad721f60c2f54d0b1/cadquery_ocp-7.9.3.1.1-cp310-cp310-win_amd64.whl", hash = "sha256:b52931a6786f9a1949bcac7ef49c8a83426c4198d6847cd13a8cc40795207e09", size = 46299225 },
+]
+
+[[package]]
+name = "cadquery-ocp-proxy"
+version = "7.9.3.1.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/30/c0/04e9363a99fee892de2776820e3dcf04f8825b6edc9580efe3416c9465a7/cadquery_ocp_proxy-7.9.3.1.1-py3-none-any.whl", hash = "sha256:ca4164ec4b54956d9fc3e68c67d555b5486cb963c2f71e18df005ba16b921c91", size = 3322 },
+]
+
+[[package]]
 name = "cloudpickle"
 version = "3.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -489,6 +513,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+cad = [
+    { name = "cadquery-ocp" },
+]
 dev = [
     { name = "pytest" },
     { name = "ruff" },
@@ -501,6 +528,7 @@ embree = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cadquery-ocp", marker = "extra == 'cad'", specifier = ">=7.7" },
     { name = "embreex", marker = "extra == 'embree'", specifier = "==4.4.0" },
     { name = "glfw", specifier = "==2.5.3" },
     { name = "matplotlib", specifier = "==3.5.3" },
@@ -517,4 +545,19 @@ requires-dist = [
     { name = "setuptools", marker = "extra == 'embree'", specifier = "<70" },
     { name = "trimesh", specifier = "==3.12.7" },
 ]
-provides-extras = ["embree", "dev"]
+provides-extras = ["embree", "cad", "dev"]
+
+[[package]]
+name = "vtk"
+version = "9.6.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ff/3f/f4d0cbc05c1a494b2cf590135949f44fde97f0e7470bc5df20c9f8a3da61/vtk-9.6.2-cp310-cp310-macosx_10_10_x86_64.whl", hash = "sha256:8ed0c1e329fd857c696c44609df7be952fcb08c69e30c94e025fbcef712480ee", size = 114703522 },
+    { url = "https://files.pythonhosted.org/packages/41/e3/47546c2baf31e31d6039866948f6d4f2aae636e06f16c8cccd2ba0fc11fa/vtk-9.6.2-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:809065272b207439f13ef0f62767f9041b4c6d61dd4dc2f60a1a62201843dc4b", size = 106906792 },
+    { url = "https://files.pythonhosted.org/packages/8a/55/c28d4070cca9923c419be191ca6d4b444bc030a992b38243bf6d114042d0/vtk-9.6.2-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:9a0df4ed93b6ae7f05cb6cee9d80566f4c06c6b4ce9116ee406445703c379ef7", size = 145981000 },
+    { url = "https://files.pythonhosted.org/packages/dd/2f/320ae500942ffbf8c19205e3f98797a575db8e8b0e7815abf17601423a53/vtk-9.6.2-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:3cde8ba867cce14fdce8d8ec7bdef36a328cbd126433490109eccc586e489916", size = 135731415 },
+    { url = "https://files.pythonhosted.org/packages/c3/58/eb6c9788ec15b30a3e3e0885b92b5fa1f9dc6e619460020c707828a83ade/vtk-9.6.2-cp310-cp310-win_amd64.whl", hash = "sha256:9b55baa61beafc00d68b571ef07b71e2343a02200f089f07b6a40c3ebe01844a", size = 81289717 },
+]
