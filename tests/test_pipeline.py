@@ -51,6 +51,34 @@ def test_same_config_and_seed_give_the_same_viewpoint_set(clamped_plate, quick_c
     assert first.report["coverage_pct"] == second.report["coverage_pct"]
 
 
+def test_progress_reports_the_real_stages_and_never_rewinds(clamped_plate, quick_cfg):
+    """The bar is driven by the pipeline's own stages, not by a guessed time curve."""
+    events: list[tuple[str, float, str]] = []
+
+    def hook(stage: str, fraction: float, detail: str = "") -> None:
+        events.append((stage, fraction, detail))
+
+    plan(clamped_plate.station, quick_cfg, face="upper", progress=hook)
+
+    assert events, "a run with a hook must report something"
+    stages = {stage for stage, _fraction, _detail in events}
+    assert {"segmentation", "candidates", "occlusion", "report"} <= stages
+    fractions = [fraction for _stage, fraction, _detail in events]
+    assert fractions == sorted(fractions), "the bar must not rewind"
+    assert all(0.0 <= fraction <= 1.0 for fraction in fractions)
+    assert fractions[0] < fractions[-1] == pytest.approx(1.0)
+
+
+def test_a_run_without_a_hook_is_unchanged(clamped_plate, quick_cfg):
+    """The CLI and the scripts pass no hook; adding progress must not move a number."""
+    silent = plan(clamped_plate.station, quick_cfg, face="upper")
+    listened = plan(clamped_plate.station, quick_cfg, face="upper",
+                    progress=lambda stage, fraction, detail="": None)
+    assert [tuple(viewpoint.position) for viewpoint in silent.viewpoints] \
+        == [tuple(viewpoint.position) for viewpoint in listened.viewpoints]
+    assert silent.report["coverage_pct"] == listened.report["coverage_pct"]
+
+
 def test_a_point_budget_is_respected_and_reported(clamped_plate, quick_cfg):
     """`max_points` is a hard ceiling on delivered points, and the report says why it hit."""
     tight = replace(quick_cfg, target=replace(quick_cfg.target, max_points=12))

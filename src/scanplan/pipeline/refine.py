@@ -37,10 +37,16 @@ class RefineState:
 
 def refine_rounds(state: RefineState, builder: StrokeBuilder | None, target: TargetSet,
                   station: Station, model: ScannerModel, cfg: PlannerConfig, gate,
-                  *, kin=None, log=None) -> None:
+                  *, kin=None, log=None, progress=None) -> None:
     """Run up to `cfg.scanner.refine_rounds` rounds against `state`, in place."""
     say = log or (lambda _message: None)
+    rounds = max(int(cfg.scanner.refine_rounds), 1)
     for round_index in range(cfg.scanner.refine_rounds):
+        # Each round gets its own slice of the refine band, so a run that refines twice
+        # still shows movement instead of sitting on one number until the report starts.
+        round_rep = (progress.band("strokes", round_index / rounds,
+                                   (round_index + 1) / rounds)
+                     if progress is not None else None)
         if (cfg.target.coverage_target_pct is not None
                 and state.selection.coverage_pct + 1e-9 >= cfg.target.coverage_target_pct):
             # Refinement re-aims at everything still uncovered, and at a target there is
@@ -61,24 +67,40 @@ def refine_rounds(state: RefineState, builder: StrokeBuilder | None, target: Tar
         say(f"refinement round {round_index + 1}: {len(leftover)} uncovered samples "
             f"({int((~reachable[leftover]).sum())} of them out of the pool's reach)")
         ceiling_before = state.combined.pool_reach_pct
+        if round_rep is not None:
+            round_rep(0.05, f"refinement round {round_index + 1}: aiming at the leaks")
         extra = refine(target.samples.points[leftover], target.samples.normals[leftover],
-                       cfg.scanner, seed=cfg.seed + round_index, log=log)
+                       cfg.scanner, seed=cfg.seed + round_index, log=log,
+                       progress=round_rep.band("strokes", 0.0, 0.25).tick("aims")
+                       if round_rep is not None else None)
         if not extra:
             break
         state.counters["refine_rounds"] = round_index + 1
         state.counters["refine_candidates"] += len(extra)
+        if round_rep is not None:
+            round_rep(0.3, f"refinement round {round_index + 1}: {len(extra)} new candidates")
         state.coverage = merge(
             state.coverage,
             evaluate(extra, target.samples, station, model, cfg, visible=gate,
-                     gate=kin, log=log))
+                     gate=kin, log=log,
+                     progress=round_rep.band("strokes", 0.25, 0.60).tick("poses")
+                     if round_rep is not None else None))
         if builder is not None:
             # Re-grow on the enlarged pool: the design's refinement is not "add poses",
             # it is "the candidate generator was not good enough here".
+            recheck = round_rep.band("strokes", 0.60, 0.95) if round_rep is not None else None
+            if recheck is not None:
+                recheck(0.0, f"refinement round {round_index + 1}: re-growing strokes")
             state.stroke_cov = merge_stroke_coverage(state.stroke_cov, builder.evaluate(
                 builder.generate(target.samples.points[leftover],
                                  target.samples.normals[leftover],
                                  aim_grid_mm=cfg.scanner.refine_aim_grid_mm,
-                                 seed_offset=len(state.coverage.poses), log=log), log=log))
+                                 seed_offset=len(state.coverage.poses), log=log,
+                                 progress=recheck.band("strokes", 0.0, 0.5).tick("seeds")
+                                 if recheck is not None else None),
+                log=log,
+                progress=recheck.band("strokes", 0.5, 1.0).tick("strokes")
+                if recheck is not None else None))
             state.combined = combine(state.coverage, state.stroke_cov)
             # The refinement re-selects, so it has to price the same preference the first
             # selection did: the joint-room tie-break and the skeleton weight are part of
@@ -107,6 +129,13 @@ def refine_rounds(state: RefineState, builder: StrokeBuilder | None, target: Tar
             say("  refinement gained nothing: the remaining misses are not a candidate "
                 "density problem")
             break
+        if round_rep is not None:
+            round_rep(1.0, f"refinement round {round_index + 1} done: "
+                           f"{state.selection.coverage_pct:.2f}%")
+    if progress is not None:
+        # Close the band even when every round was skipped: a bar that stops at the
+        # selection and then jumps to the report looks like a stall that never happened.
+        progress(1.0, "refinement settled")
 
 
 def _shift_rows(selection: Selection, old_poses: int, new_poses: int) -> Selection:

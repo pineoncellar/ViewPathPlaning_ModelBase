@@ -90,6 +90,7 @@ def dedupe(poses) -> list[ScannerPose]:
 
 def generate(points, normals, params: ScannerParams, *, seed: int,
              aim_grid_mm: float | None = None, max_candidates: int | None = None,
+             progress: Callable[[int, int], None] | None = None,
              log: Callable[[str], None] | None = None) -> list[ScannerPose]:
     """Build the candidate pool: a ladder on every aim cell of the target."""
     say = log or (lambda _message: None)
@@ -103,8 +104,10 @@ def generate(points, normals, params: ScannerParams, *, seed: int,
     grid = float(params.aim_grid_mm if aim_grid_mm is None else aim_grid_mm)
     aims = aim_indices(points, grid)
     pool: list[ScannerPose] = []
-    for index in aims:
+    for done, index in enumerate(aims):
         pool.extend(ladder(points[index], normals[index], params))
+        if progress is not None:
+            progress(done + 1, len(aims))
     pool = dedupe(pool)
 
     limit = int(params.max_candidates if max_candidates is None else max_candidates)
@@ -119,6 +122,7 @@ def generate(points, normals, params: ScannerParams, *, seed: int,
 
 def refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
            max_candidates: int | None = None,
+           progress: Callable[[int, int], None] | None = None,
            log: Callable[[str], None] | None = None) -> list[ScannerPose]:
     """Aim a new ladder at what is still uncovered, on a finer grid than the face.
 
@@ -138,8 +142,10 @@ def refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
 
     aims = aim_indices(leak_points, params.refine_aim_grid_mm)
     pool: list[ScannerPose] = []
-    for index in aims:
+    for done, index in enumerate(aims):
         pool.extend(ladder(leak_points[index], leak_normals[index], params))
+        if progress is not None:
+            progress(done + 1, len(aims))
     pool = dedupe(pool)
     limit = int(params.max_candidates if max_candidates is None else max_candidates)
     if len(pool) > limit:
