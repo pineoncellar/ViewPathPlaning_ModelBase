@@ -32,6 +32,11 @@ embree = [
     # shipping in version 70.
     "setuptools<70",
 ]
+# STEP / IGES import for the browser UI.  OpenCASCADE is heavy (it also pulls
+# VTK), so it stays an optional extra; planning itself never needs it.
+cad = [
+    "cadquery-ocp>=7.7",
+]
 dev = [
     "pytest>=7",
     "ruff>=0.1",
