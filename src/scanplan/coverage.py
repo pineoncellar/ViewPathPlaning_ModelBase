@@ -97,6 +97,7 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
              visible: Callable[[np.ndarray], np.ndarray] | None = None,
              obstacles: dict | None = None,
              gate=None,
+             progress: Callable[[int, int], None] | None = None,
              log: Callable[[str], None] | None = None) -> CoverageResult:
     """Evaluate every pose against the target samples, returning sparse coverage sets.
 
@@ -109,6 +110,9 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
     covers less, it is a pose that cannot be commanded, so it must not enter the selection
     and then be discovered at export time. Rejecting it here is what makes the reported
     coverage and the program agree.
+
+    `progress(done, total)` is the optional per-candidate tick; this loop is the run's hot
+    spot, so a caller that wants a truthful progress bar needs to hear from it.
     """
     say = log or (lambda _message: None)
     points = np.asarray(samples.points, dtype=float).reshape(-1, 3)
@@ -142,6 +146,8 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
         if rejected is not None:
             sets.append(np.zeros(0, dtype=np.int64))
             quality.append(np.zeros(0))
+            if progress is not None:
+                progress(index + 1, len(poses))
             continue
 
         mask = measure_mask(model, pose, points, normals, casters,
@@ -152,6 +158,8 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
             counters["rejected_no_points"] += 1
             sets.append(chosen)
             quality.append(np.zeros(0))
+            if progress is not None:
+                progress(index + 1, len(poses))
             continue
 
         offset = points[chosen] - np.asarray(pose.position, dtype=float)
@@ -160,6 +168,8 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
                                      normals[chosen])
         sets.append(chosen)
         quality.append(cosines)
+        if progress is not None:
+            progress(index + 1, len(poses))
 
     say(f"  evaluated {len(poses)} candidates: {counters}")
     return CoverageResult(poses=list(poses), sets=sets, quality=quality,

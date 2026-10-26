@@ -21,7 +21,8 @@ const state = {
   solving: false,
   result: null,
   resultSource: null,
-  showPath: true
+  showPath: true,
+  relocate: { busy: false, token: 0 }
 };
 
 let registrationTimer = 0;
@@ -735,6 +736,7 @@ function renderDatumRows() {
       input.placeholder = "mm";
       input.addEventListener("input", () => {
         state.measured[index][axis] = input.value;
+        mirrorDatumInput("relocateRows", index, axis, input.value);
         state.registration = null;
         updateSolveAvailability();
         scheduleRegistrationCheck();
@@ -844,6 +846,7 @@ function updateSolveAvailability() {
     && !state.solving;
   $("solveButton").disabled = !ready;
   updateWorkflow();
+  updateRelocateAvailability();
 }
 
 function updateWorkflow() {
@@ -928,10 +931,20 @@ async function checkRegistration() {
       ok ? "ok" : "bad"
     );
     updateSolveAvailability();
+    updateRelocateResiduals();
+    if (state.result) {
+      setRelocateStatus(
+        ok
+          ? "新坐标已校核：最大残差 " + body.result.max_error_mm.toFixed(3) + " mm，可点「按新坐标重新定位路径」变换路径。"
+          : "新坐标超出限值（最大残差 " + body.result.max_error_mm.toFixed(3) + " mm），请核对点位或放宽限值。",
+        ok ? "ok" : "bad"
+      );
+    }
   } catch (error) {
     if (request !== registrationRequest) return;
     state.registration = null;
     updateSolveAvailability();
+    updateRelocateResiduals();
     setRegistrationStatus(error.message, "bad");
   }
 }
@@ -988,15 +1001,57 @@ function postJsonWithUpload(url, body, handlers = {}) {
 
 /* ---------- planning progress bar ---------- */
 
-// 每个阶段的天花板百分比：阶段标签跟着进度走，进度由真实上传字节数和服务端估算时间共同驱动。
+function newProgressToken() {
+  const raw = window.crypto && window.crypto.randomUUID
+    ? window.crypto.randomUUID()
+    : String(Date.now()) + Math.random().toString(16).slice(2);
+  return raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40) || "job";
+}
+
+// 规划是一个同步请求，服务端把阶段写进 /api/progress，页面在这里轮询它的快照。
+// 返回停止函数；轮询本身是可选的，失败不影响任何结果。
+function pollProgress(token, onUpdate) {
+  let stopped = false;
+  let timer = 0;
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const response = await fetch("/api/progress?id=" + encodeURIComponent(token),
+        { cache: "no-store" });
+      if (response.ok) {
+        const data = await response.json();
+        if (!stopped && data && data.ok && data.progress) onUpdate(data.progress);
+      }
+    } catch (_error) {
+      /* 进度只是展示，断一次不影响服务端 */
+    }
+    if (!stopped) timer = window.setTimeout(tick, 400);
+  };
+  tick();
+  return () => {
+    stopped = true;
+    window.clearTimeout(timer);
+  };
+}
+
+// 阶段顺序与服务端上报的 stage 键一一对应：进度条走到哪一步由真实的阶段决定，
+// 不再用时间曲线去猜。上传阶段的百分比仍来自真实上传字节。
 const PLAN_STAGES = [
-  { key: "upload", label: "上传模型", ceiling: 22 },
-  { key: "registration", label: "坐标配准", ceiling: 40 },
-  { key: "segmentation", label: "目标面分割", ceiling: 58 },
-  { key: "candidates", label: "候选视点", ceiling: 76 },
-  { key: "occlusion", label: "遮挡计算", ceiling: 92 },
-  { key: "export", label: "交付文件导出", ceiling: 99 }
+  { key: "upload", label: "上传模型" },
+  { key: "registration", label: "坐标配准" },
+  { key: "segmentation", label: "目标面分割" },
+  { key: "candidates", label: "候选视点" },
+  { key: "occlusion", label: "遮挡计算" },
+  { key: "strokes", label: "扫描带规划" },
+  { key: "report", label: "报告生成" },
+  { key: "export", label: "交付文件导出" }
 ];
+// 上传占 0–15%，服务端自己的 0–100% 线性映射到 15–99%。
+const UPLOAD_CEILING = 15;
+const SOLVE_FLOOR = 15;
+const SOLVE_CEILING = 99;
+// 服务端超过这么久没有新阶段，说明可能是旧版本或某个阶段确实很慢：只允许缓慢爬升到 90%。
+const PROGRESS_STALE_MS = 8000;
 
 const planProgress = {
   timer: 0,
@@ -1004,6 +1059,9 @@ const planProgress = {
   stage: 0,
   uploadRatio: 0,
   solveStart: 0,
+  serverAt: 0,
+  serverDetail: "",
+  stopPolling: null,
 
   start() {
     this.stop();
@@ -1011,13 +1069,15 @@ const planProgress = {
     this.stage = -1;
     this.uploadRatio = 0;
     this.solveStart = 0;
+    this.serverAt = 0;
+    this.serverDetail = "";
     const node = $("planProgress");
     if (!node) return;
     node.classList.remove("is-done", "is-failed");
     document.querySelectorAll("#progressSteps li").forEach((item) => {
       item.classList.remove("done", "active");
     });
-    $("progressCaption").textContent = "GEOMETRY ANALYSIS IN PROGRESS";
+    this.caption("", 0);
     this.markStage(0);
     this.render();
     this.timer = window.setInterval(() => this.tick(), 140);
@@ -1026,6 +1086,37 @@ const planProgress = {
   stop() {
     if (this.timer) window.clearInterval(this.timer);
     this.timer = 0;
+    if (this.stopPolling) {
+      this.stopPolling();
+      this.stopPolling = null;
+    }
+  },
+
+  caption(detail, elapsedSeconds) {
+    const node = $("progressCaption");
+    if (!node) return;
+    const text = detail ? String(detail).toUpperCase() : "GEOMETRY ANALYSIS IN PROGRESS";
+    node.textContent = text + (elapsedSeconds > 0
+      ? " · " + Math.round(elapsedSeconds) + " S"
+      : "");
+  },
+
+  // 服务端阶段快照：百分比直接采用，只有阶段键不在表里（done/failed）时才保持原位。
+  applyServer(progress) {
+    if (!progress) return;
+    this.serverAt = Date.now();
+    this.serverDetail = progress.detail || "";
+    const pct = Number(progress.pct);
+    if (Number.isFinite(pct)) {
+      const mapped = SOLVE_FLOOR
+        + (SOLVE_CEILING - SOLVE_FLOOR) * Math.max(0, Math.min(100, pct)) / 100;
+      this.value = Math.max(this.value, Math.min(SOLVE_CEILING, mapped));
+    }
+    const index = PLAN_STAGES.findIndex((stage) => stage.key === progress.stage);
+    if (index >= 0) this.markStage(index);
+    else this.markStage(PLAN_STAGES.length - 1);
+    this.caption(this.serverDetail, Number(progress.elapsed_s) || 0);
+    this.render();
   },
 
   markStage(index) {
@@ -1051,17 +1142,19 @@ const planProgress = {
 
   tick() {
     if (this.solveStart) {
-      // 服务端阶段无法逐个回报，用带渐近上限的估算曲线：约 26 s 走一半，越接近完成越慢。
       const seconds = (Date.now() - this.solveStart) / 1000;
-      const estimate = 24 + 75 * (1 - Math.exp(-seconds / 26));
-      this.value = Math.max(this.value, Math.min(99, estimate));
+      const fresh = this.serverAt && Date.now() - this.serverAt < PROGRESS_STALE_MS;
+      if (!fresh) {
+        // 没有阶段回报时不假装知道进度：只缓慢爬升到 90%，绝不提前冲到 99%。
+        const estimate = SOLVE_FLOOR + 75 * (1 - Math.exp(-seconds / 120));
+        this.value = Math.max(this.value, Math.min(90, estimate));
+      }
+      this.caption(this.serverDetail, seconds);
     } else {
       // 上传阶段：真实上传字节比为主，读文件 / 转 base64 时缓慢爬升。
-      const estimate = Math.min(PLAN_STAGES[0].ceiling, 2 + this.uploadRatio * 20);
-      this.value = Math.max(this.value + 0.15, estimate);
+      const estimate = Math.min(UPLOAD_CEILING, 1 + this.uploadRatio * (UPLOAD_CEILING - 1));
+      this.value = Math.max(this.value + 0.1, estimate);
     }
-    const index = PLAN_STAGES.findIndex((stage) => this.value < stage.ceiling);
-    this.markStage(index === -1 ? PLAN_STAGES.length - 1 : index);
     this.render();
   },
 
@@ -1069,15 +1162,19 @@ const planProgress = {
     if (!Number.isFinite(ratio)) return;
     this.uploadRatio = Math.max(this.uploadRatio, Math.min(1, ratio));
     if (!this.solveStart) {
-      this.value = Math.max(this.value, Math.min(PLAN_STAGES[0].ceiling, 2 + this.uploadRatio * 20));
+      this.value = Math.max(this.value,
+        Math.min(UPLOAD_CEILING, 1 + this.uploadRatio * (UPLOAD_CEILING - 1)));
       this.render();
     }
   },
 
-  beginSolve() {
+  beginSolve(token) {
     this.solveStart = this.solveStart || Date.now();
-    this.value = Math.max(this.value, 24);
+    this.value = Math.max(this.value, SOLVE_FLOOR);
     this.render();
+    if (token && !this.stopPolling) {
+      this.stopPolling = pollProgress(token, (progress) => this.applyServer(progress));
+    }
   },
 
   complete() {
@@ -1119,6 +1216,7 @@ async function solve() {
   }
   state.solving = true;
   state.result = null;
+  renderRelocatePanel(null);
   $("formFeedback").textContent = "";
   $("showPath").checked = false;
   $("showPath").disabled = true;
@@ -1131,9 +1229,12 @@ async function solve() {
   $("progressMessage").textContent = "正在执行配准、目标面分割、候选视点与遮挡计算。零件复杂时可能需要几分钟，请勿关闭页面。";
   try {
     await prepareMeshPayload();
-    const body = await postJsonWithUpload("/api/solve", payload(true), {
+    const token = newProgressToken();
+    const requestBody = payload(true);
+    requestBody.progress_id = token;
+    const body = await postJsonWithUpload("/api/solve", requestBody, {
       onUpload: (ratio) => planProgress.setUploadRatio(ratio),
-      onUploaded: () => planProgress.beginSolve()
+      onUploaded: () => planProgress.beginSolve(token)
     });
     planProgress.complete();
     state.result = body.result;
@@ -1142,6 +1243,7 @@ async function solve() {
     $("showPath").checked = true;
     $("showPath").disabled = false;
     buildPathBuffers();
+    syncSetupFromResult(body.result);
     renderResult(body.result);
     await delay(520);
     showResultState("result");
@@ -1219,6 +1321,10 @@ function renderResult(result) {
     ["扫描面外法向（整车）", "[" + result.scan_face_axis_vehicle.map((value) => Number(value).toFixed(3)).join(", ") + "]"],
     ["目标面面积", (Number(result.target_face_mm2) / 1e6).toFixed(4) + " m²"],
     ["配准 RMS / 最大误差", result.registration_rms_error_mm.toFixed(3) + " / " + result.registration_max_error_mm.toFixed(3) + " mm"],
+    ...(result.relocalised
+      ? [["定位方式", "自 " + result.relocated_from + " 变换 "
+          + Number(result.shift_mm || 0).toFixed(2) + " mm（未重新规划）"]]
+      : []),
     ["底座", result.base_supplied ? "已导入" : "未导入 · 已自动生成参考板"],
     ["未覆盖原因", reasons],
     ["输出目录", result.output_dir]
@@ -1254,6 +1360,263 @@ function renderResult(result) {
   $("openViewer").disabled = false;
   $("downloadReport").dataset.url = "/api/file?run_id=" + encodeURIComponent(result.run_id) + "&name=planning_report.html";
   $("downloadReport").disabled = false;
+  renderRelocatePanel(result);
+}
+
+/* ---------- re-localisation after a plan ---------- */
+
+// The page keeps one datum state: the step-02 table and the result panel's review
+// table read and write the same rows, so editing either one cannot leave the other
+// showing coordinates the next run will not use.
+function mirrorDatumInput(containerId, index, axis, value) {
+  const target = document.querySelector(
+    "#" + containerId + ' input[data-measure="' + index + '"][data-axis="' + axis + '"]'
+  );
+  if (target && target.value !== value) target.value = value;
+}
+
+function axisFromVector(vector) {
+  const direction = unit(vector.map(Number));
+  let best = null;
+  let score = -Infinity;
+  for (const axis of Object.keys(SIDE_VECTORS)) {
+    const value = dot(direction, SIDE_VECTORS[axis]);
+    if (value > score) {
+      score = value;
+      best = axis;
+    }
+  }
+  return best;
+}
+
+// Restore what a completed run actually used, so its datum points can be corrected
+// afterwards instead of starting over from an empty table.
+function syncSetupFromResult(result) {
+  const cad = result && result.cad_points_vehicle_mm;
+  const measured = result && result.measured_points_mm;
+  if (!Array.isArray(cad) || !cad.length
+    || !Array.isArray(measured) || measured.length !== cad.length) {
+    return false;
+  }
+  state.pointCount = Math.min(cad.length, 4);
+  state.picked = cad.map((point) => point.map((value) => round(Number(value))));
+  const sameAsTyped = measured.every((point, index) => point.every((value, axis) => {
+    const typed = state.measured[index] && state.measured[index][axis];
+    return typed !== "" && Number.isFinite(Number(typed))
+      && Math.abs(Number(typed) - Number(value)) < 1e-6;
+  }));
+  if (!sameAsTyped) {
+    state.measured = Array.from({ length: 4 }, () => ["", "", ""]);
+    measured.forEach((point, index) => {
+      state.measured[index] = point.map((value) => String(round(Number(value))));
+    });
+  }
+  state.registration = {
+    measured_frame: result.measured_frame,
+    rms_error_mm: Number(result.registration_rms_error_mm) || 0,
+    max_error_mm: Number(result.registration_max_error_mm) || 0,
+    point_errors_mm: Array.isArray(result.point_errors_mm) ? result.point_errors_mm : [],
+    translation_vehicle_origin_in_measured_mm: []
+  };
+  if (result.program_name) $("progName").value = result.program_name;
+  if (result.delivery_mode) $("scanMode").value = result.delivery_mode;
+  if (Number.isFinite(Number(result.uframe))) {
+    $("measureFrame").value = String(Number(result.uframe));
+  }
+  if (Number.isFinite(Number(result.error_limit_mm))) {
+    $("errorLimit").value = String(Number(result.error_limit_mm));
+    $("relocateLimit").value = String(Number(result.error_limit_mm));
+  }
+  if (Array.isArray(result.scan_face_axis_vehicle)
+    && result.scan_face_axis_vehicle.length === 3) {
+    const axis = axisFromVector(result.scan_face_axis_vehicle);
+    if (axis) {
+      $("scanAxis").value = axis;
+      updateAxisBadge("本次运行：" + AXIS_LABELS[axis]);
+    }
+  }
+  document.querySelectorAll("[data-point-count]").forEach((button) => {
+    button.classList.toggle("active", Number(button.dataset.pointCount) === state.pointCount);
+  });
+  renderDatumRows();
+  updateSolveAvailability();
+  requestRender();
+  return true;
+}
+
+function setRelocateStatus(message, kind = "") {
+  const node = $("relocateStatus");
+  if (!node) return;
+  node.className = "relocate-status" + (kind ? " " + kind : "");
+  node.textContent = message;
+}
+
+function renderRelocatePanel(result) {
+  const panel = $("relocatePanel");
+  if (!panel) return;
+  const cad = result && result.cad_points_vehicle_mm;
+  if (!Array.isArray(cad) || !cad.length) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+  const body = $("relocateRows");
+  body.replaceChildren();
+  for (let index = 0; index < cad.length; index += 1) {
+    const row = document.createElement("tr");
+    const label = document.createElement("td");
+    label.className = "point";
+    label.textContent = "P" + (index + 1);
+    const cadCell = document.createElement("td");
+    cadCell.className = "cad";
+    cadCell.textContent = cad[index].map((value) => Number(value).toFixed(2)).join(", ");
+    row.append(label, cadCell);
+    for (let axis = 0; axis < 3; axis += 1) {
+      const cell = document.createElement("td");
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = "0.001";
+      input.dataset.measure = String(index);
+      input.dataset.axis = String(axis);
+      input.value = (state.measured[index] && state.measured[index][axis]) || "";
+      input.placeholder = "mm";
+      input.addEventListener("input", () => {
+        state.measured[index][axis] = input.value;
+        mirrorDatumInput("datumRows", index, axis, input.value);
+        state.registration = null;
+        updateSolveAvailability();
+        scheduleRegistrationCheck();
+      });
+      cell.append(input);
+      row.append(cell);
+    }
+    const residual = document.createElement("td");
+    residual.className = "residual";
+    residual.textContent = "—";
+    row.append(residual);
+    body.append(row);
+  }
+  updateRelocateResiduals();
+  updateRelocateAvailability();
+  if (!state.relocate.busy) {
+    setRelocateStatus(
+      "改动现场坐标后会自动重算配准残差；确认无误后点「按新坐标重新定位路径」，"
+      + "把已规划的路径整体变换到新坐标系，不重新规划。"
+    );
+  }
+}
+
+function updateRelocateResiduals() {
+  const cells = document.querySelectorAll("#relocateRows td.residual");
+  if (!cells.length) return;
+  const errors = state.registration && Array.isArray(state.registration.point_errors_mm)
+    ? state.registration.point_errors_mm
+    : [];
+  const tolerance = Number($("relocateLimit").value);
+  cells.forEach((cell, index) => {
+    const value = Number(errors[index]);
+    if (!Number.isFinite(value)) {
+      cell.textContent = "—";
+      cell.classList.remove("bad");
+      return;
+    }
+    cell.textContent = value.toFixed(3);
+    cell.classList.toggle("bad", Number.isFinite(tolerance) && value > tolerance);
+  });
+}
+
+function updateRelocateAvailability() {
+  const button = $("relocateButton");
+  if (!button) return;
+  const tolerance = Number($("relocateLimit").value);
+  const ready = Boolean(state.result && state.result.run_id)
+    && Boolean(state.registration)
+    && state.picked.length === state.pointCount
+    && hasMeasuredPoints()
+    && Number.isFinite(tolerance) && tolerance > 0
+    && Number(state.registration.max_error_mm) <= tolerance
+    && !state.relocate.busy
+    && !state.solving;
+  button.disabled = !ready;
+}
+
+async function relocate() {
+  if (state.relocate.busy || state.solving) return;
+  const result = state.result;
+  if (!result || !result.run_id) {
+    toast("请先完成一次规划，再修改定位点重新定位");
+    return;
+  }
+  let body;
+  try {
+    const tolerance = Number($("relocateLimit").value);
+    if (!Number.isFinite(tolerance) || tolerance <= 0) {
+      throw new Error("配准最大误差限值必须是正数");
+    }
+    if (state.picked.length !== state.pointCount) {
+      throw new Error("定位点数量已改变，请先在 3D 模型上选满 " + state.pointCount + " 个点");
+    }
+    body = {
+      run_id: result.run_id,
+      cad_points_vehicle_mm: state.picked.slice(0, state.pointCount),
+      measured_points_mm: measuredPoints(),
+      max_registration_error_mm: tolerance,
+      prog_name: $("progName").value.trim().toUpperCase() || result.program_name,
+      delivery_mode: $("scanMode").value || result.delivery_mode,
+      scan_face_axis: SIDE_VECTORS[currentAxis()],
+      uframe: Number($("measureFrame").value),
+      run_name: $("runName").value.trim() || undefined,
+      progress_id: newProgressToken()
+    };
+  } catch (error) {
+    setRelocateStatus(error.message, "bad");
+    toast(error.message);
+    return;
+  }
+  state.relocate.busy = true;
+  const token = state.relocate.token;
+  updateRelocateAvailability();
+  const started = Date.now();
+  setRelocateStatus("正在把扫描路径变换到新坐标系…", "busy");
+  let lastReport = 0;
+  const stopPolling = pollProgress(body.progress_id, (progress) => {
+    lastReport = Date.now();
+    const stage = PLAN_STAGES.find((entry) => entry.key === progress.stage);
+    setRelocateStatus(
+      "正在把扫描路径变换到新坐标系 · " + (stage ? stage.label : "收尾")
+      + " " + Number(progress.pct).toFixed(0) + "% · 已用时 "
+      + Math.round(Number(progress.elapsed_s) || 0) + " 秒",
+      "busy"
+    );
+  });
+  const ticker = window.setInterval(() => {
+    if (Date.now() - lastReport < 1500) return;
+    const seconds = Math.round((Date.now() - started) / 1000);
+    setRelocateStatus("正在把扫描路径变换到新坐标系… 已用时 " + seconds + " 秒", "busy");
+  }, 1000);
+  try {
+    const response = await fetchJson("/api/relocate", body);
+    if (token !== state.relocate.token) return;
+    state.result = response.result;
+    state.resultSource = "live";
+    state.showPath = true;
+    $("showPath").checked = true;
+    $("showPath").disabled = false;
+    buildPathBuffers();
+    syncSetupFromResult(response.result);
+    renderResult(response.result);
+    requestRender();
+    toast("已把扫描路径变换到新的定位点坐标系");
+  } catch (error) {
+    if (token !== state.relocate.token) return;
+    setRelocateStatus("重新定位失败：" + error.message, "bad");
+    toast(error.message);
+  } finally {
+    window.clearInterval(ticker);
+    stopPolling();
+    state.relocate.busy = false;
+    updateRelocateAvailability();
+  }
 }
 
 function showResultState(name) {
@@ -1320,6 +1683,7 @@ function bindEvents() {
   });
   $("errorLimit").addEventListener("input", () => {
     state.registration = null;
+    $("relocateLimit").value = $("errorLimit").value;
     updateSolveAvailability();
     scheduleRegistrationCheck();
   });
@@ -1348,6 +1712,13 @@ function bindEvents() {
     requestRender();
   });
   $("solveButton").addEventListener("click", solve);
+  $("relocateButton").addEventListener("click", relocate);
+  $("relocateLimit").addEventListener("input", () => {
+    $("errorLimit").value = $("relocateLimit").value;
+    state.registration = null;
+    updateSolveAvailability();
+    scheduleRegistrationCheck();
+  });
   $("openViewer").addEventListener("click", openViewer);
   $("downloadReport").addEventListener("click", () => {
     if (!state.result) return;
@@ -1562,14 +1933,20 @@ function historyItem(run) {
 
 async function loadHistoryModels(runId) {
   for (const name of ["part", "support", "base"]) {
-    const response = await fetch(
-      "/api/history/model?run_id=" + encodeURIComponent(runId)
-      + "&name=" + encodeURIComponent(name)
-    );
-    if (!response.ok) continue;
-    const buffer = await response.arrayBuffer();
-    const file = new File([buffer], name + ".stl", { type: "model/stl" });
-    await loadModel(name, file);
+    // `base.stl` in a run folder is already installed in the measured frame; the
+    // vehicle-frame copy is the one the planner expects when the run is repeated.
+    const candidates = name === "base" ? ["base_vehicle", "base"] : [name];
+    for (const candidate of candidates) {
+      const response = await fetch(
+        "/api/history/model?run_id=" + encodeURIComponent(runId)
+        + "&name=" + encodeURIComponent(candidate)
+      );
+      if (!response.ok) continue;
+      const buffer = await response.arrayBuffer();
+      const file = new File([buffer], name + ".stl", { type: "model/stl" });
+      await loadModel(name, file);
+      break;
+    }
   }
 }
 
@@ -1586,6 +1963,7 @@ async function openHistoryRun(runId) {
     $("showPath").checked = true;
     toast("正在载入历史项目的零件与夹具模型…");
     await loadHistoryModels(runId);
+    syncSetupFromResult(data.result);
     renderResult(data.result);
     showResultState("result");
     buildPathBuffers();
@@ -1644,6 +2022,9 @@ function resetWorkspace() {
   $("downloadReport").disabled = true;
   $("downloadList").replaceChildren();
   $("resultDetails").replaceChildren();
+  renderRelocatePanel(null);
+  state.relocate.busy = false;
+  state.relocate.token += 1;
   $("resultName").textContent = "项目";
   $("resultSubtitle").textContent = "规划完成";
   $("stageEmpty").style.display = "";
@@ -1679,6 +2060,7 @@ async function deleteHistoryRun(run) {
       state.result = null;
       $("openViewer").disabled = true;
       $("downloadReport").disabled = true;
+      renderRelocatePanel(null);
       showResultState("empty");
     }
     renderHistory();
