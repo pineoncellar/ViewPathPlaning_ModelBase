@@ -12,6 +12,7 @@ import pytest
 import trimesh
 
 import scanweb
+from scanview import save_target_samples
 from scanweb import (
     _available_run_id,
     _decode_stl,
@@ -417,6 +418,21 @@ def make_relocatable_run(root: Path, run_id: str, *, rotation=None, translation=
         },
         "point_pairs": DATUM_PAIRS,
     }), encoding="utf-8")
+    # The sampled surface and the leak clusters live in the same frame as the path, so a
+    # relocation has to move them too - copying them is the bug this helper guards.
+    save_target_samples(run_dir / "target_samples.npz",
+                        points=np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+                        covered=np.array([True, False]),
+                        mask=np.zeros((2, 1), dtype=np.uint8))
+    (run_dir / "coverage_report.json").write_text(json.dumps({
+        "coverage_pct": 91.5,
+        "target_points": 2,
+        "uncovered_points": 1,
+        "target_face_mm2": 10.0,
+        "face": "upper",
+        "leak_regions": [{"area_mm2": 1.0, "center": [0.0, 0.0, 0.0],
+                          "size_mm": [1.0, 1.0, 0.0]}],
+    }), encoding="utf-8")
     return run_dir
 
 
@@ -462,6 +478,16 @@ def test_relocation_moves_the_planned_path_without_replanning(tmp_path, monkeypa
                         .read_text(encoding="utf-8"))
     assert report["relocalisation"]["replanned"] is False
     assert report["relocalisation"]["from_run"] == "run_020"
+
+    # The sampled surface and the leak cluster centres move with the path: a viewer that
+    # draws them from the old frame shows the part and its points 10 mm apart.
+    with np.load(Path(result["output_dir"]) / "target_samples.npz") as saved:
+        assert saved["points"].tolist() == [[11.0, 2.0, 3.0], [14.0, 5.0, 6.0]]
+        assert saved["mask"].shape == (2, 1)
+    coverage = json.loads((Path(result["output_dir"]) / "coverage_report.json")
+                          .read_text(encoding="utf-8"))
+    assert coverage["leak_regions"][0]["center"] == [10.0, 0.0, 0.0]
+    assert coverage["coverage_pct"] == pytest.approx(91.5)
 
 
 def test_relocation_rotates_the_path_with_the_new_frame(tmp_path, monkeypatch):
