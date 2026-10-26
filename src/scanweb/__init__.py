@@ -45,7 +45,7 @@ from scanplan.roboguide.adapt import export as export_ls
 from scanplan.roboguide.wpr import normalise_prog_name
 from scanplan.scene import StationDescription, load_station
 from scanplan.sheet_split import split_sheet
-from scanview import render_run
+from scanview import load_target_samples, render_run, save_target_samples
 
 from .cad_import import mesh_from_bytes, to_stl_bytes
 
@@ -989,7 +989,16 @@ def relocate_job(data: dict, progress=None) -> dict:
             _move_samples_csv(run_dir / name, output / name, delta)
         samples = run_dir / "target_samples.npz"
         if samples.is_file():
-            shutil.copyfile(samples, output / "target_samples.npz")
+            # The sidecar carries the sampled surface the 3D page draws, so it moves with
+            # the part. Copying it would leave a point cloud stranded in the old frame -
+            # the one kind of misalignment a rigid relocation must not produce.
+            sample_points, sampled_covered, sampled_mask = load_target_samples(samples)
+            save_target_samples(
+                output / "target_samples.npz",
+                points=sample_points @ delta[:3, :3].T + delta[:3, 3],
+                covered=sampled_covered,
+                mask=sampled_mask,
+            )
 
         announce("export", 0.5, "exporting the FANUC program")
         options = _relocation_export_options(run_dir, prog_name)
@@ -1105,6 +1114,10 @@ def relocate_job(data: dict, progress=None) -> dict:
         }
         coverage_report["viewpoint_records"] = [vp.as_dict() for vp in moved]
         coverage_report["relocalisation"] = relocalisation
+        for region in coverage_report.get("leak_regions") or []:
+            center = region.get("center")
+            if isinstance(center, list) and len(center) == 3:
+                region["center"] = _moved_point(delta, center)
         if coverage_report:
             write_report(output, coverage_report)
 
