@@ -186,6 +186,8 @@
                 <li data-stage="segmentation">目标面分割</li>
                 <li data-stage="candidates">候选视点</li>
                 <li data-stage="occlusion">遮挡计算</li>
+                <li data-stage="strokes">扫描带规划</li>
+                <li data-stage="report">报告生成</li>
                 <li data-stage="export">交付导出</li>
               </ol>
             </div>
@@ -202,6 +204,20 @@
               <div class="metric"><span>规划耗时</span><b id="metricElapsed">—</b><i>本次规划计算时长</i></div>
             </div>
             <div class="result-details" id="resultDetails"></div>
+            <div class="section-label"><span>定位点复核 · 重新定位</span><small>改现场坐标即可变换路径</small></div>
+            <div class="relocate-panel hidden" id="relocatePanel">
+              <table class="datum-table relocate-table" aria-label="本次规划使用的定位点">
+                <thead><tr><th>点</th><th>CAD / 整车坐标 (mm)</th><th>现场 X</th><th>现场 Y</th><th>现场 Z</th><th>残差 (mm)</th></tr></thead>
+                <tbody id="relocateRows"></tbody>
+              </table>
+              <div class="relocate-bar">
+                <label class="relocate-limit" for="relocateLimit">配准最大误差限值（mm）
+                  <input class="text-input" id="relocateLimit" type="number" step="0.1" min="0.1" value="3">
+                </label>
+                <span class="relocate-status" id="relocateStatus">改动现场坐标后会自动重算配准残差；确认无误后点「按新坐标重新定位路径」，把已规划的路径整体变换到新坐标系，不重新规划。</span>
+                <button class="primary-button" id="relocateButton" type="button" disabled><span>按新坐标重新定位路径</span><span class="button-arrow">↻</span></button>
+              </div>
+            </div>
             <div class="warning-note" style="margin-top:12px"><b>!</b><span>结果不包含机器人可达性与碰撞验证。导入 ROBOGUIDE 前，请确认 UFRAME、UTOOL 与扫描头测量参考点契约。</span></div>
             <div class="section-label download-heading"><span>规划结果文件</span><small>点击下载</small></div>
             <div class="download-list" id="downloadList"></div>

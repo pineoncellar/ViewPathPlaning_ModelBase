@@ -259,7 +259,7 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
                         stroke_cov: StrokeCoverage, selection: Selection,
                         pose_selection: Selection, target: TargetSet, station: Station,
                         model: ScannerModel, cfg: PlannerConfig, gate,
-                        *, kin=None, log=None):
+                        *, kin=None, log=None, progress=None):
     """Build both deliveries, then keep the one that is better on the same scale.
 
     Two candidate deliverables, both ordered and connected by the same code:
@@ -295,7 +295,11 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
     verdict = ""
     lam_used = 0.0
     history: list[tuple[float, int, float]] = []
-    for lam in (BUDGET_LAMBDAS if budget is not None else (0.0,)):
+    passes = BUDGET_LAMBDAS if budget is not None else (0.0,)
+    for pass_index, lam in enumerate(passes):
+        if progress is not None:
+            progress(0.8 * pass_index / max(len(passes), 1),
+                     f"budget pass {pass_index + 1}/{len(passes)}")
         offered = _group_selection(combined, coverage, stroke_cov, cfg, tie=tie,
                                    weight=weight, lam=lam, log=log)
         chosen_sources = dict(sources)
@@ -329,6 +333,8 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
                                     stroke_cov, coverage, cfg, station, model, gate,
                                     kin=kin, log=log)
     pose_sel.corners = pose_path.turns
+    if progress is not None:
+        progress(0.85, "building the pose-only reference")
     if budget is not None and pose_path.turns > int(budget):
         pose_sel, pose_path = None, None
 

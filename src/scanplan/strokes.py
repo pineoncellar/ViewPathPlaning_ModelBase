@@ -622,6 +622,7 @@ class StrokeBuilder:
 
     def generate(self, points, normals, *, aim_grid_mm: float,
                  seed_offset: int = 0,
+                 progress: Callable[[int, int], None] | None = None,
                  log: Callable[[str], None] | None = None) -> list[Stroke]:
         """Seeds -> grown strokes -> de-duplicated, in that order.
 
@@ -645,8 +646,10 @@ class StrokeBuilder:
             seeds.extend(self.side_scan_seeds(points, normals, aim_grid_mm=aim_grid_mm,
                                               seed_offset=seed_offset))
         grown: list[Stroke] = []
-        for seed, index in seeds:
+        for done, (seed, index) in enumerate(seeds):
             grown.extend(self.grow(seed, index))
+            if progress is not None:
+                progress(done + 1, len(seeds))
         unique = dedupe(grown, self.params.dedupe_mm)
         say(f"  stroke generation: {len(seeds)} seeds -> {len(grown)} grown -> "
             f"{len(unique)} kept (<= {self.params.max_stroke_mm:g} mm each)")
@@ -655,6 +658,7 @@ class StrokeBuilder:
     # -- evaluation ---------------------------------------------------------
 
     def evaluate(self, strokes: Sequence[Stroke], *,
+                 progress: Callable[[int, int], None] | None = None,
                  log: Callable[[str], None] | None = None) -> StrokeCoverage:
         """Coverage of every stroke, dropping the ones that cannot physically be flown."""
         say = log or (lambda _message: None)
@@ -666,7 +670,9 @@ class StrokeBuilder:
         kept: list[Stroke] = []
         smallest_margin = np.inf
 
-        for stroke in strokes:
+        for done, stroke in enumerate(strokes):
+            if progress is not None:
+                progress(done + 1, len(strokes))
             check = stroke.check_positions_mm(params.check_step_mm)
             fits, margin = self.fits_at(check)
             smallest_margin = min(smallest_margin, margin)
