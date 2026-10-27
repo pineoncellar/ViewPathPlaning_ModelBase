@@ -18,7 +18,7 @@ one pose per leftover sample returns exactly the tail the target exists to cut o
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -45,6 +45,15 @@ class Selection:
     # `len(chosen)` is NOT that number once poses and strokes are mixed: ten strokes are
     # twenty corners and thirty poses are thirty.
     corners: int | None = None
+    # The exchange rate this selection was made at (merge plan 5.3). 0 is the density
+    # greedy of before, and the budget layer only leaves it when it has to.
+    lam: float = 0.0
+    # Why the selection stopped: `target_bound` (the acceptance figure came first),
+    # `budget_bound` (the point cap did) or `exhausted` (the pool had nothing more to
+    # offer). One of these three, never a fourth - see merge plan 6.5.
+    bound: str = ""
+    # What the point-budget layer did, for the report. Empty when no budget was set.
+    budget: dict = field(default_factory=dict)
 
     @property
     def cost_corners(self) -> int:
@@ -59,45 +68,8 @@ class Selection:
         return float(100.0 * self.coverage_area_mm2 / self.target_area_mm2)
 
 
-def _score(gains: np.ndarray, costs, lam: float, weight) -> np.ndarray:
-    """Density: new area per unit of cost, with the cost offset by the budget exchange rate.
-
-    `lam` is the exchange rate between coverage and corners. At 0 this is the density
-    greedy: cheapest first, which saturates coverage as late as possible. As it grows the
-    cost stops mattering and the pass degenerates into "take the biggest uncovered area",
-    which covers more with more corners. Making it a parameter is what turns "fit the
-    coverage into a point budget" into a one-dimensional search instead of a re-run of the
-    whole pipeline at a coarser resolution.
-    """
-    numerator = np.asarray(gains, dtype=float)
-    if weight is not None:
-        numerator = numerator * np.asarray(weight, dtype=float)
-    if costs is None:
-        return numerator
-    return numerator / (np.maximum(np.asarray(costs, dtype=float), _COST_EPS) + float(lam))
-
-
-def _pick(score: np.ndarray, gains: np.ndarray, tie) -> int:
-    """`argmax`, with an explicit tie-break when the scores are equal.
-
-    `np.argmax` returns the first maximum, which makes an exact tie a coin flip decided by
-    candidate order. `tie` is the per-candidate preference used when the areas are equal -
-    on this cell that is the joint room at that pose, so two poses covering the same area
-    are separated by which one leaves the wrist further from its limit.
-    """
-    best = int(np.argmax(score))
-    if tie is None:
-        return best
-    preferences = np.asarray(tie, dtype=float)
-    close = np.flatnonzero(np.isclose(score, score[best], rtol=1e-12, atol=1e-15))
-    if len(close) <= 1:
-        return best
-    return int(close[int(np.argmax(preferences[close]))])
-
-
 def select(cov: CoverageResult, area_mm2=None, *,
            coverage_target_pct: float | None = None,
-           tie=None,
            log: Callable[[str], None] | None = None) -> Selection:
     """Greedy set cover on covered AREA, then a repair pass for the leftovers.
 
@@ -138,7 +110,7 @@ def select(cov: CoverageResult, area_mm2=None, *,
         if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
             break
         gains = matrix @ np.where(covered, 0.0, area)
-        best = _pick(gains, gains, tie)
+        best = int(np.argmax(gains))
         if gains[best] <= 0.0:
             break
         greedy.append(best)
@@ -163,8 +135,7 @@ def select(cov: CoverageResult, area_mm2=None, *,
         if len(candidates) == 0:
             continue
         gains = matrix[candidates] @ np.where(covered, 0.0, area)
-        preferences = None if tie is None else np.asarray(tie, dtype=float)[candidates]
-        best = int(candidates[_pick(gains, gains, preferences)])
+        best = int(candidates[int(np.argmax(gains))])
         repair.append(best)
         covered |= _row(matrix, best)
     say(f"  repair: {len(repair)} poses -> {covered_pct():.2f}%"
@@ -180,7 +151,7 @@ def select(cov: CoverageResult, area_mm2=None, *,
 
 def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
                   repair_ok=None, coverage_target_pct: float | None = None,
-                  tie=None, weight=None, lam: float = 0.0, exclude=None,
+                  lam: float = 0.0, repair_limit: int | None = None,
                   log: Callable[[str], None] | None = None) -> Selection:
     """Set cover over candidates of MIXED kind: strokes and single poses together.
 
@@ -195,6 +166,17 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
     `repair_ok` restricts the repair pass (default: everything). Pass True for the
     single poses: a leftover sample is a hole to be patched point by point, and inventing
     a stroke for it would add two corners and a transition to cover one footprint.
+
+    `lam` is the exchange rate between covered area and corners, in the same unit as
+    `costs`: the score becomes `gain / (cost + lam)`. It is the one knob the point budget
+    turns (merge plan 5.3). At `lam = 0` this is exactly the density greedy of before, so
+    the budget layer can start from today's answer and only move away from it when it has
+    to. Larger `lam` drowns the cost term, so the pass drifts towards pure area greedy:
+    more coverage, more corners. That monotonicity is what makes "the largest lam that
+    still fits the budget" a searchable question.
+
+    `repair_limit` caps how many repair items may be added; the budget layer uses it to
+    keep the tail - which is one pose per leftover sample - inside a point budget.
     """
     say = log or (lambda _message: None)
     if coverage_target_pct is not None and not 0.0 < coverage_target_pct <= 100.0:
@@ -211,13 +193,6 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
                else np.asarray(repair_ok, dtype=bool))
     if len(allowed) != matrix.shape[0]:
         raise ValueError("one repair flag per candidate is required")
-    # Candidates the caller refuses to consider at all - the hard gate's dropped items,
-    # after they could not be connected. Excluding them here is what turns "drop the band"
-    # into "choose something else for that area" instead of "lose that area".
-    banned = (np.zeros(matrix.shape[0], dtype=bool) if exclude is None
-              else np.asarray(exclude, dtype=bool).reshape(-1))
-    if len(banned) != matrix.shape[0]:
-        raise ValueError("one exclusion flag per candidate is required")
     target_area = float(cov.target_area_mm2)
 
     def covered_pct() -> float:
@@ -233,11 +208,10 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
         # `max(cost, eps)` rather than `cost + 1`: the +1 was "one millimetre, ignore it",
         # which stopped being true the moment the cost became a corner count (2 or 3).
         # Adding 1 there is a 50% bias and hides the very ratio the caller asked for.
-        score = _score(gains, costs, lam, weight)
-        if banned.any():
-            score = np.where(banned, -np.inf, score)
-        best = _pick(score, gains, tie)
-        if gains[best] <= 0.0 or banned[best]:
+        # `lam` is that bias made explicit, and it is zero unless a point budget asks for it.
+        score = gains / np.maximum(costs + float(lam), _COST_EPS)
+        best = int(np.argmax(score))
+        if gains[best] <= 0.0:
             break
         greedy.append(best)
         covered |= _row(matrix, best)
@@ -247,18 +221,21 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
     repair: list[int] = []
     reachable = cov.pool_reach()
     for target in np.flatnonzero(reachable & ~covered):
+        if repair_limit is not None and len(repair) >= max(0, int(repair_limit)):
+            say(f"  repair over groups: stopped at the point budget with "
+                f"{int((reachable & ~covered).sum())} reachable samples left uncovered")
+            break
         if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
             say(f"  repair over groups: stopped at the {coverage_target_pct:g}% target with "
                 f"{int((reachable & ~covered).sum())} reachable samples left uncovered")
             break
         if covered[target]:
             continue
-        candidates = np.flatnonzero(_row(matrix, None, column=target) & allowed & ~banned)
+        candidates = np.flatnonzero(_row(matrix, None, column=target) & allowed)
         if len(candidates) == 0:
             continue
         gains = matrix[candidates] @ np.where(covered, 0.0, area)
-        preferences = None if tie is None else np.asarray(tie, dtype=float)[candidates]
-        best = int(candidates[_pick(gains, gains, preferences)])
+        best = int(candidates[int(np.argmax(gains))])
         repair.append(best)
         covered |= _row(matrix, best)
     say(f"  repair over groups: {len(repair)} poses -> {covered_pct():.2f}%")

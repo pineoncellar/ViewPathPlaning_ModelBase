@@ -38,6 +38,12 @@ def summary_lines(report: dict) -> list[str]:
             f"{interrupts.get('translation', 0)} translation + "
             f"{interrupts.get('reorient', 0)} re-orient interrupts",
         ]
+    joints = path.get("joints")
+    if joints:
+        lines.append(f"joint window           {joints['checked_moves']} moves checked, "
+                     f"{joints.get('out_of_window_moves', 0)} with no legal "
+                     f"configuration, worst utilization "
+                     f"{joints.get('worst_utilization', 0.0):.3f}")
     strokes = report.get("stroke_plan", {})
     if strokes.get("enabled") and strokes.get("delivered"):
         lines.append(f"strokes                "
@@ -46,28 +52,24 @@ def summary_lines(report: dict) -> list[str]:
                      f"{strokes['swept_coverage_pct']:.2f}%")
         for violation in path.get("constraint_violations", []):
             lines.append(f"CONSTRAINT             {violation}")
-    kinematics = report.get("kinematics", {})
     lines += [
         f"ray backend            {report['runtime']['ray_backend']}",
-        ("NOTE: joint limits were screened here (see the kinematics block); collision and "
-         "final reachability are still decided by ROBOGUIDE and the controller, and "
-         "robot-arm occlusion of the tracker is not modelled."
-         if kinematics.get("enabled") else
-         "NOTE: coverage is geometric reachability only - robot reachability, joint limits "
-         "and robot collision are checked in ROBOGUIDE, and robot-arm occlusion of the "
-         "tracker is not modelled."),
+        _note_line(report),
     ]
-    if kinematics.get("enabled"):
-        lines.append(
-            f"joints                 min margin {kinematics.get('min_margin_deg')} deg, "
-            f"worst step {kinematics.get('max_step_deg')} deg "
-            f"(limit {kinematics.get('max_step_deg_limit')}), "
-            f"branches {kinematics.get('branch_histogram')}")
-    budget = report.get("budget", {})
-    if budget.get("max_points") is not None:
-        lines.append(f"budget                 {budget.get('verdict')} at "
-                     f"{budget.get('delivered_points')} of {budget['max_points']} points")
     return lines
+
+
+def _note_line(report: dict) -> str:
+    """The caveat a reader must not miss, in this run's terms."""
+    arm = report.get("robot", {})
+    if arm.get("checked"):
+        return ("NOTE: coverage is geometric reachability filtered by the arm's joint "
+                f"window ({arm.get('model', 'robot')}, each stop derated to "
+                f"{arm.get('joint_limit_margin', 1.0):.0%}) - robot collision is checked in "
+                "ROBOGUIDE, and robot-arm occlusion of the tracker is not modelled.")
+    return ("NOTE: coverage is geometric reachability only - robot reachability, joint "
+            "limits and robot collision are checked in ROBOGUIDE, and robot-arm occlusion "
+            "of the tracker is not modelled.")
 
 
 def summary_text(report: dict) -> str:

@@ -13,8 +13,8 @@ import numpy as np
 
 from ..config import PlannerConfig
 from ..coverage import CoverageResult, evaluate
-from ..geometry import unit
-from ..path import PathPlan, assign_branches, build_path, prune, transition_poses
+from ..path import PathPlan, build_path, prune, transition_poses, unreachable_items
+from ..robot import RobotArm
 from ..scanner_model import ScannerModel
 from ..scene import Station
 from ..selection import Selection, select_groups
@@ -25,10 +25,15 @@ from .ranking import _rank_plan
 # Pruning keeps the requirement, not the achieved peak: pruning against the peak can
 # never remove anything, which would make the stage pointless by construction.
 PRUNE_TARGET_PCT = 99.0
+# How many drop-and-rebuild rounds the joint screen may run. Each round drops at least one
+# item, so this is a stop on pathological inputs rather than on the normal case: a path
+# normally settles after one or two rounds.
+REACH_ROUNDS = 12
 
 
 def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
-                    model: ScannerModel, gate, kin=None) -> StrokeBuilder | None:
+                    model: ScannerModel, gate, *, robot: RobotArm | None = None,
+                    ) -> StrokeBuilder | None:
     """The stroke builder, or None when the delivered set is single poses."""
     if cfg.target.delivery_mode == "lean":
         # The lean deliverable is v1 plus a stopping rule: poses alone, no connectors, and
@@ -38,121 +43,58 @@ def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
         return None
     if cfg.stroke.max_stroke_mm <= 0.0:
         return None
-    return StrokeBuilder(target.samples, station, model, cfg, visible=gate, gate=kin)
+    return StrokeBuilder(target.samples, station, model, cfg, visible=gate, robot=robot)
 
 
-def _group_selection(combined: CoverageResult, coverage: CoverageResult,
-                     stroke_cov: StrokeCoverage, cfg: PlannerConfig, *,
-                     tie=None, weight=None, lam: float = 0.0, exclude=None,
-                     log=None) -> Selection:
-    """Set cover over poses and strokes together, priced in the configured unit.
+def _group_costs(cfg: PlannerConfig, coverage: CoverageResult, stroke_cov: StrokeCoverage,
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    """What each candidate costs, and whether the repair pass may use it.
 
     `corners` is the default because it is what the workshop counts: one stop for a pose,
     two for a stroke, plus the transition each one drags along. `millimetres` is the
     upstream design's pricing and is kept so the two can be compared on the same part.
 
-    `lam` raises the cost floor, which is what turns "fit the coverage into a point budget"
-    into a search over one number instead of a re-run at a coarser resolution. `tie` breaks
-    exact area ties by joint room, and `weight` is the skeleton preference - both are None
-    unless the caller has a reason, so the default path is unchanged.
+    One definition, because the budget layer must price candidates exactly as the ordinary
+    pass does - a different cost there would make the exchange rate mean something else.
     """
     stop = float(cfg.stroke.stop_cost_mm)
     transition = float(cfg.stroke.transition_corners_estimate)
     n_poses = len(coverage.poses)
     if cfg.stroke.cost_model == "corners":
-        costs = [1.0 + transition] * n_poses + [2.0 + transition] * len(stroke_cov.strokes)
+        costs = np.array([1.0 + transition] * n_poses
+                         + [2.0 + transition] * len(stroke_cov.strokes))
     else:
-        costs = ([stop] * n_poses
-                 + [stroke.length_mm + stop for stroke in stroke_cov.strokes])
-    repair_ok = [True] * n_poses + [False] * len(stroke_cov.strokes)
-    return select_groups(combined, costs, repair_ok=repair_ok,
-                         coverage_target_pct=cfg.target.coverage_target_pct,
-                         tie=tie, weight=weight, lam=lam, exclude=exclude, log=log)
+        costs = np.array([stop] * n_poses
+                         + [stroke.length_mm + stop for stroke in stroke_cov.strokes])
+    repair_ok = np.array([True] * n_poses + [False] * len(stroke_cov.strokes), dtype=bool)
+    return costs, repair_ok
 
 
-def _exclusion_mask(combined: CoverageResult, coverage: CoverageResult,
-                    stroke_cov: StrokeCoverage, forbidden) -> np.ndarray:
-    """A candidate mask with `forbidden` rows set, for the re-selection after a drop."""
-    mask = np.zeros(combined.matrix().shape[0], dtype=bool)
-    for row in forbidden:
-        index = int(row)
-        if 0 <= index < len(mask):
-            mask[index] = True
-    return mask
+def _group_selection(combined: CoverageResult, coverage: CoverageResult,
+                     stroke_cov: StrokeCoverage, cfg: PlannerConfig, *,
+                     lam: float = 0.0, repair_limit: int | None = None,
+                     log=None) -> Selection:
+    """Set cover over poses and strokes together, at the configured price and rate.
 
-
-def _skeleton_axis(strokes) -> np.ndarray | None:
-    """The direction the long parallel bands run along, or None when there is no majority."""
-    if not strokes:
-        return None
-    directions = [unit(stroke.unit_direction) * max(stroke.length_mm, 1.0)
-                  for stroke in strokes if stroke.length_mm > 0.0]
-    if not directions:
-        return None
-    mean = np.sum(directions, axis=0)
-    length = float(np.linalg.norm(mean))
-    return mean / length if length > 1e-6 else None
-
-
-def _parallel_weights(coverage: CoverageResult, stroke_cov: StrokeCoverage,
-                      cfg: PlannerConfig):
-    """Per-candidate skeleton preference, or None when the knob is neutral.
-
-    The weight is a tie-break, not a policy: it may nudge the score by up to the configured
-    30 percent, and it is never applied to the repair pass - the last percent of coverage
-    comes from bands in other directions, and a skeleton preference that overrules them
-    reaches 95 percent and then cannot patch what it skipped.
+    `lam` is the exchange rate the point budget bisects; at 0 this is exactly the density
+    greedy of before, which is what lets the budget layer start from today's answer.
     """
-    factor = float(cfg.stroke.parallel_weight)
-    if abs(factor - 1.0) < 1e-12:
-        return None
-    axis = _skeleton_axis(stroke_cov.strokes)
-    if axis is None:
-        return None
-    weights = [1.0] * len(coverage.poses)
-    for stroke in stroke_cov.strokes:
-        aligned = (stroke.length_mm > 0.0
-                   and abs(float(np.dot(unit(stroke.unit_direction), axis))) > 0.9)
-        weights.append(float(factor) if aligned else 1.0)
-    return weights
+    costs, repair_ok = _group_costs(cfg, coverage, stroke_cov)
+    return select_groups(combined, costs, repair_ok=repair_ok, lam=float(lam),
+                         repair_limit=repair_limit,
+                         coverage_target_pct=cfg.target.coverage_target_pct, log=log)
 
 
-def _joint_tie(coverage: CoverageResult, stroke_cov: StrokeCoverage, kin):
-    """Per-candidate J5 room, or None when the kinematic gate is off.
-
-    A stroke is scored by its WORSE end: the band is only as safe as the point along it
-    that sits closest to a limit, and that point may well be the far end.
-    """
-    if kin is None or not kin.active:
-        return None
-    values: list[float] = []
-    for pose in coverage.poses:
-        verdict = kin.check(pose.position, pose.axis, pose.roll_deg)
-        values.append(verdict.solution.j5_margin_deg
-                      if verdict.ok and verdict.solution is not None else -1e9)
-    for stroke in stroke_cov.strokes:
-        ends = [kin.check(point, stroke.axis, stroke.roll_deg)
-                for point in (stroke.start, stroke.end)]
-        margins = [item.solution.j5_margin_deg for item in ends
-                   if item.ok and item.solution is not None]
-        values.append(min(margins) if len(margins) == 2 else -1e9)
-    return values
-
-
-def _one_delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, str],
-                  stroke_cov: StrokeCoverage, coverage: CoverageResult, cfg: PlannerConfig,
-                  station: Station, model: ScannerModel, gate, *,
-                  strict: bool | None = None, kin=None,
-                  log=None) -> tuple[Selection, PathPlan, list[int]]:
+def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, str],
+              stroke_cov: StrokeCoverage, coverage: CoverageResult, cfg: PlannerConfig,
+              station: Station, model: ScannerModel, gate, *,
+              robot: RobotArm | None = None, log=None) -> tuple[Selection, PathPlan]:
     """Prune and order an explicit set of chosen rows into a delivered path.
 
     Poses go in as zero-length strokes. That is not a trick: the module documentation of
     `strokes` already says a stroke of length zero is a viewpoint, and delivering them this
     way is what keeps the reported coverage and the program's actual sweep the same number.
     Pruning sees every row, so a pose the target does not need can go too.
-
-    Returns the rebuilt selection, the path, and the row each surviving item came from -
-    the last one is what lets the caller map `path.dropped` back to selection rows.
     """
     n_poses = len(coverage.poses)
     say = log or (lambda _message: None)
@@ -177,89 +119,256 @@ def _one_delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[i
         say(f"  pruning: {len(items)} selected items -> {len(kept)} while staying at "
             f"{(PRUNE_TARGET_PCT if target_pct is None else target_pct):g}%")
     kept_rows = [item_rows[index] for index in kept]
-    path = build_path([items[index] for index in kept], cfg=cfg, station=station,
-                      model=model, coverage_index=lambda index: kept_rows[index],
-                      sources=lambda index: sources.get(kept_rows[index], "greedy"),
-                      visible=gate, strict=strict, kin=kin, log=log)
-    # The selection is rebuilt from what the PATH actually delivers, not from what was
-    # selected: an item the hard gate refused is not in the program, so counting its area
-    # would make the headline figure describe a sweep that never happens. That is the same
-    # defect the stroke accounting was introduced to remove, one layer down.
-    delivered = [row for index, row in enumerate(kept_rows) if index not in set(path.dropped)]
-    rebuilt = _rebuild_selection(combined, delivered, sources, None)
-    return rebuilt, path, kept_rows
+    kept_items = [items[index] for index in kept]
+
+    def build(items_here: Sequence[Stroke], rows_here: Sequence[int]) -> PathPlan:
+        return build_path(items_here, cfg=cfg, station=station, model=model,
+                          coverage_index=lambda index: rows_here[index],
+                          sources=lambda index: sources.get(rows_here[index], "greedy"),
+                          visible=gate, robot=robot, log=log)
+
+    # The joint screen is applied to the DELIVERED points, and a point it rejects is
+    # dropped before anything is exported: carrying it in the program only moves the
+    # failure to ROBOGUIDE. Dropping an item can change the connectors around it, so the
+    # path is ordered and connected again and the survivors are screened again, until the
+    # screen passes on every point or there is nothing left to deliver.
+    path = build(kept_items, kept_rows)
+    dropped_by_arm: list[int] = []
+    for _round in range(REACH_ROUNDS):
+        blocked = set(unreachable_items(path)) if robot is not None else set()
+        if not blocked or not kept_items:
+            break
+        keep = [index for index in range(len(kept_items)) if index not in blocked]
+        dropped_by_arm.extend(kept_rows[index] for index in sorted(blocked))
+        say(f"  joint window: {len(blocked)} item(s) reach no configuration inside the "
+            f"window; dropping and re-planning {len(keep)}")
+        kept_items = [kept_items[index] for index in keep]
+        kept_rows = [kept_rows[index] for index in keep]
+        path = build(kept_items, kept_rows)
+    if dropped_by_arm:
+        path.joints["dropped_items"] = sorted(dropped_by_arm)
+        say(f"  joint window: dropped {len(dropped_by_arm)} item(s) the arm cannot fly; "
+            f"the delivered path has {path.turns} corners and "
+            f"{path.joints.get('out_of_window_moves', 0)} move(s) outside the window")
+    rebuilt = _rebuild_selection(combined, kept_rows, sources, None)
+    return rebuilt, path
 
 
-def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, str],
-              stroke_cov: StrokeCoverage, coverage: CoverageResult, cfg: PlannerConfig,
-              station: Station, model: ScannerModel, gate, *,
-              kin=None, strict: bool | None = None, rounds: int = 3,
-              reselect=None, log=None) -> tuple[Selection, PathPlan]:
-    """Deliver `rows`, removing any item the hard gate refuses and re-running on the rest.
+# The point budget (merge plan 5.3). Every iteration is one greedy pass over a sparse
+# matrix, one ordering and one point count - all milliseconds - so a bounded number of
+# them costs well under a per-cent of the run. The bound exists because "bisect until it
+# converges" on a response that is only empirically monotone can run away.
+_BUDGET_BISECT_STEPS = 8
+_BUDGET_MAX_EVALUATIONS = 20
+# Multiples of the median candidate cost the exchange rate is sampled at. The ladder is
+# relative to the prices in force, so it means the same thing whether candidates are
+# priced in corners (1-2) or in millimetres (hundreds).
+_LAMBDA_FACTORS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0)
 
-    The retry is the point. "Legality is a hard constraint" cannot mean "write a violation
-    and deliver the program anyway"; it has to mean "that sweep is not part of the answer",
-    and then the selection has to be told, because dropping one item can make another
-    redundant or reveal that the coverage target is no longer met.
 
-    `reselect(forbidden)` re-runs the selection with those rows banned. Falling back on
-    simply filtering the list is wrong and visibly so: one 800 mm band carries several
-    percent of the part, and dropping it without a replacement loses that area rather than
-    re-covering it - on the measured part the difference was 82.7% against 99.0%.
+def _deliver(combined: CoverageResult, coverage: CoverageResult,
+             stroke_cov: StrokeCoverage, cfg: PlannerConfig, station: Station,
+             model: ScannerModel, gate, selection: Selection, *,
+             robot: RobotArm | None = None, log=None):
+    """Order and connect an explicit selection - the unit the budget layer iterates."""
+    sources = {int(row): str(source)
+               for row, source in zip(selection.chosen, selection.sources, strict=True)}
+    return _delivery(combined, selection.chosen, sources, stroke_cov, coverage, cfg,
+                     station, model, gate, robot=robot, log=log)
 
-    Three rounds is a cap, not a target: each round is a full ordering pass, and a plan that
-    needs more than three is better reported than silently ground down.
+
+def _bound_kind(selection: Selection, coverage: CoverageResult,
+                cfg: PlannerConfig) -> str:
+    """Which limit stopped the run: the target, the point cap, or the pool.
+
+    Exactly one of three, because they ask for three different next steps: lower the
+    acceptance figure, raise the point budget, or change the scan direction (merge plan
+    6.5). A fourth name would only hide which of the three it was.
+    """
+    target = cfg.target.coverage_target_pct
+    if target is not None and selection.coverage_pct + 1e-9 >= float(target):
+        return "target_bound"
+    if selection.coverage_pct + 1e-6 >= float(coverage.pool_reach_pct):
+        return "exhausted"
+    return "budget_bound" if cfg.target.max_points is not None else "exhausted"
+
+
+def _budget_plan(combined: CoverageResult, coverage: CoverageResult,
+                 stroke_cov: StrokeCoverage, cfg: PlannerConfig, station: Station,
+                 model: ScannerModel, gate, *, robot: RobotArm | None = None, log=None):
+    """The most coverage that fits in `target.max_points`, or None when no cap is set.
+
+    The cap is turned into a search over ONE number: the exchange rate `lam` in
+    `gain / (cost + lam)`. `lam = 0` is today's density greedy and produces the fewest
+    points; raising it drowns the cost term and drifts towards pure area greedy, which
+    produces the most coverage and the most corners. So "maximise coverage inside N
+    points" becomes "find the largest lam whose delivered plan still fits", which is one
+    bisection over an answer that costs milliseconds to evaluate.
+
+    Delivered points are counted by BUILDING the path, not by adding up estimates. A
+    connector is one point or two depending on the route and the lift it needed, so any
+    "estimate the connector" shortcut would stop the search on a number that is not the
+    one written into the program - which is how a budget turns back into silent
+    truncation (merge plan 4.2).
+
+    `repair_budget_share` caps the tail repair, because repair is one pose per leftover
+    sample: inside a cap it is exactly the tail that must not eat the whole allowance.
     """
     say = log or (lambda _message: None)
-    hard = cfg.stroke.hard_gate if strict is None else bool(strict)
-    current = list(rows)
-    current_sources = dict(sources)
-    forbidden: set[int] = set()
-    rejected: list[int] = []
-    rebuilt = _rebuild_selection(combined, current, current_sources, None)
-    path = PathPlan(points=[], ordering="empty")
-    for _round in range(max(1, int(rounds))):
-        rebuilt, path, kept_rows = _one_delivery(
-            combined, current, current_sources, stroke_cov, coverage, cfg, station, model,
-            gate, strict=hard, kin=kin, log=log)
-        if not path.dropped:
+    if cfg.target.max_points is None:
+        return None
+    budget = int(cfg.target.max_points)
+    costs, _repair_ok = _group_costs(cfg, coverage, stroke_cov)
+    scale = float(np.median(costs)) if len(costs) else 1.0
+    scale = max(scale, 1e-6)
+    repair_limit = int(np.floor(float(cfg.stroke.repair_budget_share) * budget))
+    say(f"  point budget: {budget} points, exchange rate searched over "
+        f"{len(_LAMBDA_FACTORS) + _BUDGET_BISECT_STEPS} candidates, repair capped at "
+        f"{repair_limit} item(s)")
+
+    evaluations: list[dict] = []
+    results: list[tuple[Selection, PathPlan, dict]] = []
+
+    def evaluate(lam: float):
+        if len(evaluations) >= _BUDGET_MAX_EVALUATIONS:
+            return None
+        selection = _group_selection(combined, coverage, stroke_cov, cfg, lam=lam,
+                                     repair_limit=repair_limit, log=None)
+        rebuilt, path = _deliver(combined, coverage, stroke_cov, cfg, station, model, gate,
+                                 selection, robot=robot, log=None)
+        entry = {"lam": round(float(lam), 4), "turns": int(path.turns),
+                 "coverage_pct": round(float(rebuilt.coverage_pct), 3),
+                 "path_length_mm": round(float(path.path_length_mm), 1)}
+        evaluations.append(entry)
+        results.append((rebuilt, path, entry))
+        return rebuilt, path, entry
+
+    cheapest = evaluate(0.0)
+    if cheapest is None:
+        return None
+
+    def deliver(selection: Selection):
+        return _deliver(combined, coverage, stroke_cov, cfg, station, model, gate,
+                        selection, robot=robot, log=None)
+
+    if cheapest[1].turns > budget:
+        return _trim_to_budget(cheapest, budget, evaluations, cfg, coverage, stroke_cov,
+                               deliver)
+
+    # Ladder upwards until the cap is broken, then bisect the last interval. A plan that
+    # meets the acceptance figure already has no reason to grow: more coverage past the
+    # target buys nothing, so the search stops there rather than at the cap.
+    low, high = 0.0, None
+    for factor in _LAMBDA_FACTORS:
+        lam = scale * factor
+        found = evaluate(lam)
+        if found is None:
             break
-        bad = {kept_rows[index] for index in path.dropped if index < len(kept_rows)}
-        if not bad:
+        if found[1].turns > budget:
+            high = lam
             break
-        rejected.extend(sorted(bad))
-        forbidden |= bad
-        if reselect is not None:
-            current, current_sources = reselect(frozenset(forbidden))
-        else:
-            current = [row for row in current if row not in bad]
-        if not current:
+        low = lam
+        if (cfg.target.coverage_target_pct is not None and found[0].coverage_pct + 1e-9
+                >= float(cfg.target.coverage_target_pct)):
             break
-        say(f"  hard gate: dropping {len(bad)} item(s) and re-delivering "
-            f"{len(current)}")
-    if rejected:
-        path.violations.append(
-            f"the hard gate removed {len(rejected)} item(s) with no legal connector; "
-            "the selection was re-run without them")
-    if kin is not None and kin.active and path.points:
-        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg))
-        path.branches = assignment
-        path.max_step_deg = assignment.max_step_deg
-        if assignment.failed:
-            path.violations.append(
-                f"{len(assignment.failed)} delivered point(s) have no joint solution at all")
-        if assignment.broken:
-            path.violations.append(
-                f"{len(assignment.broken)} joint step(s) exceed max_step_deg "
-                f"({assignment.max_step_deg:.1f} > {cfg.robot.max_step_deg:g} deg)")
-    return rebuilt, path
+    if high is not None:
+        for _ in range(_BUDGET_BISECT_STEPS):
+            middle = 0.5 * (low + high)
+            found = evaluate(middle)
+            if found is None:
+                break
+            if found[1].turns > budget:
+                high = middle
+            else:
+                low = middle
+
+    feasible = [item for item in results if item[1].turns <= budget]
+    best = max(feasible, key=lambda item: (round(item[0].coverage_pct, 9),
+                                           -item[1].turns, -item[1].path_length_mm))
+    record = {
+        "max_points": budget,
+        "repair_limit": repair_limit,
+        "chosen_lam": best[2]["lam"],
+        "frontier": sorted({(entry["turns"], entry["coverage_pct"]): entry
+                            for entry in evaluations}.values(),
+                           key=lambda entry: (entry["turns"], -entry["coverage_pct"])),
+        "evaluations": len(evaluations),
+        "monotone": _is_monotone(evaluations),
+    }
+    if not record["monotone"]:
+        say("  WARNING: coverage did not rise with the exchange rate on this pool; the "
+            "answer is the best plan seen, not a bisection result")
+    best[0].lam = float(best[2]["lam"])
+    best[0].budget = record
+    best[0].bound = _bound_kind(best[0], coverage, cfg)
+    say(f"  point budget met: {best[1].turns} points, {best[0].coverage_pct:.2f}% at "
+        f"exchange rate {best[0].lam:g} ({len(evaluations)} evaluations)")
+    return best[0], best[1], record
+
+
+def _is_monotone(evaluations: Sequence[dict]) -> bool:
+    """Does coverage never fall as the exchange rate rises? An empirical property only."""
+    ordered = sorted(evaluations, key=lambda entry: entry["lam"])
+    return all(later["coverage_pct"] + 1e-6 >= earlier["coverage_pct"]
+               for earlier, later in zip(ordered, ordered[1:], strict=False))
+
+
+def _trim_to_budget(cheapest, budget: int, evaluations: list[dict],
+                    cfg: PlannerConfig, coverage: CoverageResult,
+                    stroke_cov: StrokeCoverage, deliver):
+    """No exchange rate fits the cap, so give up the cheapest area until it does.
+
+    Reached only when the pool holds nothing inside the cap - every candidate costs more
+    corners than the budget has. Reporting that instead of trimming would hand over a
+    program that breaks the cap, so the tail is dropped by marginal area per corner and
+    the amount of coverage given up is written into the record.
+    """
+    selection, path, entry = cheapest
+    costs, _repair_ok = _group_costs(cfg, coverage, stroke_cov)
+    areas = np.asarray(coverage.area_mm2, dtype=float)
+    current, current_path = selection, path
+    dropped: list[dict] = []
+    steps = 0
+    while current_path.turns > budget and current.chosen and steps < _BUDGET_MAX_EVALUATIONS:
+        steps += 1
+        rows = list(current.chosen)
+        counts = np.zeros(coverage.n_targets, dtype=np.int32)
+        for row in rows:
+            counts[current.sets[row]] += 1
+        scored = []
+        for index, row in enumerate(rows):
+            own = current.sets[row]
+            marginal = float(areas[own[counts[own] == 1]].sum())
+            scored.append((marginal / max(float(costs[row]), 1e-9), index, row, marginal))
+        scored.sort()
+        _value, index, row, marginal = scored[0]
+        dropped.append({"row": int(row), "marginal_area_mm2": round(marginal, 1)})
+        rows.pop(index)
+        current = _rebuild_selection(current, rows, {int(item): "greedy" for item in rows})
+        current, current_path = deliver(current)
+    record = {
+        "max_points": int(budget),
+        "bound": "budget_bound",
+        "chosen_lam": 0.0,
+        "frontier": [entry],
+        "evaluations": len(evaluations),
+        "monotone": True,
+        "dropped_for_budget": dropped,
+        "coverage_given_up_mm2": round(sum(item["marginal_area_mm2"] for item in dropped), 1),
+        "note": ("even the cheapest exchange rate exceeded the point cap, so the tail was "
+                 "dropped by marginal area per corner; the area given up is reported "
+                 "rather than hidden"),
+    }
+    current.budget = record
+    current.bound = "budget_bound"
+    return current, current_path, record
 
 
 def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
                         stroke_cov: StrokeCoverage, selection: Selection,
                         pose_selection: Selection, target: TargetSet, station: Station,
                         model: ScannerModel, cfg: PlannerConfig, gate,
-                        *, kin=None, log=None, progress=None):
+                        *, robot: RobotArm | None = None, log=None):
     """Build both deliveries, then keep the one that is better on the same scale.
 
     Two candidate deliverables, both ordered and connected by the same code:
@@ -275,164 +384,82 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
     The ranking is the design's guarantee ("not worse than today"): met the target first,
     then fewer corners, then less travel.
 
-    With `target.max_points` set, the mixed plan is rebuilt for a growing lambda and the
-    largest one that still fits the budget is kept. Delivered points are counted, not
-    estimated: connectors decide on their own how many corners a transfer needs, so any
-    estimate would be a number the program then contradicts.
+    When `target.max_points` is set, a third candidate joins the comparison: the plan the
+    budget layer found, plus the pose-only one only if it too fits the cap. The cap is a
+    hard gate on what may be delivered, so an over-budget plan never wins on coverage.
     """
     say = log or (lambda _message: None)
     target_pct = cfg.target.coverage_target_pct
-    budget = cfg.target.max_points
     sources = {int(row): str(source)
                for row, source in zip(selection.chosen, selection.sources, strict=True)}
+    mixed_sel, mixed_path = _delivery(combined, selection.chosen, sources, stroke_cov,
+                                      coverage, cfg, station, model, gate, robot=robot,
+                                      log=log)
     pose_sources = {int(row): str(source) for row, source
                     in zip(pose_selection.chosen, pose_selection.sources, strict=True)}
-
-    tie = _joint_tie(coverage, stroke_cov, kin)
-    weight = _parallel_weights(coverage, stroke_cov, cfg)
-
-    best = None
-    verdict = ""
-    lam_used = 0.0
-    history: list[tuple[float, int, float]] = []
-    passes = BUDGET_LAMBDAS if budget is not None else (0.0,)
-    for pass_index, lam in enumerate(passes):
-        if progress is not None:
-            progress(0.8 * pass_index / max(len(passes), 1),
-                     f"budget pass {pass_index + 1}/{len(passes)}")
-        offered = _group_selection(combined, coverage, stroke_cov, cfg, tie=tie,
-                                   weight=weight, lam=lam, log=log)
-        chosen_sources = dict(sources)
-        chosen_sources.update({int(row): str(label) for row, label
-                               in zip(offered.chosen, offered.sources, strict=True)})
-
-        def reselect(forbidden, lam=lam):
-            """Re-choose the same problem with the gated items banned."""
-            mask = _exclusion_mask(combined, coverage, stroke_cov, forbidden)
-            again = _group_selection(combined, coverage, stroke_cov, cfg, tie=tie,
-                                     weight=weight, lam=lam, exclude=mask, log=log)
-            return again.chosen, {int(row): str(label) for row, label
-                                  in zip(again.chosen, again.sources, strict=True)}
-
-        mixed_sel, mixed_path = _delivery(combined, offered.chosen, chosen_sources,
-                                          stroke_cov, coverage, cfg, station, model, gate,
-                                          kin=kin, reselect=reselect, log=log)
-        mixed_sel.corners = mixed_path.turns
-        history.append((float(lam), int(mixed_path.turns), float(mixed_sel.coverage_pct)))
-        fits = budget is None or mixed_path.turns <= int(budget)
-        if fits and (best is None
-                     or (mixed_sel.coverage_pct, -mixed_path.turns)
-                     > (best[0].coverage_pct, -best[1].turns)):
-            best = (mixed_sel, mixed_path)
-            lam_used = float(lam)
-        if budget is not None and not fits:
-            # More lambda means more corners; the first overflow bounds the search.
-            break
-
     pose_sel, pose_path = _delivery(combined, pose_selection.chosen, pose_sources,
                                     stroke_cov, coverage, cfg, station, model, gate,
-                                    kin=kin, log=log)
-    pose_sel.corners = pose_path.turns
-    if progress is not None:
-        progress(0.85, "building the pose-only reference")
-    if budget is not None and pose_path.turns > int(budget):
-        pose_sel, pose_path = None, None
-
-    if best is None:
-        # Even the cheapest lambda overflows: this pool has no solution that fits. Drop the
-        # worst value-per-point items until it does, and say so - the alternative is a
-        # program over the controller's limit, which is not a deliverable.
-        best = _shed_to_budget(combined, coverage, stroke_cov, cfg, station, model, gate,
-                               kin=kin, tie=tie, weight=weight, log=log)
-        verdict = "budget_bound"
-    elif budget is not None:
-        met = (target_pct is not None
-               and best[0].coverage_pct + 1e-9 >= float(target_pct))
-        verdict = "target_bound" if met else (
-            "budget_bound" if lam_used > 0.0 else "exhausted")
-
-    mixed_sel, mixed_path = best
+                                    robot=robot, log=log)
     mixed_sel.corners = mixed_path.turns
-    mixed_path.budget_history = history
-    mixed_path.verdict = verdict
-    say(f"  budget: verdict {verdict or 'unbudgeted'}, {mixed_path.turns} corners at "
-        f"lambda {lam_used:g}, {len(history)} trial(s)")
+    pose_sel.corners = pose_path.turns
+    budgeted = _budget_plan(combined, coverage, stroke_cov, cfg, station, model, gate,
+                            robot=robot, log=log)
+    if budgeted is not None:
+        selection, path, _record = budgeted
+        selection.corners = path.turns
+        candidates = [(mixed_sel, mixed_path, "mixed"), (pose_sel, pose_path, "pose-only"),
+                      (selection, path, "budgeted")]
+    else:
+        candidates = [(mixed_sel, mixed_path, "mixed"), (pose_sel, pose_path, "pose-only")]
 
-    mixed_rank = _rank_plan(mixed_sel.coverage_pct, mixed_path.turns,
-                            mixed_path.path_length_mm, target_pct)
-    pose_rank = (_rank_plan(pose_sel.coverage_pct, pose_path.turns,
-                            pose_path.path_length_mm, target_pct)
-                 if pose_sel is not None else None)
-    if pose_rank is not None and pose_rank >= mixed_rank:
-        say(f"  the mixed plan ({mixed_sel.coverage_pct:.2f}%, {mixed_path.turns} corners, "
-            f"{mixed_path.path_length_mm:.0f} mm) does not beat the pose-only plan "
-            f"({pose_sel.coverage_pct:.2f}%, {pose_path.turns} corners, "
-            f"{pose_path.path_length_mm:.0f} mm): delivering the poses")
-        pose_path.verdict = verdict
-        pose_path.budget_history = history
-        return pose_sel, pose_path, _swept_pct(pose_sel, pose_path, target, station, model,
-                                               cfg, combined, gate, log=log)
-    say(f"  the mixed plan wins: {mixed_sel.coverage_pct:.2f}%, {mixed_path.turns} corners "
-        f"against the pose-only {pose_sel.coverage_pct:.2f}%, "
-        f"{pose_path.turns if pose_path is not None else 0}")
-    return mixed_sel, mixed_path, _swept_pct(mixed_sel, mixed_path, target, station, model,
-                                             cfg, combined, gate, log=log)
-
-
-# Lambda samples for the budget search, in corner units. The scale is the cost scale, not
-# the area scale: the score is gain / (cost + lambda), so lambda only has to become large
-# next to a corner count (1 to 3) for the cost term to stop mattering at all.
-BUDGET_LAMBDAS = (0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
-
-
-def _shed_to_budget(combined: CoverageResult, coverage: CoverageResult,
-                    stroke_cov: StrokeCoverage, cfg: PlannerConfig, station: Station,
-                    model: ScannerModel, gate, *, kin, tie, weight, log=None):
-    """Drop the items with the worst covered-area-per-corner until the plan fits.
-
-    The last resort, and it is a real one: with a pool that cannot be squeezed any other
-    way, the choice is between a shorter program and a program the controller rejects. The
-    report calls the outcome `budget_bound` and says how much coverage went with it.
-    """
-    say = log or (lambda _message: None)
-    offered = _group_selection(combined, coverage, stroke_cov, cfg, tie=tie, weight=weight,
-                               log=log)
-    rows = list(offered.chosen)
-    sources = {int(row): str(label) for row, label
-               in zip(offered.chosen, offered.sources, strict=True)}
-    budget = int(cfg.target.max_points)
-    best = None
-    while rows:
-        rebuilt, path = _delivery(combined, rows, sources, stroke_cov, coverage, cfg,
-                                  station, model, gate, kin=kin, log=log)
-        rebuilt.corners = path.turns
-        best = (rebuilt, path)
-        if path.turns <= budget:
-            break
-        # cheapest value per delivered point goes first
-        area = np.asarray(combined.area_mm2, dtype=float)
-        values = [(float(area[combined.sets[row]].sum()), int(row)) for row in rows]
-        values.sort()
-        dropped = values[0][1]
-        rows = [row for row in rows if row != dropped]
-        say(f"  budget too tight: dropping row {dropped} "
-            f"({values[0][0]:.0f} mm2) and retrying")
-    return best
+    cap = None if cfg.target.max_points is None else int(cfg.target.max_points)
+    allowed = [item for item in candidates if cap is None or item[1].turns <= cap]
+    if not allowed:
+        allowed = [candidates[0]]
+    for candidate, candidate_path, label in candidates:
+        if candidate_path.turns > (cap if cap is not None else np.inf):
+            if label == "pose-only":
+                say(f"  the pose-only plan needs {candidate_path.turns} corners and does "
+                    f"not fit the {cap}-point budget: not considered")
+    best = max(allowed, key=lambda item: _rank_plan(item[0].coverage_pct, item[1].turns,
+                                                    item[1].path_length_mm, target_pct))
+    for candidate, candidate_path, label in candidates:
+        if candidate is best[0]:
+            continue
+        say(f"  {label} plan: {candidate.coverage_pct:.2f}%, {candidate_path.turns} "
+            f"corners, {candidate_path.path_length_mm:.0f} mm")
+    say(f"  delivering the {best[2]} plan: {best[0].coverage_pct:.2f}%, "
+        f"{best[1].turns} corners, {best[1].path_length_mm:.0f} mm")
+    if not best[0].bound:
+        best[0].bound = _bound_kind(best[0], coverage, cfg)
+    if budgeted is not None:
+        # The search is part of what this run did, so the report carries it even when a
+        # plan the budget layer did not propose wins: the cap was in force and these were
+        # its candidates and their price in coverage. `delivered` says which plan the
+        # numbers belong to, so nobody reads `chosen_lam` as the delivered plan's rate.
+        best[0].budget = {**budgeted[2], "delivered": best[0] is budgeted[0],
+                          "delivered_plan": best[2]}
+    return (best[0], best[1],
+            _swept_pct(best[0], best[1], target, station, model, cfg, combined, gate,
+                       robot=robot, log=log))
 
 
 def _swept_pct(rebuilt: Selection, path: PathPlan, target: TargetSet, station: Station,
                model: ScannerModel, cfg: PlannerConfig, combined: CoverageResult, gate,
-               *, log=None) -> float:
+               *, robot: RobotArm | None = None, log=None) -> float:
     """The coverage the path actually sweeps, transitions included.
 
     Reported for the workshop and never used for acceptance: it depends on the ordering,
-    so a plan could "gain" coverage by flying over the part.
+    so a plan could "gain" coverage by flying over the part. Transition poses go through
+    the same gates the candidates did, joint window included, so a swing that no
+    configuration of the arm can fly does not add coverage it will never sweep.
     """
     say = log or (lambda _message: None)
     swept_pct = rebuilt.coverage_pct
     swings = transition_poses(path, cfg)
     if swings:
-        swept = evaluate(swings, target.samples, station, model, cfg, visible=gate, log=log)
+        swept = evaluate(swings, target.samples, station, model, cfg, visible=gate,
+                         robot=robot, log=log)
         covered = rebuilt.covered.copy()
         for row in swept.sets:
             covered[row] = True

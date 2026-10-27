@@ -36,6 +36,11 @@ def configure(subparsers) -> None:
         default=3.0,
         help="maximum allowed residual for any registration point (default: 3 mm)",
     )
+    exporter.add_argument(
+        "--travel-motion", default="J", choices=["J", "L"],
+        help="how the repositions of a straight (L) program are emitted: J flies a "
+             "traverse/reorient point between two sweeps as a joint move (default), "
+             "L keeps every move straight")
     exporter.add_argument("--uframe", type=int, help="UFRAME number (default 1, or 0 "
                                                     "with --place or --registration)")
     exporter.add_argument("--utool", type=int, default=1)
@@ -48,9 +53,6 @@ def configure(subparsers) -> None:
     exporter.add_argument("--config", help="configuration override (JSON); it is authoritative "
                                           "for motion, termination and speed when the "
                                           "viewpoint file is a stroke plan")
-    exporter.add_argument("--joint-blocks", action="store_true",
-                          help="write P[n] as joint angles where the viewpoint file has "
-                               "them; the controller then has no branch to choose")
 
 
 def run(args, parser: argparse.ArgumentParser) -> int:
@@ -120,7 +122,7 @@ def run(args, parser: argparse.ArgumentParser) -> int:
                                      else args.uframe),
                              utool=args.utool,
                              motion=motion, speed=speed, termination=termination,
-                             joint_blocks=bool(args.joint_blocks),
+                             travel_motion=args.travel_motion,
                              order=order)
     except ValueError as error:
         parser.error(str(error))

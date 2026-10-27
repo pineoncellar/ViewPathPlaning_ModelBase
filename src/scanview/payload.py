@@ -90,7 +90,8 @@ def build_payload(*, part, viewpoints, fixture=None, base=None, target_points=No
         meshes["base"] = mesh_payload(base, max_faces)
 
     params = scanner if scanner is not None else load_config().scanner
-    records = [_viewpoint_payload(record, params) for record in _coerce(viewpoints)]
+    records = [_viewpoint_payload(record, params, index)
+               for index, record in enumerate(_coerce(viewpoints))]
     centre, radius = _fit(part, records, tracker)
 
     return {
@@ -221,7 +222,7 @@ def _field(record, name: str, default=None):
     return getattr(record, name, default)
 
 
-def _viewpoint_payload(record, params: ScannerParams) -> dict:
+def _viewpoint_payload(record, params: ScannerParams, index: int) -> dict:
     position = np.asarray(_field(record, "position"), dtype=float)
     axis = unit(_field(record, "axis"))
     roll = float(_field(record, "roll_deg", 0.0) or 0.0)
@@ -236,6 +237,10 @@ def _viewpoint_payload(record, params: ScannerParams) -> dict:
 
     return {
         "id": int(_field(record, "id", 0) or 0),
+        # The number the PROGRAM uses: the exporter writes position `k` of the delivered
+        # order as FANUC's `P[k + 1]`, so this is the only label that lets a reader match
+        # a point in the picture against a point in ROBOGUIDE.
+        "p_index": int(index) + 1,
         # `order`, `stroke_id` and `role` are what turn a bag of poses into the program:
         # the page draws the path between consecutive points and has to know which
         # segment is a sweep and which one only moves the head.

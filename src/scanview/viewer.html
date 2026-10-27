@@ -18,12 +18,13 @@
   #stats { display: grid; grid-template-columns: auto auto; gap: 2px 18px; }
   #stats span { color: #8b98a8; }
   #stats b { justify-self: end; font-weight: 600; font-variant-numeric: tabular-nums; }
-  #tools { top: 14px; right: 14px; padding: 10px 12px; width: 208px;
+  #tools { top: 14px; right: 14px; padding: 10px 12px; width: 262px;
     max-height: calc(100vh - 28px); overflow-y: auto; }
   #tools h2 { margin: 0 0 6px; font-size: 11px; font-weight: 600; color: #8b98a8;
     text-transform: uppercase; letter-spacing: .6px; }
   #tools label { display: flex; align-items: center; gap: 7px; padding: 2px 0;
     color: #c9d3de; cursor: pointer; user-select: none; }
+  #tools label > span { white-space: nowrap; }
   #tools input { accent-color: #3b82f6; margin: 0; }
   #tools select { margin-left: auto; background: #1c2530; color: #c9d3de; border: 1px solid #2b3440;
     border-radius: 5px; font-family: inherit; font-size: 11px; padding: 1px 3px; }
@@ -50,14 +51,14 @@
   #info .note { color: #78838f; line-height: 1.6; margin-top: 6px; }
   #legend { left: 14px; bottom: 14px; padding: 8px 12px; color: #97a3b2; line-height: 1.8; }
   .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
-    margin-right: 6px; vertical-align: -1px; }
-  #hint { left: 50%; bottom: 14px; transform: translateX(-50%); padding: 5px 13px;
-    color: #7c8794; white-space: nowrap; }
+    margin-right: 6px; vertical-align: -1px; flex: 0 0 auto; }
+  #tools .swrow { display: flex; align-items: center; gap: 7px; padding: 2px 0; color: #9aa6b4; }
   #error { position: absolute; inset: 0; display: none; place-items: center; padding: 40px;
     text-align: center; line-height: 1.7; color: #e3b341; font-size: 13px; }
   @media (max-width: 760px) {
-    #legend, #hint { display: none; }
-    #tools { width: 150px; }
+    #tools { width: 176px; font-size: 11px; }
+    #tools .note { display: none; }
+    #info { width: 246px; }
   }
 </style>
 </head>
@@ -71,28 +72,31 @@
 </div>
 
 <div id="tools" class="panel">
-  <h2>显示</h2>
-  <label><input type="checkbox" id="show-part" checked> 零件</label>
-  <label><input type="checkbox" id="show-fixture" checked> 夹具</label>
-  <label><input type="checkbox" id="show-base" checked> 底座</label>
-  <label><input type="checkbox" id="show-viewpoints" checked> 视点位置</label>
-  <label><input type="checkbox" id="show-path" checked> 扫描路径</label>
-  <label>视场锥
+  <label><input type="checkbox" id="show-part" checked><span class="sw" style="background:#8fa8bd"></span>零件</label>
+  <label><input type="checkbox" id="show-fixture" checked><span class="sw" style="background:#b08b57"></span>支基 / 夹具</label>
+  <label><input type="checkbox" id="show-base" checked><span class="sw" style="background:#6b6152"></span>底座</label>
+  <label><input type="checkbox" id="show-path" checked><span class="sw" style="background:#38d98a"></span>扫描段（走过的路径）</label>
+  <label><input type="checkbox" id="show-viewpoints" checked><span class="sw" style="background:#ffe08a"></span>程序点</label>
+  <div class="swrow"><span class="sw" style="background:#e33d38"></span>转移段（路径）</div>
+  <div class="swrow"><span class="sw" style="background:#40d9f2"></span>选中点的扫描幅面</div>
+  <div class="swrow"><span class="sw" style="background:#6b9ac7"></span>已覆盖采样</div>
+  <div class="swrow"><span class="sw" style="background:#ed59bf"></span>未覆盖采样</div>
+  <label><span>视场锥</span>
     <select id="fov-mode">
       <option value="selected">仅选中</option>
       <option value="all">全部</option>
       <option value="off">关闭</option>
     </select>
   </label>
-  <label>采样点
+  <label><span>采样点</span>
     <select id="sample-mode">
       <option value="all">全部</option>
       <option value="selected">仅选中视点</option>
       <option value="uncovered">仅未覆盖</option>
-      <option value="off">关闭</option>
+      <option value="off" selected>关闭</option>
     </select>
   </label>
-  <div class="note">单击视点看它的视场锥，单击采样点看谁扫到它。亮色路径是扫描段（带），暗灰段是过渡/退刀；单击路径可从那里开始播放。</div>
+  <div class="note">单击视点看它的视场锥，单击采样点看谁扫到它。<b>绿色</b>是扫描段（走过的路径），<b>红色</b>是转移/退刀段；单击路径可从那里开始播放。<br>左键拖动旋转 · 滚轮缩放 · 右键或 Shift 拖动平移。</div>
   <div class="btnrow">
     <button id="btn-fit">适配</button>
     <button id="btn-iso">等轴</button>
@@ -123,23 +127,6 @@
   <div id="info-extra"></div>
 </div>
 
-<div id="legend" class="panel">
-  <div><span class="sw" style="background:#88a8c8"></span>零件</div>
-  <div><span class="sw" style="background:#c2ae86"></span>夹具 / 底座</div>
-  <div><span class="sw" style="background:#1d4ed8"></span>视点（跟踪器可见）</div>
-  <div><span class="sw" style="background:#f0a03a"></span>视点（跟踪器不可见）</div>
-  <div><span class="sw" style="background:#f07ae8"></span>当前选中视点及其视场</div>
-  <div><span class="sw" style="background:#8fa3a0"></span>全部视点的视场矩形</div>
-  <div><span class="sw" style="background:#2ecf74"></span>已覆盖采样</div>
-  <div><span class="sw" style="background:#e5484d"></span>未覆盖采样</div>
-  <div><span class="sw" style="background:#4ddcf0"></span>选中视点扫到的采样 / 能扫到所选采样的视点</div>
-  <div><span class="sw" style="background:#ffcf6b"></span>扫描路径（带）</div>
-  <div><span class="sw" style="background:#738599"></span>过渡 / 退刀路径</div>
-  <div><span class="sw" style="background:#1adbdf"></span>回放中已扫过的采样</div>
-</div>
-
-<div id="hint" class="panel">左键拖动旋转 · 滚轮缩放 · 右键或 Shift 拖动平移 · 单击视点看它的视场锥</div>
-
 <script id="scene-data" type="application/json">__SCENE_JSON__</script>
 <script>
 (function () {
@@ -164,21 +151,26 @@
   }
 
   var FOV = 45 * Math.PI / 180;
+  // The palette follows the reference viewer's legend: the two meshes keep their
+  // blue-grey / tan, and the program is read by the colour of the segment - green where
+  // the head scans (the path it has gone over) and red where it only travels.
   var COLORS = {
-    part: [0.53, 0.66, 0.78],
-    fixture: [0.76, 0.68, 0.52],
-    base: [0.40, 0.43, 0.48],
-    viewpointOk: [0.11, 0.31, 0.85],
-    viewpointBad: [0.94, 0.63, 0.23],
+    part: [0.56, 0.66, 0.74],
+    fixture: [0.69, 0.55, 0.34],
+    base: [0.42, 0.38, 0.32],
+    viewpointOk: [1.00, 0.88, 0.54],
+    viewpointBad: [0.66, 0.56, 0.34],
     selected: [0.94, 0.48, 0.91],
     footprintAll: [0.56, 0.64, 0.63],
-    sampleSelected: [0.30, 0.86, 1.00],
+    sampleSelected: [0.25, 0.85, 0.95],
     samplePicked: [1.00, 0.86, 0.30],
-    covered: [0.18, 0.78, 0.44],
-    uncovered: [0.90, 0.28, 0.30],
+    // The sample cloud is off by default and never green: green belongs to the scan path,
+    // and a green cloud over the part hides both the part and the bands that scan it.
+    covered: [0.42, 0.60, 0.78],
+    uncovered: [0.93, 0.35, 0.75],
     tracker: [0.30, 0.60, 1.00],
-    pathScan: [1.00, 0.81, 0.42],
-    pathMove: [0.45, 0.52, 0.60],
+    pathScan: [0.22, 0.85, 0.54],
+    pathMove: [0.89, 0.24, 0.22],
     reveal: [0.10, 0.86, 0.88],
     playHead: [1.00, 0.94, 0.60],
     playQuad: [1.00, 0.78, 0.35]
@@ -905,12 +897,23 @@
     });
   }
 
+  // The number the PROGRAM uses. The exporter writes position `k` of the delivered order
+  // as FANUC's `P[k + 1]`, so this is the only label under which a point in the picture and
+  // a point in ROBOGUIDE are the same point. The viewer used to print the 0-based index
+  // instead, which made every point look one lower than it is in the controller.
+  function pointLabel(index) {
+    var record = VP[index];
+    var number = record && record.p_index ? record.p_index : index + 1;
+    return "P[" + number + "]";
+  }
+
   function showInfo(index) {
     var panel = document.getElementById("info");
     if (index < 0) { panel.style.display = "none"; return; }
     var v = VP[index];
-    document.getElementById("info-title").textContent = "视点 " + v.id;
+    document.getElementById("info-title").textContent = pointLabel(index);
     fillRows([
+      ["程序点（P 号）", pointLabel(index) + " · 与 .LS / ROBOGUIDE 一致"],
       ["位置 / mm", v.position.map(function (n) { return formatNumber(n, 1); }).join(", ")],
       ["光轴", v.axis.map(function (n) { return formatNumber(n, 3); }).join(", ")],
       ["滚转", formatNumber(v.roll_deg, 1) + "°"],
@@ -953,7 +956,7 @@
       chips.className = "chips";
       viewers.forEach(function (column) {
         var button = document.createElement("button");
-        button.textContent = "视点 " + VP[column].id;
+        button.textContent = pointLabel(column);
         button.addEventListener("click", function () { select(column); });
         chips.appendChild(button);
       });
@@ -1110,7 +1113,7 @@
     slider.max = String(Math.max(total, 0));
     slider.value = String(playback.index);
     var point = VP[playback.index];
-    var head = "点 " + (VP.length ? playback.index + 1 : 0) + " / " + VP.length;
+    var head = "点 " + pointLabel(playback.index) + " / 共 " + VP.length;
     if (point) {
       if (point.stroke_id !== null && point.stroke_id !== undefined) head += " · 带 " + point.stroke_id;
       if (point.role && point.role !== "coverage") head += " · " + point.role;
@@ -1350,17 +1353,11 @@
     stats.appendChild(key);
     stats.appendChild(strong);
   }
+  // The head-up box says one thing: how many viewpoints the delivered set holds. The
+  // coverage figure and the sample counts belong in the report, where they are read
+  // against their definitions - a number floating over the 3D view invites being read
+  // without them.
   addStat("视点", String(VP.length));
-  if (DATA.stats && DATA.stats.face) addStat("目标面", DATA.stats.face);
-  if (DATA.stats && typeof DATA.stats.coverage_pct === "number") {
-    addStat("覆盖率", DATA.stats.coverage_pct.toFixed(2) + "%");
-  }
-  if (target) {
-    var total = (target.coveredCount || 0) + (target.uncoveredCount || 0);
-    addStat("目标采样", Number(target.coveredCount || 0).toLocaleString()
-                        + " / " + total.toLocaleString());
-  }
-  addStat("坐标系", DATA.units + " · " + DATA.frame);
 
   window.scanplanView = { data: DATA, select: select, render: render,
                           frames: function () { return framesDrawn; },
@@ -1385,11 +1382,11 @@
                                      center: center.slice(), yaw: yaw, pitch: pitch };
                           } };
 
-  // Open on the first pose, so the field-of-view geometry is visible immediately
-  // instead of the page starting with no cone at all.
+  // Nothing is selected on load: the page opens on the program itself - the part, the
+  // sweeps and the transfers - and a cone plus a details box appear only once a pose is
+  // clicked. The selects still open a pose for you when a mode needs one.
   syncPlaybackBuffers();
   syncPlaybackUI();
-  if (VP.length && document.getElementById("fov-mode").value !== "off") select(0);
   render();
 })();
 </script>

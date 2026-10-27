@@ -16,6 +16,7 @@ mistyped parameter would otherwise leave a placeholder silently in force.
 from __future__ import annotations
 
 import json
+import math
 import types
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
@@ -30,6 +31,9 @@ DELIVERY_MODES = ("path", "lean")
 # What the selection optimises against. Millimetres is the upstream design's choice and is
 # kept so the two can be compared on the same part; corners is what the workshop counts.
 COST_MODELS = ("corners", "millimetres")
+# How a seed's roll is chosen. `reference` follows the qianduan2 rule (tool x on station
+# +X); `frame` is the old explicit zero, kept for the legacy preset.
+ROLL_MODES = ("reference", "frame")
 
 
 @dataclass(frozen=True)
@@ -73,16 +77,6 @@ class TargetParams:
     `delivery_mode` chooses between the two deliverables. `path` orders the chosen sweeps
     and inserts a checked connector between them; `lean` hands over the poses alone and
     makes no claim about the motion between them - see the config comment.
-
-    `surface_bias` is the site's taste on a surface where a constant-pose sweep cannot stay
-    valid for long: 0.0 keeps growing into the low-yield tail, 0.5 is the shipped behaviour,
-    1.0 stops at the first sign of diminishing returns. It is one knob rather than six
-    because the workshop can answer "sweep this part fully, or keep the program tidy" and
-    cannot answer "what should min_gain_mm2_per_step be". The derived numbers live in
-    `SURFACE_ANCHORS` and are written back into the report.
-
-    `max_points` is the hard program-point ceiling. `None` skips the whole budget layer, so
-    the selection path is byte-for-byte today's.
     """
 
     sample_grid_mm: float
@@ -93,7 +87,12 @@ class TargetParams:
     knn: int
     coverage_target_pct: float | None
     delivery_mode: str
+    # The one curvature-preference input (merge plan section 6). 0.0 = coverage first,
+    # 0.5 = the shipped behaviour, 1.0 = regular programs first. Everything it implies is
+    # derived into the `stroke` section by `surface_profile`, and written back per key.
     surface_bias: float
+    # The program point cap. null means no budget layer at all, which is the shipped
+    # behaviour and keeps the selection path identical to the one before the budget existed.
     max_points: int | None
 
 
@@ -127,45 +126,16 @@ class StrokeParams:
       the greedy pass takes poses first and strokes only for the tail. `corners` counts
       what the workshop counts: one stop for a pose, two for a stroke, plus the
       transition an extra `transition_corners_estimate` each.
-    * `connector_level` is the most compressed connector the planner may use: 2 is the
-      route through a retract AND a re-orientation point, 1 spreads the rotation over the
-      flight and drops the second point, 0 also allows a straight move between two
-      identical poses. 0 stays off until ROBOGUIDE has confirmed it.
+    * `connector_level` caps the most elaborate connector the planner may use: 2 allows
+      the joint route (a short straight lift, a joint move to the next sweep's pre-point,
+      then a short straight approach), 1 forbids joint travel and keeps every move
+      straight, 0 also allows the corner-less straight move. It is a cap and not a
+      preference: a move between two identical poses shorter than `joint_travel_min_mm`
+      stays straight at every level, and a longer or rotated move is the joint route
+      wherever joint travel is allowed. 0 stays off until ROBOGUIDE has confirmed it.
     * `order_axis_weight_mm_per_deg` prices a pose change in the ordering. Distance alone
       ignores the axis, so two adjacent strokes 60 degrees apart in pose look free to
       travel between and cost a large re-orientation instead.
-
-    The last three belong to the merged coverage/continuity design (2026-10-22):
-
-    * `lock_roll` fixes the roll at seed time from the axis alone (`rolls.roll_for_axis`)
-      instead of leaving every seed at 0 and letting the exporter derive a frame. With a
-      600 x 500 footprint the roll decides which samples a constant-pose sweep can reach,
-      so it has to be decided once, before the coverage is measured - not smoothed
-      afterwards. `False` reproduces the pre-2026-10-22 sweep exactly.
-    * `scan_gate` judges a growth step as a SCAN rather than as a move: at every check step
-      there must still be a target sample inside the footprint, the range and the incidence
-      limit. Without it a stroke keeps growing for up to one coverage step past the point
-      where the head can see anything, and the report still shows the longer sweep as
-      covered. `False` keeps the legacy behaviour (the gap is at most one coverage step,
-      which is why the regression profile can afford to turn it off).
-    * `hard_gate` makes an unconnectable item an ERROR rather than a note. With it on, a
-      stroke whose connector cannot keep positive clearance is removed and the selection is
-      re-run; with it off the path is delivered with a violation line in the report, which
-      is what "legality is a hard constraint" cannot mean. Off only in the regression
-      profile, which exists to reproduce that old behaviour.
-    * `parallel_weight` is the tie-break multiplier for the long parallel bands that form
-      the skeleton. It is 1.0 at the default bias and must never be applied to the repair
-      pass: the last percent of coverage comes from bands in other directions.
-    * `repair_budget_share` is the fraction of `target.max_points` the tail repair may
-      spend. Only has an effect when a budget is set.
-    * `pool_mode` selects the candidate pool. `full` is the aim-grid ladder plus the rail
-      and side-scan families; `grid` is the historical aim-grid ladder alone, which is what
-      the regression profile needs to reproduce; `rails` lays only the rail lines, the
-      "ten minute draft" the design asks for - a smaller pool of the same algorithm, not a
-      second pipeline.
-    * `side_scan_tilt_deg` adds a family of seeds whose optical axis is tilted off the
-      surface normal by this angle, for the walls and deep pockets a head-on sweep cannot
-      reach. 0 disables the family.
     """
 
     enabled: bool
@@ -180,18 +150,33 @@ class StrokeParams:
     check_step_mm: float
     retract_clearance_mm: float
     max_rot_deg_per_mm: float
+    # The "short" threshold of the connector decision: a move between two IDENTICAL poses
+    # shorter than this is flown straight, without inserting a joint move into it. Longer
+    # than this - or any pose change at all - and the transition is the joint route, whose
+    # long move is a joint move, so no straight segment ever has to turn the wrist while
+    # travelling. See `scanplan.path._connector`.
+    joint_travel_min_mm: float
     max_prune_rounds: int
     cost_model: str
     transition_corners_estimate: float
     connector_level: int
     order_axis_weight_mm_per_deg: float
-    lock_roll: bool
-    scan_gate: bool
-    hard_gate: bool
+    # -- roll and wrist (the qianduan2 half of the merge) ------------------------
+    # `reference` keeps tool x on station +X, which is what made the reference program's
+    # wrist turns small; `frame` is the old explicit zero, kept so an old preset can still
+    # reproduce itself. The roll turns the field-of-view rectangle, so it is decided when
+    # the seed is built and never re-picked for a coverage point.
+    roll_mode: str
+    # The per-move wrist turn the program aims for. Exceeding it is reported, never hidden.
+    max_wrist_step_deg: float
+    # Degrees of deviation from the reference posture the smoother accepts per degree of
+    # rotation it saves. Only transition points are ever smoothed.
+    roll_reference_bias: float
+    # -- derived by `surface_profile` -------------------------------------------
+    # Tie-break multiplier for long parallel bands in the selection; 1.0 is neutral.
     parallel_weight: float
+    # Share of a point budget the tail repair may spend; only read when `max_points` is set.
     repair_budget_share: float
-    pool_mode: str
-    side_scan_tilt_deg: float
 
 
 @dataclass(frozen=True)
@@ -209,137 +194,41 @@ class MotionParams:
 
 @dataclass(frozen=True)
 class RobotParams:
-    """The arm, its two limit sets, and the tool - everything the kinematics needs.
+    """The arm the scanner rides on, and the joint window the planner may use.
 
-    Not standard DH and deliberately not written that way: on this controller J3 reports
-    the absolute pitch of the forearm, so `j3_zero_deg`/`j3_sign` mean what the machine
-    means, and the wrist is described by its measured axis order and fixed tilts rather
-    than by a textbook ball-wrist assumption. The numbers below were solved from eight
-    measured poses (position residual <= 0.015 mm, attitude <= 0.001 deg, leave-one-out
-    at the same level) and then checked against four drawing dimensions, so they are
-    measurements, not datasheet guesses. The arm numbers came back unchanged when the
-    pose bank was replaced - only the tool did, which is what a re-taught UTOOL looks
-    like. `docs/robot-calibration.md` is the procedure.
+    `joint_limits_deg` is written in the ROBOT'S WORKSPACE TABLE convention - the numbers a
+    workshop reads on the controller and in the datasheet - not in the CAD model's own joint
+    zero. `scanplan.robot` owns the conversion between the two, because for this arm they
+    are the same physical stops under a different zero (J2 is -90..+46 in the table against
+    -60..+76 in the CAD chain, both 136 deg wide).
 
-    `soft_limits_deg` is what the controller actually enforces. It is inferred, not read
-    off the machine yet (three joints sat exactly on integer values in the captured
-    samples, and the 2026-10-23 bank has two poses sitting 0.68 deg inside the J5 floor,
-    which is the SRVO-115 pose), so it is kept separate from the mechanical envelope: the
-    planner uses the intersection, and `limits_source` in the report says so.
+    `joint_limit_margin` is the derating applied to every stop: 0.9 means the outermost 10%
+    of each axis' travel is off limits, so the arm never works against a mechanical stop and
+    the controller's own settling has somewhere to go.
 
-    `enabled=False` skips the whole gate, which is what keeps the pre-2026-10-22 result
-    reproducible bit for bit.
+    The rest are the three things about the mounting that the planner cannot derive:
+
+    * `base_position_mm` / `base_rpy_deg` place the robot in the station CAD frame, in the
+      same way the station file places the part. Get this wrong and every verdict is wrong
+      while still looking plausible, which is why the report records both;
+    * `tool_length_mm` is the flange-to-TCP distance along the optical axis: 0.0 means the
+      TCP is the mounting flange, which is the honest "not measured yet" value and
+      understates the reach the scanner ball needs;
+    * `tool_mount_deg` is how the bracket is clocked about that axis. It shifts J6 by a
+      constant and nothing else, so a wrong value costs J6 accuracy and not the plan.
+
+    `enabled=False` is the escape hatch for a station where the base pose is not known yet:
+    the run then behaves exactly as it did before the joint check existed.
     """
 
     enabled: bool
     model: str
-
-    base_offset_mm: float
-    j2_height_mm: float
-    upper_arm_mm: float
-    forearm_mm: float
-    forearm_offset_mm: float
-
-    j1_sign: int
-    j1_zero_deg: float
-    j2_sign: int
-    j2_zero_deg: float
-    j3_sign: int
-    j3_zero_deg: float
-    j4_sign: int
-    j4_zero_deg: float
-    j5_sign: int
-    j5_zero_deg: float
-    j6_sign: int
-    j6_zero_deg: float
-    wrist_tilt_deg: tuple[float, float]
-
-    tool_xyz_mm: tuple[float, float, float]
-    tool_ypr_deg: tuple[float, float, float]
-
-    mechanical_limits_deg: tuple[tuple[float, float], ...]
-    soft_limits_deg: tuple[tuple[float, float], ...]
-
-    joint_margin_deg: float
-    j5_min_abs_deg: float
-    max_step_deg: float
-    wrist_identified: bool
-
-    @classmethod
-    def disabled(cls) -> RobotParams:
-        """The measured machine with the gate off - the default when no `robot` block."""
-        return cls(
-            enabled=False, model="FANUC R-2000iC/125L",
-            base_offset_mm=312.0, j2_height_mm=0.0, upper_arm_mm=1075.0,
-            forearm_mm=1730.0, forearm_offset_mm=225.0,
-            j1_sign=1, j1_zero_deg=0.0, j2_sign=1, j2_zero_deg=0.0,
-            j3_sign=-1, j3_zero_deg=0.0, j4_sign=-1, j4_zero_deg=180.0,
-            j5_sign=1, j5_zero_deg=0.0, j6_sign=1, j6_zero_deg=180.0,
-            wrist_tilt_deg=(-90.0, -90.0),
-            tool_xyz_mm=(-248.001, -26.674, 584.158),
-            tool_ypr_deg=(179.279, -45.934, 172.758),
-            mechanical_limits_deg=((-185.0, 185.0), (-136.0, 136.0), (-301.0, 301.0),
-                                   (-720.0, 720.0), (-250.0, 250.0), (-720.0, 720.0)),
-            soft_limits_deg=((-185.0, 185.0), (-60.0, 136.0), (-301.0, 301.0),
-                             (-720.0, 720.0), (-125.0, 125.0), (-360.0, 360.0)),
-            joint_margin_deg=5.0, j5_min_abs_deg=8.0, max_step_deg=40.0,
-            wrist_identified=True,
-        )
-
-
-# The single place the surface-bias table lives. Three anchors, linear in between; the
-# 0.5 column is deliberately equal to the values the shipped configuration carried before
-# 2026-10-22, so `surface_profile(0.5)` is the regression test for the whole table.
-SURFACE_ANCHORS: tuple[tuple[float, dict[str, float]], ...] = (
-    (0.0, {"min_gain_mm2_per_step": 50.0, "min_stroke_mm": 60.0, "seed_dirs": 4.0,
-           "order_axis_weight_mm_per_deg": 1.0, "parallel_weight": 1.0,
-           "repair_budget_share": 0.35}),
-    (0.5, {"min_gain_mm2_per_step": 200.0, "min_stroke_mm": 150.0, "seed_dirs": 4.0,
-           "order_axis_weight_mm_per_deg": 2.0, "parallel_weight": 1.0,
-           "repair_budget_share": 0.20}),
-    (1.0, {"min_gain_mm2_per_step": 600.0, "min_stroke_mm": 300.0, "seed_dirs": 2.0,
-           "order_axis_weight_mm_per_deg": 3.5, "parallel_weight": 1.3,
-           "repair_budget_share": 0.05}),
-)
-
-# Deliberately NOT in the table: `scanner.max_incidence_deg` and `scanner.range_mm`. Making
-# the scanner see further is not a taste setting, and tuning it to buy coverage would make
-# the report look better without the head being able to scan any of it.
-
-
-def surface_profile(bias: float) -> dict[str, dict[str, float]]:
-    """The `stroke` keys that follow from one `target.surface_bias`, as a config patch.
-
-    Pure function of the bias by design: it is merged *under* the override file, so an
-    explicitly written key always wins and nothing has to track which keys were typed by
-    hand. `seed_dirs` is interpolated and rounded because a direction family cannot be
-    fractional.
-    """
-    value = float(bias)
-    if not 0.0 <= value <= 1.0:
-        raise ValueError(f"'surface_bias' must be in [0, 1], not {bias!r}: an out-of-range "
-                         "bias is refused rather than clamped, so a typo cannot silently "
-                         "become 'maximum tidiness'")
-    low, high = SURFACE_ANCHORS[0], SURFACE_ANCHORS[-1]
-    for anchor, values in SURFACE_ANCHORS:
-        if abs(value - anchor) < 1e-12:
-            # Exactly on an anchor: return the table's own numbers rather than a
-            # interpolation that lands one ulp away. The test that pins the three columns
-            # compares against the table, so it must not have to guess at 0.049999...
-            return {"stroke": {key: float(item) for key, item in values.items()}}
-    for (start, first), (end, second) in zip(SURFACE_ANCHORS, SURFACE_ANCHORS[1:],
-                                             strict=True):
-        if start <= value <= end:
-            low, high = (start, first), (end, second)
-            break
-    span = high[0] - low[0]
-    share = 0.0 if span <= 0.0 else (value - low[0]) / span
-    derived: dict[str, float] = {}
-    for key, start_value in low[1].items():
-        end_value = high[1][key]
-        mixed = start_value + (end_value - start_value) * share
-        derived[key] = float(round(mixed)) if key == "seed_dirs" else float(mixed)
-    return {"stroke": derived}
+    joint_limits_deg: tuple[tuple[float, float], ...]
+    joint_limit_margin: float
+    base_position_mm: tuple[float, float, float]
+    base_rpy_deg: tuple[float, float, float]
+    tool_length_mm: float
+    tool_mount_deg: float
 
 
 @dataclass(frozen=True)
@@ -349,14 +238,19 @@ class PlannerConfig:
     tracker: TrackerParams
     stroke: StrokeParams
     motion: MotionParams
+    robot: RobotParams
     occlusion_tol_mm: float
     seed: int
-    robot: RobotParams = field(default_factory=RobotParams.disabled)
     source: str = ""
     override: str | None = None
-    # Where each surface-derived `stroke` value came from: `base`, `profile(bias=x)` or
-    # `override`. Written into the report so "why is min_stroke_mm 300" is answerable.
-    parameter_sources: dict[str, str] = field(default_factory=dict)
+    # Which layer each `surface_bias`-derived key came from: `base`, `profile` or
+    # `override`. Written into the report so "why is this number 200?" has an answer.
+    derived: dict = field(default_factory=dict)
+
+    @property
+    def surface_bias_source(self) -> str:
+        """Where `target.surface_bias` itself was set: `base` or `override`."""
+        return str(self.derived.get("surface_bias", "base"))
 
     @property
     def contact_distance_mm(self) -> float:
@@ -369,55 +263,106 @@ def default_config_path() -> Path:
     return Path(__file__).resolve().parents[2] / "configs" / DEFAULT_CONFIG_NAME
 
 
+# The surface profile (merge plan section 6.2). One semantic input - "does this part have
+# to be scanned completely, or does a regular program matter more?" - and the `stroke` keys
+# it implies. Three anchors, interpolated linearly, and the middle anchor IS the shipped
+# configuration: at bias 0.5 every pre-existing key keeps its factory value and the two
+# new ones are neutral, which is what makes every old config file behave as before.
+#
+# `scanner.max_incidence_deg` and `scanner.range_mm` are deliberately NOT in here. They
+# are sensor physics, not taste; bending them to buy coverage would fake a capability and
+# make the report look better while the cell cannot scan it.
+SURFACE_PROFILE_ANCHORS: dict[str, tuple[float, float, float]] = {
+    # growth stop threshold: low keeps growing, high gives up earlier
+    "min_gain_mm2_per_step": (50.0, 200.0, 600.0),
+    # dropped fragments: high means fewer corners and fewer short bands
+    "min_stroke_mm": (60.0, 150.0, 300.0),
+    # direction family: 2 = the in-plane long axis only, so the program stays parallel
+    "seed_dirs": (4.0, 4.0, 2.0),
+    # what a pose change costs the ordering: high means fewer re-orientations
+    "order_axis_weight_mm_per_deg": (1.0, 2.0, 3.5),
+    # neutral tie-break for long parallel bands in the selection
+    "parallel_weight": (1.00, 1.00, 1.30),
+    # share of a point budget the tail repair may spend
+    "repair_budget_share": (0.35, 0.20, 0.05),
+}
+# Keys the profile derives, in report order.
+SURFACE_PROFILE_KEYS = tuple(SURFACE_PROFILE_ANCHORS)
+
+
+def surface_profile(bias: float) -> dict[str, float]:
+    """The `stroke` keys a `surface_bias` implies, at the three anchors and in between.
+
+    Pure, so the anchors are unit-testable, and monotone in `bias`: a higher bias never
+    grows a band further, never keeps a shorter fragment, never adds a direction family,
+    never makes a pose change cheaper and never hands the repair pass more budget.
+    """
+    value = float(bias)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("surface_bias must be in [0.0, 1.0]")
+    profile: dict[str, float] = {}
+    for key, (low, middle, high) in SURFACE_PROFILE_ANCHORS.items():
+        if value <= 0.5:
+            share = value / 0.5
+            blended = low + (middle - low) * share
+        else:
+            share = (value - 0.5) / 0.5
+            blended = middle + (high - middle) * share
+        if key == "seed_dirs":
+            profile[key] = int(round(blended))
+        else:
+            profile[key] = round(float(blended), 6)
+    return profile
+
+
+def _surface_bias(base: dict[str, Any], override: dict[str, Any]) -> tuple[float, str]:
+    """The effective `surface_bias` and which layer set it. An override wins outright."""
+    if "surface_bias" in override.get("target", {}):
+        return float(override["target"]["surface_bias"]), "override"
+    return float(base.get("target", {}).get("surface_bias", 0.5)), "base"
+
+
+def _profile_sources(base: dict[str, Any], override: dict[str, Any], bias: float,
+                     ) -> dict[str, str]:
+    """Which layer each derived key came from, for the report.
+
+    An explicit value always wins over the profile, so a key written in the override file
+    is reported as `override`; a key the base file already sets to the profile's value is
+    reported as `base` (at bias 0.5 that is every pre-existing key).
+    """
+    profile = surface_profile(bias)
+    base_stroke = base.get("stroke", {})
+    override_stroke = override.get("stroke", {})
+    sources: dict[str, str] = {"surface_bias": _surface_bias(base, override)[1]}
+    for key in SURFACE_PROFILE_KEYS:
+        if key in override_stroke:
+            sources[key] = "override"
+        elif key in base_stroke and float(base_stroke[key]) == float(profile[key]):
+            sources[key] = "base"
+        else:
+            sources[key] = "profile"
+    return sources
+
+
 def load_config(path: str | Path | None = None) -> PlannerConfig:
     """Load the shipped configuration, optionally overridden by `path`.
 
-    Three layers, lowest first: the shipped file, the patch derived from
-    `target.surface_bias`, and the override file. Putting the derived patch *above* the
-    shipped file is the point - the shipped file writes all of these keys, so a profile
-    merged underneath it could never take effect. Putting it *below* the override file is
-    the other half: an explicitly written key always wins, and nothing has to remember
-    which keys were typed by hand.
-
-    The bias itself is read from the override file first, so `{"target": {"surface_bias":
-    1.0}}` alone is enough to ask for the tidy profile.
+    Three layers, in this order: the shipped file, the `surface_bias` profile, and the
+    override file - so an explicitly written key always beats a derived one, and nobody
+    has to track which of the derived keys a given preset was written against.
     """
     base_path = default_config_path()
     base = _read_json(base_path)
-    override_data: dict[str, Any] = {} if path is None else _read_json(Path(path))
-    bias = _surface_bias(base, override_data)
-    profile = surface_profile(bias)
-    data = _deep_merge(_deep_merge(base, profile), override_data)
-    return _build(data, str(base_path), None if path is None else str(path),
-                  parameter_sources=_profile_sources(base, override_data, bias, profile))
-
-
-def _surface_bias(base: dict[str, Any], override_data: dict[str, Any]) -> float:
-    """The bias in force: the override's value if written, else the shipped one, else 0.5."""
-    for source in (override_data, base):
-        target = source.get("target")
-        if isinstance(target, dict) and "surface_bias" in target:
-            return float(target["surface_bias"])
-    return 0.5
-
-
-def _profile_sources(base: dict[str, Any], override_data: dict[str, Any], bias: float,
-                     profile: dict[str, dict[str, Any]]) -> dict[str, str]:
-    """Attribute every derived `stroke` key: `override`, `base`, or `profile(bias=x)`."""
-    written = override_data.get("stroke")
-    written = written if isinstance(written, dict) else {}
-    shipped = base.get("stroke")
-    shipped = shipped if isinstance(shipped, dict) else {}
-    sources: dict[str, str] = {}
-    for section, values in profile.items():
-        for key in values:
-            if key in written:
-                sources[f"{section}.{key}"] = "override"
-            elif abs(bias - 0.5) < 1e-12 and key in shipped:
-                sources[f"{section}.{key}"] = "base"
-            else:
-                sources[f"{section}.{key}"] = f"profile(bias={bias:g})"
-    return sources
+    override_name: str | None = None
+    explicit: dict[str, Any] = {}
+    if path is not None:
+        override_path = Path(path)
+        explicit = _read_json(override_path)
+        override_name = str(override_path)
+    bias, _source = _surface_bias(base, explicit)
+    data = _deep_merge(_deep_merge(base, {"stroke": surface_profile(bias)}), explicit)
+    return _build(data, str(base_path), override_name,
+                  derived=_profile_sources(base, explicit, bias))
 
 
 def override(config: PlannerConfig, **sections) -> PlannerConfig:
@@ -426,7 +371,26 @@ def override(config: PlannerConfig, **sections) -> PlannerConfig:
     The command line is a second writer of the same knobs as the JSON file, so it has to go
     through the same validation; otherwise the two can disagree about what is legal and the
     illegal value wins only when it arrives by flag.
+
+    Setting `target.surface_bias` here re-derives the profile, exactly as loading a file
+    with that key does - a flag that silently left the derived keys at the old profile would
+    be a knob that does not turn anything.
     """
+    if "surface_bias" in sections.get("target", {}):
+        bias = float(sections["target"]["surface_bias"])
+        profile = surface_profile(bias)   # raises on an out-of-range bias
+        stroke = dict(sections.get("stroke", {}))
+        derived = dict(config.derived)
+        for key, value in profile.items():
+            if key in stroke:
+                derived[key] = "override"
+            else:
+                stroke[key] = value
+                derived[key] = f"profile(bias={bias:g})"
+        derived["surface_bias"] = "override"
+        sections = {**sections, "stroke": stroke}
+        config = replace(config, derived=derived)
+
     replacement = config
     for name, changes in sections.items():
         section = getattr(config, name)
@@ -462,27 +426,26 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _build(data: dict[str, Any], source: str, override: str | None,
-           parameter_sources: dict[str, str] | None = None) -> PlannerConfig:
+           derived: dict[str, str] | None = None) -> PlannerConfig:
     _reject_unknown(data)
     scanner = _section(data, "scanner", ScannerParams)
     target = _section(data, "target", TargetParams)
     tracker = _section(data, "tracker", TrackerParams)
     stroke = _section(data, "stroke", StrokeParams)
     motion = _section(data, "motion", MotionParams)
-    robot = (_section(data, "robot", RobotParams) if "robot" in data
-             else RobotParams.disabled())
+    robot = _section(data, "robot", RobotParams)
     config = PlannerConfig(
         scanner=scanner,
         target=target,
         tracker=tracker,
         stroke=stroke,
         motion=motion,
+        robot=robot,
         occlusion_tol_mm=float(data["occlusion_tol_mm"]),
         seed=int(data["seed"]),
-        robot=robot,
         source=source,
         override=override,
-        parameter_sources=dict(parameter_sources or {}),
+        derived=dict(derived or {}),
     )
     _validate(config)
     return config
@@ -521,13 +484,7 @@ def _section(data: dict[str, Any], name: str, cls: type) -> Any:
 
 
 def _coerce(annotation: Any, value: Any) -> Any:
-    """Turn JSON lists into the tuples the frozen dataclasses declare, at any depth.
-
-    The recursion is not cosmetic: `robot.mechanical_limits_deg` is a list of six pairs,
-    and a one-level conversion would leave each pair as a JSON list. That reads fine in
-    `limits[i][0]` but silently breaks anything that relies on the declared type - a
-    frozen dataclass that quietly holds mutable lists is a trap left for the next edit.
-    """
+    """Turn JSON lists into the tuples the frozen dataclasses declare, nesting included."""
     if get_origin(annotation) is tuple:
         members = get_args(annotation)
         if not members:
@@ -571,7 +528,6 @@ def _optional_member(annotation: Any):
 
 MOTION_TYPES = ("J", "L")
 TERMINATIONS = ("FINE", "CNT0", "CNT100")
-POOL_MODES = ("full", "grid", "rails")
 
 
 def _validate(config: PlannerConfig) -> None:
@@ -608,12 +564,17 @@ def _validate(config: PlannerConfig) -> None:
     if target.delivery_mode not in DELIVERY_MODES:
         raise ValueError(f"'delivery_mode' must be one of {DELIVERY_MODES}, "
                          f"not {target.delivery_mode!r}")
+    if not 0.0 <= float(target.surface_bias) <= 1.0:
+        raise ValueError("'surface_bias' must be in [0.0, 1.0] - 0 is coverage first, "
+                         "1 is regular programs first. A value outside that range is "
+                         "refused rather than silently clamped, like coverage_target_pct")
+    if target.max_points is not None and int(target.max_points) < 2:
+        raise ValueError("'max_points' must be at least 2 (a program needs two corners to "
+                         "be a program), or null to skip the budget layer entirely")
     if config.tracker.model_robot_occlusion:
         # There is no robot model at this stage, so this flag cannot be honoured.
         raise ValueError("'model_robot_occlusion' is not implemented; leave it false")
     _validate_strokes(config.stroke)
-    _validate_surface(target)
-    _validate_robot(config.robot)
     if config.motion.type not in MOTION_TYPES:
         raise ValueError(f"'motion.type' must be one of {MOTION_TYPES}, "
                          f"not {config.motion.type!r}")
@@ -622,6 +583,44 @@ def _validate(config: PlannerConfig) -> None:
                          f"not {config.motion.termination!r}")
     if config.motion.speed_mm_s <= 0.0:
         raise ValueError("'motion.speed_mm_s' must be positive")
+    _validate_robot(config.robot)
+
+
+def _validate_robot(robot: RobotParams) -> None:
+    """Refuse a joint window or a base pose that could not describe a robot.
+
+    The model name is checked against the kinematic table in `scanplan.robot` before
+    anything else: a typo there would otherwise fall through to "every pose unreachable",
+    which reads as a planning result rather than as a configuration mistake. The import is
+    local because that module needs this one for its own parameter type.
+    """
+    from .robot import MODELS  # local: that module imports this one for its parameter type
+
+    if not robot.enabled:
+        return
+    if robot.model not in MODELS:
+        raise ValueError(f"'robot.model' must be one of {sorted(MODELS)}, not "
+                         f"{robot.model!r} - the kinematic chain and the workspace table "
+                         "are both per-model facts, so a new one has to be added to "
+                         "scanplan.robot rather than guessed here")
+    if len(robot.joint_limits_deg) != 6:
+        raise ValueError("'robot.joint_limits_deg' needs one [min, max] pair per axis, "
+                         f"six in all, not {len(robot.joint_limits_deg)}")
+    for axis, (low, high) in enumerate(robot.joint_limits_deg, start=1):
+        if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+            raise ValueError(f"'robot.joint_limits_deg' J{axis} needs a min below its max, "
+                             f"not {[low, high]}")
+    if not 0.0 < robot.joint_limit_margin <= 1.0:
+        raise ValueError("'robot.joint_limit_margin' must be in (0, 1]: a share of the "
+                         "joint travel, where 0.9 leaves the outermost 10% unused. Above 1 "
+                         "the check would allow the mechanical stops themselves")
+    for name, values in (("base_position_mm", robot.base_position_mm),
+                         ("base_rpy_deg", robot.base_rpy_deg)):
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"'robot.{name}' must be three finite numbers, not {values}")
+    if robot.tool_length_mm < 0.0:
+        raise ValueError("'robot.tool_length_mm' cannot be negative: it is the distance "
+                         "from the mounting flange to the TCP along the optical axis")
 
 
 def _validate_strokes(stroke: StrokeParams) -> None:
@@ -642,80 +641,29 @@ def _validate_strokes(stroke: StrokeParams) -> None:
         raise ValueError("'max_prune_rounds' cannot be negative")
     if stroke.max_rot_deg_per_mm <= 0.0:
         raise ValueError("'max_rot_deg_per_mm' must be positive")
+    if stroke.joint_travel_min_mm <= 0.0:
+        raise ValueError("'joint_travel_min_mm' must be positive: it is the travel below "
+                         "which a move between two identical poses stays straight")
     if stroke.cost_model not in COST_MODELS:
         raise ValueError(f"'cost_model' must be one of {COST_MODELS}, "
                          f"not {stroke.cost_model!r}")
     if stroke.transition_corners_estimate < 0.0:
         raise ValueError("'transition_corners_estimate' cannot be negative")
     if not 0 <= stroke.connector_level <= 2:
-        raise ValueError("'connector_level' must be in [0, 2]: 2 is the retract-and-"
-                         "reorient route, 1 drops the reorient point, 0 also allows a "
-                         "straight move between two identical poses")
+        raise ValueError("'connector_level' must be in [0, 2]: 2 allows the joint travel "
+                         "route between sweeps, 1 forbids it and keeps every move "
+                         "straight, 0 also allows a corner-less straight move between two "
+                         "identical poses")
     if stroke.order_axis_weight_mm_per_deg < 0.0:
         raise ValueError("'order_axis_weight_mm_per_deg' cannot be negative")
+    if stroke.roll_mode not in ROLL_MODES:
+        raise ValueError(f"'roll_mode' must be one of {ROLL_MODES}, not {stroke.roll_mode!r}")
+    if not 0.0 < stroke.max_wrist_step_deg <= 180.0:
+        raise ValueError("'max_wrist_step_deg' must be in (0, 180]")
+    if stroke.roll_reference_bias < 0.0:
+        raise ValueError("'roll_reference_bias' cannot be negative")
     if stroke.parallel_weight <= 0.0:
-        raise ValueError("'parallel_weight' must be positive: it multiplies the gain of "
-                         "the parallel bands, so zero would delete the skeleton")
+        raise ValueError("'parallel_weight' must be positive: it multiplies a score, "
+                         "and a zero or negative multiplier would invert the ranking")
     if not 0.0 <= stroke.repair_budget_share <= 1.0:
-        raise ValueError("'repair_budget_share' must be in [0, 1]")
-    if stroke.pool_mode not in POOL_MODES:
-        raise ValueError(f"'pool_mode' must be one of {POOL_MODES}, "
-                         f"not {stroke.pool_mode!r}")
-    if not 0.0 <= stroke.side_scan_tilt_deg < 90.0:
-        raise ValueError("'side_scan_tilt_deg' must be in [0, 90): it is the angle between "
-                         "the optical axis and the surface normal")
-
-
-def _validate_surface(target: TargetParams) -> None:
-    """The two site-facing knobs introduced with the merged coverage design."""
-    if not 0.0 <= target.surface_bias <= 1.0:
-        raise ValueError(f"'surface_bias' must be in [0, 1], not {target.surface_bias!r} - "
-                         "out of range is refused rather than clamped, because a clamped "
-                         "bias looks like a deliberate choice")
-    if target.max_points is not None and target.max_points < 2:
-        raise ValueError("'max_points' must be at least 2, or null to skip the budget "
-                         "layer - one point cannot describe a path")
-
-
-def _validate_robot(robot: RobotParams) -> None:
-    if not robot.enabled:
-        return
-    for name in ("upper_arm_mm", "forearm_mm", "forearm_offset_mm"):
-        if getattr(robot, name) <= 0.0:
-            raise ValueError(f"'robot.{name}' must be positive")
-    if robot.forearm_mm <= robot.forearm_offset_mm:
-        raise ValueError("'robot.forearm_mm' must exceed 'forearm_offset_mm': the wrist "
-                         "centre sits off the forearm axis, not behind it")
-    for name in ("j1_sign", "j2_sign", "j3_sign", "j4_sign", "j5_sign", "j6_sign"):
-        if getattr(robot, name) not in (-1, 1):
-            raise ValueError(f"'robot.{name}' must be -1 or +1")
-    for name in ("mechanical_limits_deg", "soft_limits_deg"):
-        limits = getattr(robot, name)
-        if len(limits) != 6:
-            raise ValueError(f"'robot.{name}' needs six [low, high] pairs")
-        for low, high in limits:
-            if low >= high:
-                raise ValueError(f"'robot.{name}' has an empty range [{low}, {high}]")
-    if len(robot.wrist_tilt_deg) != 2:
-        raise ValueError("'robot.wrist_tilt_deg' needs two angles")
-    if len(robot.tool_xyz_mm) != 3 or len(robot.tool_ypr_deg) != 3:
-        raise ValueError("'robot.tool_xyz_mm' and 'robot.tool_ypr_deg' need three values")
-    if len(robot.mechanical_limits_deg) == 6 and len(robot.soft_limits_deg) == 6:
-        for axis, ((low, high), (soft_low, soft_high)) in enumerate(
-                zip(robot.mechanical_limits_deg, robot.soft_limits_deg, strict=True), start=1):
-            if soft_low < low or soft_high > high:
-                raise ValueError(
-                    f"'robot.soft_limits_deg' axis J{axis} [{soft_low}, {soft_high}] is "
-                    f"wider than the mechanical envelope [{low}, {high}]: the controller "
-                    "cannot be more permissive than the arm")
-    if robot.joint_margin_deg < 0.0:
-        raise ValueError("'robot.joint_margin_deg' cannot be negative")
-    if robot.max_step_deg <= 0.0:
-        raise ValueError("'robot.max_step_deg' must be positive")
-    j5_low, j5_high = robot.soft_limits_deg[4]
-    if robot.j5_min_abs_deg >= (j5_high - j5_low) / 2.0:
-        raise ValueError("'robot.j5_min_abs_deg' leaves no usable J5 band inside the soft "
-                         f"limits [{j5_low}, {j5_high}]")
-    if robot.j5_min_abs_deg <= 0.0:
-        raise ValueError("'robot.j5_min_abs_deg' must be positive: J5 = 0 is the wrist "
-                         "singularity, not a safe centre")
+        raise ValueError("'repair_budget_share' must be in [0.0, 1.0]")

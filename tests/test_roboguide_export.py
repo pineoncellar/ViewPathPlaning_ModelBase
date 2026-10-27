@@ -24,6 +24,18 @@ from scanplan.roboguide import adapt, ls, wpr
 
 PROG = "SCAN_A"
 
+_POSITION_BLOCK = re.compile(r"P\[(\d+)\]\{(.*?)\};", re.S)
+
+
+def exported_positions(text: str) -> dict[int, tuple[float, ...]]:
+    """The `/POS` section as `{P index: (X, Y, Z)}`, so a test can compare numbers."""
+    positions: dict[int, tuple[float, ...]] = {}
+    for block in _POSITION_BLOCK.finditer(text):
+        numbers = dict(re.findall(r"([XYZ])\s*=\s*(-?[\d.]+)\s*mm", block.group(2)))
+        positions[int(block.group(1))] = (float(numbers["X"]), float(numbers["Y"]),
+                                          float(numbers["Z"]))
+    return positions
+
 
 def viewpoints() -> list[dict]:
     """Four synthetic viewpoints: straight down, and two tilted ones, various rolls."""
@@ -56,6 +68,47 @@ def test_the_program_name_matches_the_file_name(tmp_path):
     assert text.splitlines()[0].split() == ["/PROG", PROG]
 
 
+def test_a_position_is_never_skipped_or_repeated(tmp_path):
+    """`P[1] .. P[n]`, one per delivered point, in the delivered order.
+
+    This is the numbering the 3D view has to show. A gap here would make every later
+    point one number lower in ROBOGUIDE than in the picture, and a repeat would make two
+    program points indistinguishable.
+    """
+    adapt.export(viewpoints(), tmp_path, prog_name=PROG)
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    positions = exported_positions(text)
+    assert sorted(positions) == list(range(1, len(viewpoints()) + 1))
+    for index, vp in enumerate(viewpoints(), start=1):
+        assert positions[index] == pytest.approx(vp["position"], abs=0.001)
+    moves = re.findall(r"^\s*\d+:\s*[JL] P\[(\d+)\]", text, re.M)
+    assert [int(move) for move in moves] == list(range(1, len(viewpoints()) + 1))
+
+
+def test_the_3d_view_numbers_points_the_way_the_program_does(tmp_path):
+    """The picture's `P[n]` and the controller's `P[n]` must be the same point.
+
+    The page used to print the 0-based index, which made every point look one lower than
+    the same point in ROBOGUIDE - the difference an operator notices when they check a
+    pose in the controller.
+    """
+    from scanview.payload import build_payload
+
+    adapt.export(viewpoints(), tmp_path, prog_name=PROG)
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    positions = exported_positions(text)
+    payload = build_payload(part=_unit_cube(), viewpoints=viewpoints())
+    records = payload["viewpoints"]
+    assert [record["p_index"] for record in records] == list(range(1, len(records) + 1))
+    for record in records:
+        assert positions[record["p_index"]] == pytest.approx(record["position"], abs=0.001)
+
+
+def _unit_cube():
+    import trimesh
+    return trimesh.creation.box(extents=(10.0, 10.0, 10.0))
+
+
 def test_the_uframe_default_follows_the_placement(tmp_path):
     plain = adapt.export(viewpoints(), tmp_path / "cad", prog_name=PROG)
     assert plain["uframe_utool"]["uframe"] == 1
@@ -68,77 +121,6 @@ def test_the_uframe_default_follows_the_placement(tmp_path):
     assert placed["placement"]["applied"] == "1000,2000,3000,0,0,90"
     text = (tmp_path / "world" / f"{PROG}.LS").read_text(encoding="ascii")
     assert "UFRAME_NUM=0 ;" in text
-
-
-def test_a_speed_without_a_known_unit_is_refused():
-    """A typo in the speed field would otherwise be written into the program."""
-    with pytest.raises(ValueError, match="speed"):
-        ls.check_speed("fast")
-    with pytest.raises(ValueError, match="positive"):
-        ls.check_speed("0%")
-    with pytest.raises(ValueError, match="100 percent"):
-        ls.check_speed("150%")
-    with pytest.raises(ValueError, match="joint move"):
-        ls.check_speed("250mm/sec", motion="J")
-    assert ls.check_speed("250mm/sec", motion="L") == "250mm/sec"
-    assert ls.check_speed("100%") == "100%"
-
-
-def test_each_point_carries_its_own_config_string(tmp_path):
-    """One CONFIG for the whole program is how every point got pinned to one branch."""
-    points = viewpoints()
-    for index, point in enumerate(points):
-        point["config"] = f"F D T, {index}, 0, 0"
-    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0")
-    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
-    for index in range(len(points)):
-        assert f"CONFIG : 'F D T, {index}, 0, 0'" in text
-    assert "CONFIG : 'N U T, 0, 0, 0'" not in text
-
-
-def test_a_point_without_a_config_falls_back_to_the_program_default(tmp_path):
-    points = viewpoints()
-    points[0]["config"] = "F D F, 0, 0, 0"
-    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0")
-    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
-    assert "CONFIG : 'F D F, 0, 0, 0'" in text
-    assert text.count("CONFIG : 'N U T, 0, 0, 0'") == len(points) - 1
-
-
-def test_joint_blocks_are_written_when_asked_for(tmp_path):
-    """The most direct fix for the branch problem: the controller has nothing to solve."""
-    points = viewpoints()
-    for point in points:
-        point["joints_deg"] = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0)
-    adapt.export(points, tmp_path, prog_name=PROG, joint_blocks=True, motion="L")
-    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
-    assert text.count("J1=") == len(points)
-    assert "X =" not in text
-    # a joint-representation point cannot be reached with an L move
-    assert text.count("J P[") == len(points)
-    assert "L P[" not in text
-
-
-def test_joint_blocks_are_ignored_without_joint_values(tmp_path):
-    adapt.export(viewpoints(), tmp_path, prog_name=PROG, joint_blocks=True)
-    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
-    assert "J1=" not in text
-    assert text.count("X =") == len(viewpoints())
-
-
-def test_wpr_is_unwrapped_along_the_delivered_order():
-    """Two consecutive poses must not be written 358 degrees apart."""
-    points = [
-        {"id": 1, "position": (0.0, 0.0, 300.0), "axis": (0.0, 0.0, -1.0), "roll_deg": 179.0},
-        {"id": 2, "position": (1.0, 0.0, 300.0), "axis": (0.0, 0.0, -1.0), "roll_deg": 181.0},
-    ]
-    converted = adapt.viewpoints_to_points(points)
-    first, second = (np.asarray(item["wpr_deg"], dtype=float) for item in converted)
-    assert abs(second[2] - first[2]) < 10.0
-    # the rotation is unchanged by the whole turns that were added
-    for item, source in zip(converted, points, strict=True):
-        assert np.allclose(wpr.wpr_to_rot(*item["wpr_deg"]),
-                           scanner_frame(source["axis"], source["roll_deg"]), atol=1e-9)
 
 
 def test_the_exported_frame_is_the_single_scanner_frame_definition():
@@ -299,6 +281,23 @@ def test_the_attribute_header_is_self_consistent():
     assert text.count("J P[") == len(points)
     for index in range(1, len(points) + 1):
         assert f"P[{index}]{{" in text
+
+
+def test_a_joint_review_ignores_the_travel_settings():
+    """A J program is a reachability review: every point is a joint move, at FINE.
+
+    The travel settings describe the joint travel of a straight program. There are no
+    sweeps to travel between in a review, so they must not reach the program at all.
+    """
+    points = adapt.viewpoints_to_points(viewpoints())
+    assert len(points) == 4
+    for point, role in zip(points, ["coverage", "coverage", "joint", "joint"],
+                           strict=True):
+        point["role"] = role
+    text = ls.build_ls(points, prog_name=PROG, uframe=1, utool=2, motion="J", speed="50%")
+    assert text.count("J P[") == len(points)
+    assert "50% FINE" in text
+    assert "CNT100" not in text
 
 
 def test_the_points_csv_is_the_flat_table_the_field_asked_for(tmp_path):

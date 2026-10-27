@@ -12,14 +12,7 @@ def configure(subparsers) -> None:
         NAME,
         help="start the local browser interface for station setup and path planning",
     )
-    web.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help=(
-            "bind address; the default serves this machine only. "
-            "Use 0.0.0.0 to let other machines on the LAN open the page."
-        ),
-    )
+    web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8765)
 
 

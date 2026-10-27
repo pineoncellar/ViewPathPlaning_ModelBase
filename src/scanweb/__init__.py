@@ -1,28 +1,19 @@
 """Local-only browser interface for station setup, datum registration, and path export.
 
-`scanplan web` serves `index.html`, `app.css` and `app.js` from this package and
-answers their JSON requests with the planner's own API; nothing is uploaded
-anywhere. The page is packaged with the service (unlike a repo-root asset), so an
-installed `scanplan web` finds it.
+`scanplan web` serves `index.html` from this package and answers its JSON requests
+with the planner's own API; nothing is uploaded anywhere. The page is packaged with
+the service (unlike a repo-root asset), so an installed `scanplan web` finds it.
 """
 
 from __future__ import annotations
 
 import base64
-import csv
 import html
 import json
 import re
-import shutil
-import socket
-import sqlite3
-import threading
-import time
 import traceback
 import uuid
-import zlib
-from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -34,91 +25,17 @@ import trimesh
 from scanplan.config import load_config, override
 from scanplan.pipeline import plan, write_outputs
 from scanplan.registration import RigidRegistration, fit_points
-from scanplan.report import (
-    Viewpoint,
-    write_report,
-    write_samples_csv,
-    write_viewpoints_csv,
-    write_viewpoints_json,
-)
 from scanplan.roboguide.adapt import export as export_ls
 from scanplan.roboguide.wpr import normalise_prog_name
 from scanplan.scene import StationDescription, load_station
 from scanplan.sheet_split import split_sheet
-from scanview import load_target_samples, render_run, save_target_samples
-
-from .cad_import import mesh_from_bytes, to_stl_bytes
 
 _WEB_ROOT = Path(__file__).resolve().parent
+_STATIC_ROOT = Path(__file__).resolve().parents[1] / "scanplan" / "static"
 _MAX_STL_BYTES = 120 * 1024 * 1024
 _MAX_REQUEST_BYTES = 380 * 1024 * 1024
 _SAFE_RUN_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _SAFE_ARTIFACT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,96}$")
-
-# --- progress board --------------------------------------------------------
-#
-# A planning run is one synchronous request, so the page cannot be told anything until
-# the whole thing finishes. The job therefore publishes (stage, percent) into this
-# in-process board and the page polls `GET /api/progress`. It is deliberately tiny and
-# lossy: entries expire, and the page falls back to elapsed time if they stop coming.
-
-_PROGRESS_TTL_S = 900.0
-_PROGRESS: dict[str, dict] = {}
-_PROGRESS_LOCK = threading.Lock()
-
-
-def _publish_progress(token: str | None, stage: str, fraction: float,
-                      detail: str = "") -> None:
-    """Record one stage update for the page to poll; a no-op without a token."""
-    if not token:
-        return
-    pct = round(100.0 * min(max(float(fraction), 0.0), 1.0), 1)
-    now = time.time()
-    with _PROGRESS_LOCK:
-        for key, entry in list(_PROGRESS.items()):
-            if now - entry["updated"] > _PROGRESS_TTL_S:
-                _PROGRESS.pop(key, None)
-        previous = _PROGRESS.get(token)
-        started = previous["started"] if previous else now
-        if previous is not None:
-            # Never regress: a stage that reports late must not rewind the bar.
-            pct = max(pct, previous["pct"])
-        _PROGRESS[token] = {
-            "stage": stage,
-            "pct": pct,
-            "detail": detail,
-            "started": started,
-            "updated": now,
-        }
-
-
-def _progress_snapshot(token: str) -> dict | None:
-    now = time.time()
-    with _PROGRESS_LOCK:
-        entry = _PROGRESS.get(token)
-        if entry is None:
-            return None
-        snapshot = dict(entry)
-    snapshot.pop("started", None)
-    snapshot["age_s"] = round(now - snapshot["updated"], 2)
-    snapshot["elapsed_s"] = round(now - entry["started"], 1)
-    snapshot.pop("updated", None)
-    return snapshot
-
-
-def _progress_token(data: dict) -> str | None:
-    """The client-chosen id this job publishes under, or None when it did not ask."""
-    token = data.get("progress_id")
-    if isinstance(token, str) and _SAFE_RUN_ID.fullmatch(token):
-        return token
-    return None
-
-
-def _progress_writer(token: str | None):
-    def write(stage: str, fraction: float, detail: str = "") -> None:
-        _publish_progress(token, stage, fraction, detail)
-
-    return write
 
 
 def _vector(value: Any, name: str) -> np.ndarray:
@@ -269,6 +186,20 @@ def _write_planning_report(path: Path, *, run_id: str, prog_name: str,
     face_text = ", ".join(f"{value:.4f}" for value in face_axis)
     coverage = float(report.get("coverage_pct", 0))
     target_area = float(report.get("target_face_mm2", 0)) / 1e6
+    program = report.get("program", {}) or {}
+    levels = program.get("connector_levels", {}) or {}
+    joint_travels = int(levels.get("J2-retract-travel", 0))
+    sweep = (f"{program.get('motion', '—')} {program.get('speed_mm_s', '—')} mm/sec "
+             f"{program.get('termination', '')}".strip())
+    if joint_travels:
+        motion_text = (
+            f"扫描段 {sweep}；行与行之间 {joint_travels} 处用「短 L 抬刀 + J 关节运动到预备点 "
+            f"+ 短 L 切入」(J 100% CNT100)"
+        )
+    elif program:
+        motion_text = f"扫描段 {sweep}；行与行之间全部为直线（未使用关节运动）"
+    else:
+        motion_text = "本次结果为纯位姿交付，点与点之间的运动不做承诺"
     body = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>扫描规划报告 · {html.escape(prog_name)}</title>
@@ -311,7 +242,8 @@ code{{color:#315c82}}
 <div class="metric"><span>漏扫点</span><b>{int(report.get('uncovered_points', 0))}</b></div>
 </div>
 <p>目标面：<b>{html.escape(str(report.get('face', '—')))}</b> ·
-面积 {target_area:.4f} m² · 漏扫原因：{html.escape(reason_text)}</p></section>
+面积 {target_area:.4f} m² · 漏扫原因：{html.escape(reason_text)}</p>
+<p>程序运动：<b>{html.escape(motion_text)}</b></p></section>
 <section><h2>三点/四点配准</h2>
 <p>现场坐标系：<b>{html.escape(registration.frame_label)}</b> ·
 RMS {registration.rms_error_mm:.3f} mm ·
@@ -366,26 +298,127 @@ def _download_entries(prog_name: str) -> list[dict[str, str]]:
     ]
 
 
-def _public_config() -> dict:
-    """What the page is allowed to know about the shipped configuration, as defaults.
+def _runs_root() -> Path:
+    """Where every web run lives. One definition, so listing and writing cannot drift."""
+    return (Path.cwd() / "output" / "web_runs").resolve()
 
-    Only settings a page control can express, and the mode in the page's own vocabulary
-    (`stroke` / `pose`) rather than the config's (`path` / `lean`). Everything here is a
-    default: the page can still ask for something else, and the run reports what it used.
+
+def _run_meta_path(folder: Path) -> Path:
+    return folder / "run_meta.json"
+
+
+def _read_run_meta(folder: Path) -> dict:
+    """The summary written when a run finished, or an empty dict for older runs."""
+    path = _run_meta_path(folder)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _run_summary(folder: Path) -> dict:
+    """One run folder as the history panel needs it, read back from its own files.
+
+    A run made before `run_meta.json` existed still has to be listable - the folder holds
+    the report, the program and the registration file - so every field falls back to
+    reading those instead of returning nothing.
+    """
+    meta = _read_run_meta(folder)
+    report_path = folder / "coverage_report.json"
+    report: dict = {}
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            report = {}
+    programs = sorted(path.stem for path in folder.glob("*.LS"))
+    program = str(meta.get("program_name") or (programs[0] if programs else ""))
+    registration: dict = {}
+    registration_path = folder / "registration_report.json"
+    if registration_path.is_file():
+        try:
+            registration = json.loads(registration_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            registration = {}
+    name = program or folder.name
+    created = meta.get("created_at")
+    if not created:
+        created = datetime.fromtimestamp(folder.stat().st_mtime).isoformat(timespec="seconds")
+    files = _download_entries(program) if program else [
+        {"name": "planning_report.html", "label": "扫描规划报告 (HTML)"},
+        {"name": "coverage_report.json", "label": "覆盖报告 JSON"},
+    ]
+    available = [entry for entry in files if (folder / entry["name"]).is_file()]
+    return {
+        "run_id": folder.name,
+        "program_name": name,
+        "created_at": created,
+        "coverage_pct": float(meta.get("coverage_pct", report.get("coverage_pct") or 0.0)),
+        "point_count": int(meta.get("point_count", report.get("viewpoints") or 0)),
+        "target_points": int(meta.get("target_points", report.get("target_points") or 0)),
+        "uncovered_points": int(meta.get("uncovered_points",
+                                         report.get("uncovered_points") or 0)),
+        "face": str(meta.get("face") or report.get("face") or ""),
+        "delivery_mode": str(meta.get("delivery_mode") or (
+            "stroke" if report.get("stroke_plan", {}).get("enabled") else "pose")),
+        "bound": (meta.get("bound")
+                  or (report.get("program") or {}).get("bound")),
+        "max_points": (meta.get("max_points")
+                       if "max_points" in meta
+                       else (report.get("program") or {}).get("max_points")),
+        "surface_bias": meta.get("surface_bias",
+                                 (report.get("derived_parameters") or {}).get("surface_bias")),
+        "datum_count": int(meta.get("datum_count", len(registration.get("point_pairs") or []))),
+        "measured_frame": str(meta.get("measured_frame")
+                              or registration.get("measured_frame") or ""),
+        "has_viewer": (folder / "viewpoints_3d.html").is_file(),
+        "viewer_url": f"/api/viewer?run_id={folder.name}",
+        "failed": (folder / "job_error.txt").is_file(),
+        "output_dir": str(folder),
+        "downloads": available,
+    }
+
+
+def list_runs(limit: int = 40) -> list[dict]:
+    """Every finished run under `output/web_runs`, newest first."""
+    root = _runs_root()
+    if not root.is_dir():
+        return []
+    folders = [item for item in root.iterdir() if item.is_dir()]
+    folders.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return [_run_summary(folder) for folder in folders[:max(1, int(limit))]]
+
+
+def _write_run_meta(output: Path, payload: dict) -> Path:
+    """Record what this run was, so the history panel does not have to guess later."""
+    path = _run_meta_path(output)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+def config_defaults() -> dict:
+    """The shipped settings the page's controls start from.
+
+    Served rather than hard-coded in the page: the page used to carry its own copy of
+    these numbers, so a change to `configs/` silently left the form showing the old
+    defaults (merge plan P2-4).
     """
     config = load_config()
     return {
-        "delivery_mode": "pose" if config.target.delivery_mode == "lean" else "stroke",
-        "coverage_target_pct": config.target.coverage_target_pct,
-        "surface_bias": float(config.target.surface_bias),
         "max_points": config.target.max_points,
-        "pool_mode": config.stroke.pool_mode,
-        "robot_enabled": bool(config.robot.enabled),
-        "motion": config.motion.type,
-        "termination": config.motion.termination,
-        "speed_mm_s": float(config.motion.speed_mm_s),
-        "config_source": config.source,
-        "parameter_sources": dict(config.parameter_sources),
+        "coverage_target_pct": config.target.coverage_target_pct,
+        "surface_bias": config.target.surface_bias,
+        "delivery_mode": "stroke" if config.stroke.enabled else "pose",
+        "max_wrist_step_deg": config.stroke.max_wrist_step_deg,
+        "roll_mode": config.stroke.roll_mode,
+        "connector_level": config.stroke.connector_level,
+        "cost_model": config.stroke.cost_model,
+        "source": config.source,
+        "derived": dict(getattr(config, "derived", {}) or {}),
     }
 
 
@@ -395,13 +428,25 @@ def _delivery_config(data: dict):
     The two modes differ in the PLANNING unit, not only in the export: "pose" is the v1
     deliverable of isolated stops, so it switches the stroke stage off. Re-sorting the
     export order would not make a stroke plan pose-only.
+
+    A point cap from the page goes through the same `override` path as a config file, so
+    it is validated in one place and its derived keys (the tail-repair share) are
+    re-derived rather than left at the old profile.
     """
     config = load_config(data.get("config_path"))
     mode = str(data.get("delivery_mode") or "stroke").strip().lower()
     if mode not in ("stroke", "pose"):
         raise ValueError("delivery mode must be 'stroke' or 'pose'")
     if mode == "pose":
-        return override(config, stroke={"enabled": False})
+        config = override(config, stroke={"enabled": False})
+    cap = data.get("max_points")
+    if cap is not None and str(cap).strip() != "":
+        try:
+            numeric = int(cap)
+        except (TypeError, ValueError) as error:
+            raise ValueError("max_points must be a whole number of program points, "
+                             "or left empty for no cap") from error
+        config = override(config, target={"max_points": numeric})
     return config
 
 
@@ -428,16 +473,10 @@ def _export_options(config, viewpoints, data: dict) -> dict:
     }
 
 
-def solve_job(data: dict, progress=None) -> dict:
-    """Register uploaded meshes, plan the selected side, and export FANUC files.
-
-    `progress(stage, fraction, detail)` is optional; the page polls a snapshot of what it
-    last reported while this call is still running.
-    """
-    started = time.perf_counter()
+def solve_job(data: dict) -> dict:
+    """Register uploaded meshes, plan the selected side, and export FANUC files."""
     if not isinstance(data, dict):
         raise ValueError("request body must be a JSON object")
-    announce = progress or (lambda stage, fraction, detail="": None)
     registration, resets = _registration_from_payload(data)
     tolerance = float(data.get("max_registration_error_mm", 3.0))
     if not np.isfinite(tolerance) or tolerance <= 0.0:
@@ -451,7 +490,6 @@ def solve_job(data: dict, progress=None) -> dict:
     models = data.get("models", {})
     if not isinstance(models, dict):
         raise ValueError("models must be an object")
-    announce("registration", 0.04, "reading the station meshes")
     support = _decode_stl(models.get("support", {}), "support/fixture")
     part_raw = _decode_stl_bytes(models.get("part", {}), "part")
     part = _load_stl(part_raw, "part")
@@ -500,13 +538,8 @@ def solve_job(data: dict, progress=None) -> dict:
     _sync_input_part(part_raw, Path.cwd() / "input")
 
     base_path = output / "base.stl"
-    base_vehicle_path = output / "base_vehicle.stl"
     support_path = output / "support.stl"
     part_path = output / "part.stl"
-    # Keep the base in uploaded (vehicle) coordinates as well: the planner traces the
-    # transformed copy, but a re-localisation registers again and must not transform it
-    # twice. Older runs can still be inverted back through their registration report.
-    base.export(base_vehicle_path)
     base.apply_transform(combined_base)
     base.export(base_path)
     support.export(support_path)
@@ -533,7 +566,6 @@ def solve_job(data: dict, progress=None) -> dict:
 
     try:
         config = _delivery_config(data)
-        announce("registration", 0.08, "station written")
         description = StationDescription(
             part=part_path,
             fixture=support_path,
@@ -545,7 +577,6 @@ def solve_job(data: dict, progress=None) -> dict:
             source=station_path,
         )
         station = load_station(description, cloud_seed=config.seed)
-        announce("segmentation", 0.10, "station loaded")
         axis_in_measured = registration.rotation @ face_axis_vehicle
         split = split_sheet(
             station.part,
@@ -554,11 +585,7 @@ def solve_job(data: dict, progress=None) -> dict:
             seed=config.seed,
             through_axis=axis_in_measured,
         )
-        announce("segmentation", 0.12, "blank split")
-        result = plan(station, config, face="upper", split=split,
-                      progress=lambda stage, fraction, detail="": announce(
-                          stage, 0.12 + 0.78 * fraction, detail))
-        announce("report", 0.92, "planning finished")
+        result = plan(station, config, face="upper", split=split)
         result.report["installation_registration"] = {
             "measured_frame": registration.frame_label,
             "uframe": registration.uframe,
@@ -568,7 +595,6 @@ def solve_job(data: dict, progress=None) -> dict:
             "scan_face_axis_measured_frame": axis_in_measured.tolist(),
         }
         write_outputs(result, output)
-        announce("export", 0.93, "coverage and viewer written")
         options = _export_options(config, result.viewpoints, data)
         stroke_plan = not options["order"]
         contract = export_ls(
@@ -579,7 +605,6 @@ def solve_job(data: dict, progress=None) -> dict:
             utool=int(data.get("utool", 1)),
             **options,
         )
-        announce("export", 0.98, "program exported")
         contract["frame"]["axes"] = (
             f"Robot UFRAME {output_uframe} axes; CAD viewpoints were registered "
             "from the vehicle reset frame using three field datum points."
@@ -629,7 +654,6 @@ def solve_job(data: dict, progress=None) -> dict:
             }),
             "part_scan_face_axis_vehicle": face_axis_vehicle.tolist(),
             "scan_face_axis_measured_frame": scan_axis_target.tolist(),
-            "max_registration_error_mm": tolerance,
             "outputs": [entry["name"] for entry in _download_entries(prog_name)],
             "warning": (
                 "This is geometric planning only; verify robot reachability, collision, "
@@ -660,6 +684,27 @@ def solve_job(data: dict, progress=None) -> dict:
         delivered.append(record)
     delivered.sort(key=lambda record: record["order"])
 
+    program_block = result.report.get("program") or {}
+    _write_run_meta(output, {
+        "run_id": run_id,
+        "program_name": prog_name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "coverage_pct": float(result.report["coverage_pct"]),
+        "point_count": len(result.viewpoints),
+        "target_points": int(result.report.get("target_points", 0)),
+        "uncovered_points": int(result.report.get("uncovered_points", 0)),
+        "face": str(result.report.get("face", "")),
+        "delivery_mode": "stroke" if stroke_plan else "pose",
+        "bound": program_block.get("bound"),
+        "max_points": program_block.get("max_points"),
+        "surface_bias": (result.report.get("derived_parameters") or {}).get("surface_bias"),
+        "datum_count": int(len(registration.cad_points)),
+        "measured_frame": registration.frame_label,
+        "target_face_mm2": float(result.report.get("target_face_mm2", 0.0)),
+        "uncovered_by_reason": result.report.get("uncovered_by_reason", {}),
+        "downloads": _download_entries(prog_name),
+    })
+
     return {
         "run_id": run_id,
         "output_dir": str(output),
@@ -679,782 +724,13 @@ def solve_job(data: dict, progress=None) -> dict:
         "registration_rms_error_mm": registration.rms_error_mm,
         "registration_max_error_mm": registration.max_error_mm,
         "datum_count": int(len(registration.cad_points)),
-        # The datum inputs are part of the result so the page can show them after a run
-        # and re-localise from them without asking the operator to retype the pairs.
-        "cad_points_vehicle_mm": [
-            [float(value) for value in point] for point in registration.cad_points
-        ],
-        "measured_points_mm": [
-            [float(value) for value in point] for point in registration.measured_points
-        ],
-        "point_errors_mm": [
-            float(value) for value in np.linalg.norm(registration.residuals_mm, axis=1)
-        ],
-        "uframe": int(registration.uframe),
-        "error_limit_mm": float(tolerance),
-        "utool": int(data.get("utool", 1)),
-        "elapsed_seconds": round(time.perf_counter() - started, 2),
         "base_supplied": base_supplied,
+        "max_points": program_block.get("max_points"),
+        "bound": program_block.get("bound"),
         "viewpoints": delivered,
         "viewer_url": f"/api/viewer?run_id={run_id}",
         "downloads": _download_entries(prog_name),
     }
-
-
-def _relocated_run_id(run_id: str) -> str:
-    suffix = "_reloc"
-    stem = run_id[: 64 - len(suffix)].rstrip("_-") or "run"
-    return stem + suffix
-
-
-def _frame_delta(registration: RigidRegistration, old_rotation: np.ndarray,
-                 old_translation: np.ndarray) -> np.ndarray:
-    """The rigid motion that carries a pose from the old measured frame to the new one.
-
-    The path is a rigid-body manoeuvre relative to the part: a point the planner put at
-    `T_old p` in the old measured frame sits at `T_new p` once the installation is
-    corrected, so the whole path moves by `T_new · T_old⁻¹` and nothing has to be
-    re-planned.
-    """
-    old = np.eye(4)
-    old[:3, :3] = old_rotation
-    old[:3, 3] = old_translation
-    new = np.eye(4)
-    new[:3, :3] = registration.rotation
-    new[:3, 3] = registration.translation
-    return new @ np.linalg.inv(old)
-
-
-def _moved_point(delta: np.ndarray, point) -> list[float]:
-    moved = delta[:3, :3] @ np.asarray(point, dtype=float) + delta[:3, 3]
-    return [round(float(value), 4) for value in moved]
-
-
-def _moved_axis(delta: np.ndarray, axis) -> list[float]:
-    moved = delta[:3, :3] @ np.asarray(axis, dtype=float)
-    norm = float(np.linalg.norm(moved))
-    if norm < 1e-12:
-        return [0.0, 0.0, 0.0]
-    return [round(float(value / norm), 9) for value in moved]
-
-
-def _viewpoint_from_record(record: dict) -> Viewpoint:
-    """Rebuild a delivered viewpoint so the standard writers can re-emit it.
-
-    The joint evidence (`config`, `branch`, `joints_deg`, `j5_margin_deg`) is
-    deliberately dropped: those numbers are the verdict of a reachability test in the
-    OLD frame, and a relocated program must not ship a stale verdict as if it were
-    re-checked. Re-plan with `robot.enabled` if that evidence is needed again.
-    """
-    return Viewpoint(
-        id=int(record.get("id", 0)),
-        position=np.asarray(record.get("position", [0.0, 0.0, 0.0]), dtype=float),
-        axis=np.asarray(record.get("axis", [0.0, 0.0, 1.0]), dtype=float),
-        roll_deg=float(record.get("roll_deg", 0.0)),
-        n_points=int(record.get("n_points", 0)),
-        area_mm2=float(record.get("area_mm2", 0.0)),
-        mean_incidence_deg=float(record.get("mean_incidence_deg", 0.0)),
-        max_incidence_deg=float(record.get("max_incidence_deg", 0.0)),
-        tracker_ok=bool(record.get("tracker_ok", True)),
-        source=str(record.get("source", "")),
-        order=int(record.get("order", record.get("id", 0))),
-        stroke_id=None if record.get("stroke_id") is None else int(record["stroke_id"]),
-        role=str(record.get("role", "coverage")),
-    )
-
-
-def _moved_viewpoints(records, delta: np.ndarray) -> list[Viewpoint]:
-    moved: list[Viewpoint] = []
-    for record in records:
-        viewpoint = _viewpoint_from_record(record)
-        moved.append(replace(
-            viewpoint,
-            position=np.asarray(_moved_point(delta, viewpoint.position), dtype=float),
-            axis=np.asarray(_moved_axis(delta, viewpoint.axis), dtype=float),
-        ))
-    return moved
-
-
-def _moved_strokes(strokes: dict, delta: np.ndarray) -> dict:
-    """The authoritative move list, transformed. Lengths and ids are frame-free."""
-    moved = json.loads(json.dumps(strokes))
-    for point in moved.get("points", []):
-        point["position_mm"] = _moved_point(delta, point["position_mm"])
-        point["axis"] = _moved_axis(delta, point["axis"])
-    for stroke in moved.get("strokes", []):
-        stroke["start_mm"] = _moved_point(delta, stroke["start_mm"])
-        if stroke.get("end_mm") is not None:
-            stroke["end_mm"] = _moved_point(delta, stroke["end_mm"])
-        stroke["axis"] = _moved_axis(delta, stroke["axis"])
-    return moved
-
-
-def _move_samples_csv(source: Path, target: Path, delta: np.ndarray) -> bool:
-    """Re-express a point-cloud CSV (points and normals) in the new frame."""
-    if not source.is_file():
-        return False
-    with source.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.reader(handle))[1:]
-    if not rows:
-        return False
-    points = np.asarray([[float(row[0]), float(row[1]), float(row[2])] for row in rows])
-    normals = np.asarray([[float(row[3]), float(row[4]), float(row[5])] for row in rows])
-    reasons = [row[6] if len(row) > 6 else "" for row in rows]
-    moved_points = points @ delta[:3, :3].T + delta[:3, 3]
-    moved_normals = normals @ delta[:3, :3].T
-    write_samples_csv(target, moved_points, moved_normals, reasons)
-    return True
-
-
-def _relocation_export_options(run_dir: Path, prog_name: str) -> dict:
-    """Motion and termination of the ORIGINAL program, so the move is the same move.
-
-    Reading them from the old frame contract rather than from today's configuration is
-    what keeps a relocation from silently changing the speed the coverage was computed
-    for. Whether the order may be re-sorted is decided by the viewpoints themselves (a
-    stroke plan carries `stroke_id`, and re-sorting would split sweeps).
-    """
-    old_path = run_dir / f"{prog_name}_frame.json"
-    program: dict = {}
-    if old_path.is_file():
-        try:
-            loaded = json.loads(old_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            loaded = None
-        if isinstance(loaded, dict) and isinstance(loaded.get("program"), dict):
-            program = loaded["program"]
-    return {
-        "motion": str(program.get("motion") or "J"),
-        "speed": str(program.get("speed") or "100%"),
-        "termination": str(program.get("termination") or "FINE"),
-    }
-
-
-def _run_program_name(run_dir: Path) -> str:
-    for path in sorted(run_dir.glob("*_frame.json")):
-        try:
-            return normalise_prog_name(path.name[: -len("_frame.json")])
-        except ValueError:
-            continue
-    return ""
-
-
-def relocate_job(data: dict, progress=None) -> dict:
-    """Move a completed run's path into a corrected field frame - without re-planning.
-
-    Correcting a datum point does not change which poses the workshop wants to fly; it
-    only moves them. The path is rigid relative to the part, so the whole delivered set
-    - viewpoints, strokes, `.LS`, reports and the 3D view - is transformed by
-    `T_new · T_old⁻¹`. That takes seconds instead of minutes and, unlike a re-plan,
-    cannot produce a different path from one datum edit.
-
-    What a transform cannot answer is stated in the report instead of being guessed:
-    coverage is unchanged (part and path move together), but tracker visibility, robot
-    reachability and joint limits were judged in the old frame and are NOT re-tested.
-    """
-    if not isinstance(data, dict):
-        raise ValueError("request body must be a JSON object")
-    run_id = str(data.get("run_id") or "")
-    if not _SAFE_RUN_ID.fullmatch(run_id):
-        raise ValueError("invalid run id")
-    run_dir = _run_directory(run_id)
-    announce = progress or (lambda stage, fraction, detail="": None)
-    started = time.perf_counter()
-    announce("registration", 0.04, "reading the previous run")
-
-    report_path = run_dir / "registration_report.json"
-    viewpoints_path = run_dir / "viewpoints.json"
-    if not report_path.is_file() or not viewpoints_path.is_file():
-        raise ValueError(
-            "this run has no viewpoints/registration report; run a full plan instead"
-        )
-    old_report = json.loads(report_path.read_text(encoding="utf-8"))
-    old_rotation = np.asarray(old_report["rotation_vehicle_to_measured"], dtype=float)
-    old_translation = np.asarray(
-        old_report["translation_vehicle_origin_in_measured_mm"], dtype=float
-    )
-    records = json.loads(viewpoints_path.read_text(encoding="utf-8"))
-    if not records:
-        raise ValueError("this run's viewpoint file is empty")
-
-    previous = _history_run_payload(run_id) or {}
-    datums = _run_datums(run_id, previous)
-    cad_points = data.get("cad_points_vehicle_mm") or datums["cad_points_vehicle_mm"]
-    if not cad_points:
-        raise ValueError("this run has no recorded datum points; plan it again from the model")
-    cad = np.asarray(cad_points, dtype=float)
-    measured = np.asarray(data.get("measured_points_mm"), dtype=float)
-    if cad.ndim != 2 or cad.shape[1:] != (3,) or measured.shape != cad.shape:
-        raise ValueError(
-            f"this run registered {len(np.atleast_2d(cad))} datum points; enter the same "
-            "number of matching field XYZ coordinates"
-        )
-    if not np.isfinite(cad).all() or not np.isfinite(measured).all():
-        raise ValueError("datum coordinates must be finite numbers")
-
-    uframe = data.get("uframe")
-    if uframe is None:
-        uframe = datums["uframe"] if datums["uframe"] is not None else 1
-    uframe = int(uframe)
-    tolerance = data.get("max_registration_error_mm")
-    if tolerance is None:
-        tolerance = datums["max_registration_error_mm"]
-    tolerance = float(tolerance)
-    if not np.isfinite(tolerance) or tolerance <= 0.0:
-        raise ValueError("registration error limit must be a positive finite number")
-
-    registration = fit_points(
-        cad, measured,
-        target_frame="robot_base" if uframe == 0 else "robot_uframe_1",
-        uframe=uframe,
-    )
-    if registration.max_error_mm > tolerance:
-        raise ValueError(
-            f"corrected datum registration max error is {registration.max_error_mm:.3f} mm; "
-            f"the allowed limit is {tolerance:.3f} mm"
-        )
-    announce("registration", 0.18, "corrected datum points fitted")
-    delta = _frame_delta(registration, old_rotation, old_translation)
-
-    face_axis_vehicle = np.asarray(
-        data.get("scan_face_axis") or datums["scan_face_axis_vehicle"]
-        or old_report.get("part_scan_face_axis_vehicle") or [0.0, 0.0, 1.0],
-        dtype=float,
-    )
-    scan_axis_target = registration.rotation @ face_axis_vehicle
-    prog_name = normalise_prog_name(
-        data.get("prog_name") or previous.get("program_name")
-        or _run_program_name(run_dir) or "PART01"
-    )
-    utool = int(previous.get("utool", 1))
-    requested = _relocated_run_id(run_id)
-    run_id_new = _available_run_id(requested, _runs_root())
-    output = _runs_root() / run_id_new
-    output.mkdir(parents=True, exist_ok=False)
-
-    try:
-        announce("export", 0.28, "moving the planned viewpoints")
-        moved = _moved_viewpoints(records, delta)
-        strokes_path = run_dir / "strokes.json"
-        strokes = (json.loads(strokes_path.read_text(encoding="utf-8"))
-                   if strokes_path.is_file() else None)
-
-        resets = old_report.get("reset_poses_vehicle") or {}
-        identity = {"xyz": [0.0, 0.0, 0.0], "wpr": [0.0, 0.0, 0.0]}
-        part_reset = _pose_matrix(resets.get("part", identity), "part")
-        support_reset = _pose_matrix(resets.get("support", identity), "support")
-        base_reset = _pose_matrix(resets.get("base", identity), "base")
-        placement = np.eye(4)
-        placement[:3, :3] = registration.rotation
-        placement[:3, 3] = registration.translation
-        combined_part = placement @ part_reset
-        combined_support = placement @ support_reset
-        combined_base = placement @ base_reset
-
-        # --- meshes: same uploaded bodies, base re-installed in the new frame ---------
-        part_path = run_dir / "part.stl"
-        support_path = run_dir / "support.stl"
-        if part_path.is_file() and support_path.is_file():
-            (output / "part.stl").write_bytes(part_path.read_bytes())
-            (output / "support.stl").write_bytes(support_path.read_bytes())
-        base_vehicle = _vehicle_frame_base(run_dir)
-        if base_vehicle:
-            (output / "base_vehicle.stl").write_bytes(base_vehicle)
-            base_mesh = _load_stl(base_vehicle, "base")
-            base_mesh.apply_transform(combined_base)
-            base_mesh.export(output / "base.stl")
-
-        station_path = output / "station.json"
-        station_path.write_text(json.dumps({
-            "part": "part.stl",
-            "fixture": "support.stl",
-            "base": "base.stl",
-            "transform_part": combined_part.tolist(),
-            "transform_fixture": combined_support.tolist(),
-            "note": (
-                "Generated by scanplan web UI from a re-localisation: the planned path "
-                "was transformed into the corrected field frame, not re-planned."
-            ),
-        }, indent=2) + "\n", encoding="utf-8")
-
-        # --- the delivered path -------------------------------------------------------
-        write_viewpoints_json(output / "viewpoints.json", moved)
-        write_viewpoints_csv(output / "viewpoints.csv", moved)
-        announce("export", 0.38, "viewpoints written")
-        if strokes is not None:
-            (output / "strokes.json").write_text(
-                json.dumps(_moved_strokes(strokes, delta), indent=2, ensure_ascii=False)
-                + "\n", encoding="utf-8")
-        for name in ("exempt_points.csv", "unreachable_points.csv"):
-            _move_samples_csv(run_dir / name, output / name, delta)
-        samples = run_dir / "target_samples.npz"
-        if samples.is_file():
-            # The sidecar carries the sampled surface the 3D page draws, so it moves with
-            # the part. Copying it would leave a point cloud stranded in the old frame -
-            # the one kind of misalignment a rigid relocation must not produce.
-            sample_points, sampled_covered, sampled_mask = load_target_samples(samples)
-            save_target_samples(
-                output / "target_samples.npz",
-                points=sample_points @ delta[:3, :3].T + delta[:3, 3],
-                covered=sampled_covered,
-                mask=sampled_mask,
-            )
-
-        announce("export", 0.5, "exporting the FANUC program")
-        options = _relocation_export_options(run_dir, prog_name)
-        contract = export_ls(moved, output, prog_name=prog_name, uframe=uframe,
-                             utool=utool,
-                             order=not any(vp.stroke_id is not None for vp in moved),
-                             **options)
-        contract["frame"]["axes"] = (
-            f"Robot UFRAME {uframe} axes; the delivered path was rigidly moved from the "
-            "original installation by the corrected datum registration."
-        )
-        contract["frame"]["note"] = (
-            "See registration_report.json for the datum pairs, the new transform and the "
-            "old transform it replaced. The path itself was NOT re-planned."
-        )
-        contract["uframe_utool"]["uframe_note"] = (
-            f"Teach/verify UFRAME {uframe} matches the field coordinate frame used for the "
-            "corrected measured datum points."
-        )
-        contract["placement"]["registration"] = {
-            "method": "corrected datum registration; path transformed, not re-planned",
-            "measured_frame": registration.frame_label,
-            "rms_error_mm": registration.rms_error_mm,
-            "max_error_mm": registration.max_error_mm,
-            "relocated_from": run_id,
-            "report": "registration_report.json",
-        }
-        (output / f"{prog_name}_frame.json").write_text(
-            json.dumps(contract, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        announce("export", 0.62, "program exported")
-
-        # --- reports -----------------------------------------------------------------
-        relocalisation = {
-            "from_run": run_id,
-            "method": "rigid transform of the delivered path: delta = T_new . T_old^-1",
-            "delta_rotation": np.round(delta[:3, :3], 9).tolist(),
-            "delta_translation_mm": np.round(delta[:3, 3], 4).tolist(),
-            "shift_mm": round(float(np.linalg.norm(delta[:3, 3])), 3),
-            "replanned": False,
-            "unchanged": [
-                "coverage: the part and the path move together, so the reachable set and "
-                "the covered area are the same as the original run",
-                "viewpoint count, stroke pairing and program order",
-                "incidence angles and standoff distances",
-            ],
-            "not_recomputed": [
-                "tracker_ok per viewpoint: the tracker does not move with the part, so "
-                "visibility was NOT re-tested",
-                "robot reachability, joint limits and collision: judged in the OLD frame; "
-                "the joint evidence (CONFIG/joints) was dropped rather than carried over",
-                "cell occlusion by the robot arm: never modelled",
-            ],
-            "when_to_replan": (
-                "re-plan when the correction is large compared with the scanner standoff, "
-                "when the tracker is marginal, or when robot.enabled is on and the shift "
-                "could move a pose towards a joint limit"
-            ),
-        }
-        registration_report = {
-            "measured_frame": registration.frame_label,
-            "uframe": int(registration.uframe),
-            "rotation_vehicle_to_measured": registration.rotation.tolist(),
-            "translation_vehicle_origin_in_measured_mm": registration.translation.tolist(),
-            "rms_error_mm": registration.rms_error_mm,
-            "max_error_mm": registration.max_error_mm,
-            "max_registration_error_mm": tolerance,
-            "point_pairs": [
-                {
-                    "vehicle_mm": cad_point.tolist(),
-                    "measured_mm": measured_point.tolist(),
-                    "residual_mm": residual.tolist(),
-                    "error_mm": float(np.linalg.norm(residual)),
-                }
-                for cad_point, measured_point, residual in zip(
-                    registration.cad_points,
-                    registration.measured_points,
-                    registration.residuals_mm,
-                    strict=True,
-                )
-            ],
-            "reset_poses_vehicle": resets or {
-                name: identity for name in ("base", "support", "part")
-            },
-            "part_scan_face_axis_vehicle": face_axis_vehicle.tolist(),
-            "scan_face_axis_measured_frame": scan_axis_target.tolist(),
-            "relocalisation": relocalisation,
-            "outputs": [entry["name"] for entry in _download_entries(prog_name)],
-            "warning": (
-                "The path was moved by a rigid transform, not re-planned. Verify UFRAME, "
-                "UTOOL, reachability and tracker sight lines in ROBOGUIDE before motion."
-            ),
-        }
-        (output / "registration_report.json").write_text(
-            json.dumps(registration_report, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8")
-
-        coverage_report: dict = {}
-        coverage_path = run_dir / "coverage_report.json"
-        if coverage_path.is_file():
-            try:
-                loaded = json.loads(coverage_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                loaded = None
-            if isinstance(loaded, dict):
-                coverage_report = loaded
-        coverage_report["installation_registration"] = {
-            "measured_frame": registration.frame_label,
-            "uframe": int(registration.uframe),
-            "rms_error_mm": registration.rms_error_mm,
-            "max_error_mm": registration.max_error_mm,
-            "cad_face_axis_vehicle": face_axis_vehicle.tolist(),
-            "scan_face_axis_measured_frame": scan_axis_target.tolist(),
-        }
-        coverage_report["viewpoint_records"] = [vp.as_dict() for vp in moved]
-        coverage_report["relocalisation"] = relocalisation
-        for region in coverage_report.get("leak_regions") or []:
-            center = region.get("center")
-            if isinstance(center, list) and len(center) == 3:
-                region["center"] = _moved_point(delta, center)
-        if coverage_report:
-            write_report(output, coverage_report)
-
-        summary_path = run_dir / "summary.txt"
-        if summary_path.is_file():
-            note = (
-                f"\nre-localised from {run_id}: the planned path was transformed by the "
-                f"corrected datum registration (shift {relocalisation['shift_mm']:.3f} mm), "
-                "not re-planned.\n"
-                "  coverage, incidence and order are the original run's figures.\n"
-                "  tracker visibility and robot reachability were NOT re-tested.\n"
-            )
-            (output / "summary.txt").write_text(
-                summary_path.read_text(encoding="utf-8") + note, encoding="utf-8")
-
-        _write_planning_report(
-            output / "planning_report.html",
-            run_id=run_id_new,
-            prog_name=prog_name,
-            report=coverage_report or {"coverage_pct": 0.0, "target_face_mm2": 0.0},
-            registration=registration,
-            face_axis=face_axis_vehicle,
-            downloads=[entry["name"] for entry in _download_entries(prog_name)],
-        )
-        announce("report", 0.78, "reports written")
-
-        viewer_note = ""
-        try:
-            announce("report", 0.84, "re-rendering the 3D view")
-            render_run(output / "viewpoints.json", output,
-                       station=output / "station.json")
-        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
-            viewer_note = f"；3D 视图未能重新生成：{error}"
-            print(f"[scanplan-web] 3D view not re-rendered: {error}", flush=True)
-    except Exception:
-        (output / "job_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
-        raise
-    announce("export", 0.97, "re-localisation written" + viewer_note)
-
-    delivered = []
-    for viewpoint in moved:
-        record = viewpoint.as_dict()
-        record["position"] = _vehicle_point(combined_part, viewpoint.position)
-        record["axis"] = _vehicle_axis(combined_part, viewpoint.axis)
-        delivered.append(record)
-    delivered.sort(key=lambda record: record["order"])
-
-    result = dict(previous)
-    result.update({
-        "relocated_from": run_id,
-        "relocalised": True,
-        "run_id": run_id_new,
-        "output_dir": str(output),
-        "program": str(output / f"{prog_name}.LS"),
-        "program_name": prog_name,
-        "delivery_mode": "stroke" if strokes is not None else "pose",
-        "point_count": len(moved),
-        "scan_face_axis_vehicle": face_axis_vehicle.tolist(),
-        "scan_face_axis_measured_frame": scan_axis_target.tolist(),
-        "measured_frame": registration.frame_label,
-        "registration_rms_error_mm": registration.rms_error_mm,
-        "registration_max_error_mm": registration.max_error_mm,
-        "datum_count": int(len(registration.cad_points)),
-        "cad_points_vehicle_mm": [
-            [float(value) for value in point] for point in registration.cad_points
-        ],
-        "measured_points_mm": [
-            [float(value) for value in point] for point in registration.measured_points
-        ],
-        "point_errors_mm": [
-            float(value) for value in np.linalg.norm(registration.residuals_mm, axis=1)
-        ],
-        "uframe": int(registration.uframe),
-        "error_limit_mm": tolerance,
-        "shift_mm": relocalisation["shift_mm"],
-        "elapsed_seconds": round(time.perf_counter() - started, 2),
-        "viewpoints": delivered,
-        "viewer_url": f"/api/viewer?run_id={run_id_new}",
-        "downloads": _download_entries(prog_name),
-    })
-    # Numbers a relocated run inherits are the original plan's; fill them in when the
-    # history payload predates the run (or the record was deleted from the database).
-    result.setdefault("coverage_pct", float(coverage_report.get("coverage_pct", 0.0)))
-    result.setdefault("target_points", int(coverage_report.get("target_points", 0)))
-    result.setdefault("uncovered_points", int(coverage_report.get("uncovered_points", 0)))
-    result.setdefault("target_face_mm2", float(coverage_report.get("target_face_mm2", 0.0)))
-    result.setdefault("face", str(coverage_report.get("face", "")))
-    result.setdefault("uncovered_by_reason", coverage_report.get("uncovered_by_reason", {}))
-    result.setdefault("base_supplied", bool(base_vehicle))
-    return result
-
-
-# --- history (SQLite) ------------------------------------------------------
-#
-# Every completed run is recorded next to its output directory, so the browser
-# can list, reopen and re-download earlier work after a restart. The payload is
-# the same JSON that /api/solve returned, zlib-compressed to keep viewpoint
-# tables small. History is advisory: a write failure must never fail a job.
-
-_HISTORY_SCHEMA = """
-CREATE TABLE IF NOT EXISTS runs (
-    run_id TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    prog_name TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    status TEXT NOT NULL,
-    coverage_pct REAL,
-    point_count INTEGER,
-    target_points INTEGER,
-    uncovered_points INTEGER,
-    target_face_mm2 REAL,
-    face TEXT,
-    error TEXT,
-    payload BLOB
-);
-CREATE INDEX IF NOT EXISTS runs_created_idx ON runs (created_at DESC);
-"""
-
-
-def _history_connection() -> sqlite3.Connection:
-    root = Path.cwd() / "output" / "web_runs"
-    root.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(root / "history.sqlite3", timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.executescript(_HISTORY_SCHEMA)
-    return connection
-
-
-def _init_history() -> None:
-    connection = _history_connection()
-    try:
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def _record_history_run(result: dict, display_name: str = "") -> None:
-    try:
-        packed = zlib.compress(
-            json.dumps(result, ensure_ascii=False).encode("utf-8"), 6
-        )
-        name = display_name.strip() or f"{result['program_name']} · {result['run_id']}"
-        connection = _history_connection()
-        try:
-            connection.execute(
-                "INSERT OR REPLACE INTO runs (run_id, display_name, prog_name,"
-                " created_at, status, coverage_pct, point_count, target_points,"
-                " uncovered_points, target_face_mm2, face, error, payload)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
-                (
-                    result["run_id"],
-                    name,
-                    result["program_name"],
-                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "completed",
-                    float(result["coverage_pct"]),
-                    int(result["point_count"]),
-                    int(result["target_points"]),
-                    int(result["uncovered_points"]),
-                    float(result.get("target_face_mm2", 0.0)),
-                    str(result.get("face", "")),
-                    packed,
-                ),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-    except (sqlite3.Error, OSError) as error:
-        print(f"[scanplan-web] history write skipped: {error}", flush=True)
-
-
-def _history_runs(limit: int = 200) -> list[dict]:
-    connection = _history_connection()
-    try:
-        rows = connection.execute(
-            "SELECT run_id, display_name, prog_name, created_at, status, coverage_pct,"
-            " point_count, target_points, uncovered_points, target_face_mm2, face, error"
-            " FROM runs ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    finally:
-        connection.close()
-    return [dict(row) for row in rows]
-
-
-def _history_run_payload(run_id: str) -> dict | None:
-    connection = _history_connection()
-    try:
-        row = connection.execute(
-            "SELECT payload FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-    finally:
-        connection.close()
-    if row is None or row["payload"] is None:
-        return None
-    return json.loads(zlib.decompress(row["payload"]).decode("utf-8"))
-
-
-def _delete_history_run(run_id: str) -> bool:
-    connection = _history_connection()
-    try:
-        deleted = connection.execute(
-            "DELETE FROM runs WHERE run_id = ?", (run_id,)
-        ).rowcount > 0
-        connection.commit()
-    finally:
-        connection.close()
-    runs_root = (Path.cwd() / "output" / "web_runs").resolve()
-    run_dir = (runs_root / run_id).resolve()
-    if deleted and run_dir.parent == runs_root and run_dir.is_dir():
-        shutil.rmtree(run_dir, ignore_errors=True)
-    return deleted
-
-
-def _runs_root() -> Path:
-    return (Path.cwd() / "output" / "web_runs").resolve()
-
-
-def _run_directory(run_id: str) -> Path:
-    root = _runs_root()
-    run_dir = (root / run_id).resolve()
-    if run_dir.parent != root or not run_dir.is_dir():
-        raise ValueError("run not found")
-    return run_dir
-
-
-def _vehicle_frame_base(run_dir: Path) -> bytes | None:
-    """The base mesh in uploaded (vehicle) coordinates, for a re-localisation.
-
-    Runs store `base_vehicle.stl` next to the transformed copy.  Runs recorded before
-    that file existed hold only the installed copy, so it is inverted back through the
-    registration recorded in the same directory.
-    """
-    raw = run_dir / "base_vehicle.stl"
-    if raw.is_file():
-        return raw.read_bytes()
-    transformed = run_dir / "base.stl"
-    report_path = run_dir / "registration_report.json"
-    if not transformed.is_file() or not report_path.is_file():
-        return None
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        combined = np.eye(4)
-        combined[:3, :3] = np.asarray(report["rotation_vehicle_to_measured"], dtype=float)
-        combined[:3, 3] = np.asarray(
-            report["translation_vehicle_origin_in_measured_mm"], dtype=float
-        )
-        reset = (report.get("reset_poses_vehicle") or {}).get("base") or {}
-        if reset:
-            combined = combined @ _pose_matrix(reset, "base")
-        mesh = _load_stl(transformed.read_bytes(), "base")
-        mesh.apply_transform(np.linalg.inv(combined))
-        return mesh.export(file_type="stl")
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def _run_datums(run_id: str, stored: dict | None = None) -> dict:
-    """The datum inputs a completed run used, for the page's re-localise editor.
-
-    Newer runs record them in the stored result; older ones only keep the pairs in
-    `registration_report.json`, which is read as the fallback.
-    """
-    stored = stored or {}
-    report: dict = {}
-    run_dir = _runs_root() / run_id
-    report_path = run_dir / "registration_report.json"
-    if report_path.is_file():
-        try:
-            loaded = json.loads(report_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            loaded = None
-        if isinstance(loaded, dict):
-            report = loaded
-    pairs = [pair for pair in report.get("point_pairs") or [] if isinstance(pair, dict)]
-
-    cad = stored.get("cad_points_vehicle_mm") or [
-        pair.get("vehicle_mm") for pair in pairs
-    ]
-    measured = stored.get("measured_points_mm") or [
-        pair.get("measured_mm") for pair in pairs
-    ]
-    errors = stored.get("point_errors_mm")
-    if not errors:
-        errors = [
-            float(np.linalg.norm(np.asarray(pair["residual_mm"], dtype=float)))
-            for pair in pairs
-            if pair.get("residual_mm") is not None
-        ]
-    limit = stored.get("error_limit_mm")
-    if limit is None:
-        limit = report.get("max_registration_error_mm")
-    if limit is None:
-        observed = report.get("max_error_mm")
-        limit = max(3.0, float(observed)) if isinstance(observed, (int, float)) else 3.0
-    uframe = stored.get("uframe")
-    if uframe is None:
-        uframe = report.get("uframe")
-    return {
-        "cad_points_vehicle_mm": cad,
-        "measured_points_mm": measured,
-        "point_errors_mm": errors,
-        "uframe": uframe,
-        "max_registration_error_mm": float(limit),
-        "scan_face_axis_vehicle": (
-            stored.get("scan_face_axis_vehicle")
-            or report.get("part_scan_face_axis_vehicle")
-        ),
-        # The stroke stage writes `strokes.json` only when sweeps are the deliverable,
-        # so a run recorded before the result kept its mode still reports it correctly.
-        "delivery_mode": (
-            stored.get("delivery_mode")
-            or ("stroke" if (run_dir / "strokes.json").is_file() else "pose")
-        ),
-        "prog_name": stored.get("program_name") or "PART01",
-    }
-
-
-def _augment_datums(record: dict, run_id: str) -> dict:
-    """Fill the datum inputs the page edits when a stored result predates them."""
-    datums = _run_datums(run_id, record)
-    merged = dict(record)
-    for key in ("cad_points_vehicle_mm", "measured_points_mm", "point_errors_mm"):
-        if not merged.get(key):
-            merged[key] = datums[key] or []
-    if merged.get("uframe") is None:
-        merged["uframe"] = datums["uframe"]
-    if merged.get("error_limit_mm") is None:
-        merged["error_limit_mm"] = datums["max_registration_error_mm"]
-    if not merged.get("scan_face_axis_vehicle"):
-        merged["scan_face_axis_vehicle"] = datums["scan_face_axis_vehicle"] or []
-    if not merged.get("delivery_mode"):
-        merged["delivery_mode"] = datums["delivery_mode"]
-    if not merged.get("program_name"):
-        merged["program_name"] = datums["prog_name"]
-    return merged
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1467,68 +743,27 @@ class _Handler(BaseHTTPRequestHandler):
                              "text/html; charset=utf-8")
             return
         if route.path == "/app.css":
-            css = _WEB_ROOT / "app.css"
+            css = _STATIC_ROOT / "app.css"
             if not css.is_file():
                 self.send_error(404)
                 return
             self._send_bytes(css.read_bytes(), "text/css; charset=utf-8")
-            return
-        if route.path == "/app.js":
-            script = _WEB_ROOT / "app.js"
-            if not script.is_file():
-                self.send_error(404)
-                return
-            self._send_bytes(script.read_bytes(), "text/javascript; charset=utf-8")
             return
         if route.path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
             return
         if route.path == "/api/config":
-            # The page's defaults come from the configuration the server will actually use,
-            # not from a `selected` attribute in the HTML: two sources for "which deliverable"
-            # is how the screen says sweep and the run plans poses.
-            self._json_response(200, _public_config())
+            self._json_response(200, {"ok": True, "result": config_defaults()})
             return
-        if route.path == "/api/progress":
+        if route.path == "/api/runs":
             query = parse_qs(route.query)
-            token = query.get("id", [""])[0]
-            if not _SAFE_RUN_ID.fullmatch(token):
-                self.send_error(400, "invalid progress id")
+            try:
+                limit = int(query.get("limit", ["40"])[0])
+            except ValueError:
+                self.send_error(400, "invalid limit")
                 return
-            self._json_response(200, {"ok": True,
-                                     "progress": _progress_snapshot(token)})
-            return
-        if route.path == "/api/history":
-            self._json_response(200, {"ok": True, "runs": _history_runs()})
-            return
-        if route.path == "/api/history/detail":
-            query = parse_qs(route.query)
-            run_id = query.get("run_id", [""])[0]
-            if not _SAFE_RUN_ID.fullmatch(run_id):
-                self.send_error(400, "invalid run id")
-                return
-            record = _history_run_payload(run_id)
-            if record is None:
-                self._json_response(404, {"ok": False, "error": "run not found"})
-                return
-            self._json_response(200, {"ok": True, "result": _augment_datums(record, run_id)})
-            return
-        if route.path == "/api/history/model":
-            query = parse_qs(route.query)
-            run_id = query.get("run_id", [""])[0]
-            name = query.get("name", [""])[0]
-            if not _SAFE_RUN_ID.fullmatch(run_id) or name not in (
-                "part", "support", "base", "base_vehicle"
-            ):
-                self.send_error(400, "invalid run or model name")
-                return
-            runs_root = (Path.cwd() / "output" / "web_runs").resolve()
-            model = (runs_root / run_id / f"{name}.stl").resolve()
-            if model.parent.parent != runs_root or not model.is_file():
-                self.send_error(404)
-                return
-            self._send_bytes(model.read_bytes(), "model/stl")
+            self._json_response(200, {"ok": True, "result": {"runs": list_runs(limit)}})
             return
         if route.path == "/api/viewer":
             query = parse_qs(route.query)
@@ -1580,10 +815,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def do_POST(self) -> None:
-        if self.path not in (
-            "/api/register", "/api/solve", "/api/convert", "/api/history/delete",
-            "/api/relocate",
-        ):
+        if self.path not in ("/api/register", "/api/solve"):
             self.send_error(404)
             return
         try:
@@ -1593,72 +825,8 @@ class _Handler(BaseHTTPRequestHandler):
                     f"request size must be between 1 and {_MAX_REQUEST_BYTES} bytes"
                 )
             data = json.loads(self.rfile.read(length))
-            if not isinstance(data, dict):
-                raise ValueError("request body must be a JSON object")
-            if self.path == "/api/convert":
-                filename = str(data.get("filename") or "")
-                encoded = data.get("data_base64")
-                if not isinstance(encoded, str) or not encoded:
-                    raise ValueError("缺少模型文件数据")
-                try:
-                    raw = base64.b64decode(encoded, validate=True)
-                except ValueError as error:
-                    raise ValueError("模型文件数据不是有效的 base64") from error
-                if len(raw) > _MAX_STL_BYTES:
-                    raise ValueError(
-                        f"模型文件超过 {_MAX_STL_BYTES // (1024 * 1024)} MB 限制"
-                    )
-                try:
-                    mesh = mesh_from_bytes(raw, filename)
-                except ValueError:
-                    raise
-                except Exception as error:
-                    raise ValueError(f"模型转换失败：{error}") from error
-                stl = to_stl_bytes(mesh)
-                if len(stl) > _MAX_STL_BYTES:
-                    raise ValueError(
-                        f"转换后的网格超过 {_MAX_STL_BYTES // (1024 * 1024)} MB，"
-                        "请先在 CAD 中简化模型"
-                    )
-                self._json_response(200, {
-                    "ok": True,
-                    "stl_base64": base64.b64encode(stl).decode("ascii"),
-                    "faces": int(len(mesh.faces)),
-                    "vertices": int(len(mesh.vertices)),
-                })
-                return
-            if self.path == "/api/history/delete":
-                run_id = str(data.get("run_id") or "")
-                if not _SAFE_RUN_ID.fullmatch(run_id):
-                    raise ValueError("invalid run id")
-                self._json_response(
-                    200, {"ok": True, "deleted": _delete_history_run(run_id)}
-                )
-                return
-            if self.path == "/api/register":
-                self._json_response(
-                    200, {"ok": True, "result": _preview_registration(data)}
-                )
-                return
-            if self.path == "/api/relocate":
-                token = _progress_token(data)
-                try:
-                    result = relocate_job(data, progress=_progress_writer(token))
-                except Exception:
-                    _publish_progress(token, "failed", 100.0, "re-localisation failed")
-                    raise
-                _publish_progress(token, "done", 1.0, "re-localisation finished")
-                _record_history_run(result, str(data.get("run_name") or ""))
-                self._json_response(200, {"ok": True, "result": result})
-                return
-            token = _progress_token(data)
-            try:
-                result = solve_job(data, progress=_progress_writer(token))
-            except Exception:
-                _publish_progress(token, "failed", 100.0, "planning failed")
-                raise
-            _publish_progress(token, "done", 1.0, "planning finished")
-            _record_history_run(result, str(data.get("run_name") or ""))
+            result = _preview_registration(data) if self.path == "/api/register" \
+                else solve_job(data)
             self._json_response(200, {"ok": True, "result": result})
         except (ValueError, json.JSONDecodeError, OSError) as error:
             self._json_response(400, {"ok": False, "error": str(error)})
@@ -1692,50 +860,12 @@ def _preview_registration(data: dict) -> dict:
     }
 
 
-def _local_addresses() -> list[str]:
-    """Best-effort LAN IPv4 addresses, for the startup banner."""
-    addresses: list[str] = []
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            address = str(info[4][0])
-            if address not in addresses and not address.startswith("127."):
-                addresses.append(address)
-    except OSError:
-        pass
-    if not addresses:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-                probe.connect(("8.8.8.8", 80))
-                addresses.append(str(probe.getsockname()[0]))
-        except OSError:
-            pass
-    return addresses
-
-
-def _bind_urls(host: str, port: int) -> list[str]:
-    if host in ("", "0.0.0.0", "::"):
-        urls = [f"http://127.0.0.1:{port}"]
-        urls.extend(f"http://{address}:{port}" for address in _local_addresses())
-        return urls
-    if host in ("127.0.0.1", "localhost", "::1"):
-        return [f"http://127.0.0.1:{port}"]
-    return [f"http://{host}:{port}"]
-
-
 def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
-    """Serve the UI. Bind 0.0.0.0 to let other machines on the LAN open it."""
-    _init_history()
-    exposed = host not in ("127.0.0.1", "localhost", "::1")
-    if exposed:
-        print(
-            "warning: the UI is reachable from other machines. Anyone who can reach "
-            "this port can submit jobs and download previous outputs, so use it only "
-            "on a trusted network.",
-            flush=True,
-        )
+    """Serve the UI only on loopback; STL files never leave the local machine."""
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("the browser UI only binds to localhost")
     server = ThreadingHTTPServer((host, port), _Handler)
-    for url in _bind_urls(host, port):
-        print(f"scanplan web UI: {url}", flush=True)
+    print(f"scanplan web UI: http://127.0.0.1:{port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

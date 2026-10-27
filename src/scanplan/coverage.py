@@ -34,14 +34,15 @@ from scipy.sparse import csr_matrix
 
 from .config import PlannerConfig
 from .raycast import nearest_across
+from .robot import RobotArm
 from .scanner_model import ScannerModel, ScannerPose, measure_mask
 from .scene import Station
 from .target_surface import SampleSet
 
 REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by_base",
-           "blocked_by_tracker", "only_poses_that_collide", "unreachable_joint_limit",
-           "candidate_found")
-_COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_kinematics",
+           "blocked_by_tracker", "only_poses_that_collide",
+           "only_poses_out_of_reach", "candidate_found")
+_COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_joint_limit",
                  "rejected_no_points", "rays")
 
 
@@ -96,8 +97,7 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
              model: ScannerModel, cfg: PlannerConfig, *,
              visible: Callable[[np.ndarray], np.ndarray] | None = None,
              obstacles: dict | None = None,
-             gate=None,
-             progress: Callable[[int, int], None] | None = None,
+             robot: RobotArm | None = None,
              log: Callable[[str], None] | None = None) -> CoverageResult:
     """Evaluate every pose against the target samples, returning sparse coverage sets.
 
@@ -105,14 +105,12 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
     rejects keep an empty coverage set, so the tracker constraint flows into the
     selection problem instead of being applied to the result afterwards.
 
-    `gate` is the optional kinematic gate (`kinematics.KinematicGate`). It sits in the same
-    rejection chain, and for the same reason: a pose the arm cannot hold is not a pose that
-    covers less, it is a pose that cannot be commanded, so it must not enter the selection
-    and then be discovered at export time. Rejecting it here is what makes the reported
-    coverage and the program agree.
-
-    `progress(done, total)` is the optional per-candidate tick; this loop is the run's hot
-    spot, so a caller that wants a truthful progress bar needs to hear from it.
+    `robot` is the optional joint-limit gate, and it is the same idea one level harder: a
+    pose the arm cannot reach INSIDE its derated joint window keeps an empty coverage set,
+    so it can never be selected and the coverage figure never counts a pose the cell cannot
+    fly. The check is per pose, on its own - branch continuity along the delivered path is
+    a separate question, answered for straight moves and for the joint travel moves by
+    `scanplan.path` and reported there.
     """
     say = log or (lambda _message: None)
     points = np.asarray(samples.points, dtype=float).reshape(-1, 3)
@@ -139,15 +137,12 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
         elif not tracker_ok[index]:
             counters["rejected_tracker"] += 1
             rejected = "tracker"
-        elif gate is not None and gate.active and not gate.check(
-                pose.position, pose.axis, pose.roll_deg).ok:
-            counters["rejected_kinematics"] += 1
-            rejected = "kinematics"
+        elif robot is not None and robot.solve(pose.frame, pose.position) is None:
+            counters["rejected_joint_limit"] += 1
+            rejected = "joint_limit"
         if rejected is not None:
             sets.append(np.zeros(0, dtype=np.int64))
             quality.append(np.zeros(0))
-            if progress is not None:
-                progress(index + 1, len(poses))
             continue
 
         mask = measure_mask(model, pose, points, normals, casters,
@@ -158,8 +153,6 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
             counters["rejected_no_points"] += 1
             sets.append(chosen)
             quality.append(np.zeros(0))
-            if progress is not None:
-                progress(index + 1, len(poses))
             continue
 
         offset = points[chosen] - np.asarray(pose.position, dtype=float)
@@ -168,8 +161,6 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
                                      normals[chosen])
         sets.append(chosen)
         quality.append(cosines)
-        if progress is not None:
-            progress(index + 1, len(poses))
 
     say(f"  evaluated {len(poses)} candidates: {counters}")
     return CoverageResult(poses=list(poses), sets=sets, quality=quality,
@@ -197,12 +188,14 @@ def merge(first: CoverageResult, second: CoverageResult) -> CoverageResult:
 def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
                         station: Station, model: ScannerModel, cfg: PlannerConfig,
                         *, obstacles: dict | None = None,
-                        tracker_ok=None, gate=None) -> np.ndarray:
+                        tracker_ok=None, robot: RobotArm | None = None) -> np.ndarray:
     """Say why each uncovered sample is uncovered, one reason per sample.
 
     `only_poses_that_collide` is kept separate from `blocked_by_*`: it means the part is
     reachable in principle but the scanner body has nowhere to stand, which is a layout
-    question, not an occlusion one.
+    question, not an occlusion one. `only_poses_out_of_reach` is the same idea for the arm:
+    the pose could see the sample, but every configuration that gets there is past a derated
+    joint stop, so the sample is a reach question, not a selection one.
 
     `tracker_ok` is the per-pose tracker verdict from :func:`evaluate`. Passing it matters:
     a pose the tracker cannot see covers nothing, so without it a sample that only
@@ -223,9 +216,6 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
     casters = station.obstacles() if obstacles is None else obstacles
     resolved = np.zeros(count, dtype=bool)
     only_colliding = np.zeros(count, dtype=bool)
-    only_limited = np.zeros(count, dtype=bool)
-    faced = np.zeros(count, dtype=bool)
-    reached = np.zeros(count, dtype=bool)
     pending = np.arange(count)
     base_positions = np.array([pose.position for pose in poses], dtype=float) if poses \
         else np.zeros((0, 3))
@@ -240,6 +230,18 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
     # answer from the poses the tracker can actually see first, so their verdicts win
     order = np.argsort(~visible, kind="stable")
 
+    reach_cache: dict[int, bool] = {}
+
+    def _reachable(index: int) -> bool:
+        """Whether this pose is inside the arm's window, solved once per pose."""
+        if index not in reach_cache:
+            if robot is None:
+                reach_cache[index] = True
+            else:
+                pose = poses[int(index)]
+                reach_cache[index] = robot.solve(pose.frame, pose.position) is not None
+        return bool(reach_cache[index])
+
     for index in order:
         pose = poses[index]
         if resolved.all():
@@ -248,21 +250,11 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
         if len(candidates) == 0:
             break
         geometry = model.geometry_mask(pose, points[candidates], normals[candidates])
-        reached[candidates[geometry]] = True
-        offset_all = points[candidates] - np.asarray(pose.position, dtype=float)
-        distance_all = np.linalg.norm(offset_all, axis=1)
-        cosines = model.incidence_cos(offset_all / np.maximum(distance_all, 1e-9)[:, None],
-                                      normals[candidates])
-        faced[candidates[cosines >= model.cos_incidence_limit]] = True
         index_set = candidates[geometry]
         if len(index_set) == 0:
             continue
         if not model.body_fits(pose.position, clearances[index]):
             only_colliding[index_set] = True
-            continue
-        if gate is not None and gate.active and not gate.check(
-                pose.position, pose.axis, pose.roll_deg).ok:
-            only_limited[index_set] = True
             continue
 
         offset = points[index_set] - np.asarray(pose.position, dtype=float)
@@ -272,21 +264,17 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
                             len(index_set), axis=0)
         nearest, names, _ = nearest_across(casters, origins, directions)
         blocked = nearest < distance - cfg.occlusion_tol_mm
+        reachable = _reachable(index)
         for local, target in enumerate(index_set):
             if blocked[local]:
                 reasons[target] = f"blocked_by_{names[local]}"
+            elif not visible[index]:
+                reasons[target] = "blocked_by_tracker"
+            elif not reachable:
+                reasons[target] = "only_poses_out_of_reach"
             else:
-                reasons[target] = "candidate_found" if visible[index] else "blocked_by_tracker"
+                reasons[target] = "candidate_found"
             resolved[target] = True
 
-    reasons[~resolved & only_limited] = "unreachable_joint_limit"
-    reasons[~resolved & only_colliding & ~only_limited] = "only_poses_that_collide"
-    if poses:
-        # Two more, and they point at different fixes: a sample no pose's footprint ever
-        # covers is a candidate-generation problem (add a rail / lower the standoff), while
-        # one that is inside the footprint but turned away from every candidate is a
-        # direction-family problem. Reporting both as "never in view" hides which.
-        unclaimed = ~resolved & (reasons == "never_in_view")
-        reasons[unclaimed & ~reached & ~faced] = "not_facing"
-        reasons[unclaimed & ~reached & faced] = "no_line"
+    reasons[~resolved & only_colliding] = "only_poses_that_collide"
     return reasons

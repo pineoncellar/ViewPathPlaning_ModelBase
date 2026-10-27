@@ -26,8 +26,7 @@ output/*
 # derived from customer geometry, so its contents stay out as well.
 **/00_Output Collection/*
 
-# `docs/` is versioned (public documentation). What stays out is declared by
-# `docs/.gitignore`, so a plain blacklist keeps the rest trackable.
+docs/*
 
 # Execution scratch (plan ledgers, review packages) - never versioned.
 .superpowers/

@@ -14,16 +14,33 @@ from ..tracker import Tracker
 
 EXEMPT_REASON = "fixture_contact"
 
+# The note for a run where no arm was configured, or where the base pose is still unknown
+# (`robot.enabled` off): the pre-arm wording, kept because it is still exactly true there.
 SCOPE_NOTE = (
-    "Coverage is GEOMETRIC reachability. Joint limits are screened HERE when the "
-    "`kinematics` block reports the gate as enabled - a pose the arm cannot hold is "
-    "rejected before the selection, and the delivered points are inside the configured "
-    "envelope with margin. Collision and final reachability are still decided by "
-    "ROBOGUIDE and the controller. With the gate disabled this set deliberately "
-    "contains poses the robot may reject, which is the old behaviour and not a defect: "
-    "import the .LS, try another CONFIG before calling a pose unreachable, and feed the "
-    "rejected poses back."
+    "Coverage is GEOMETRIC reachability only. Robot reachability, joint limits and "
+    "robot collision are NOT modelled here: they are decided later in ROBOGUIDE, so "
+    "this viewpoint set deliberately contains poses ROBOGUIDE may reject. That is "
+    "expected, not a defect - import the .LS, try another CONFIG before calling a "
+    "pose unreachable, and feed the rejected poses back."
 )
+
+# The note for a run WITH an arm: joint limits are now part of the coverage figure, so
+# saying they are not would be false. Collision still is not.
+SCOPE_NOTE_ARM = (
+    "Coverage is GEOMETRIC reachability filtered by the arm. Joint limits ARE enforced: "
+    "every delivered pose - and every straight move between two of them - is solved "
+    "against the robot's kinematic chain with each axis derated by `robot."
+    "joint_limit_margin`, and anything that needs more travel than that is dropped before "
+    "the selection. Robot COLLISION is still NOT modelled, and neither is the arm's "
+    "occlusion of the tracker: import the .LS, confirm the clearances in ROBOGUIDE, and "
+    "treat a pose it rejects as a question for the base pose or the fixture, not as a "
+    "planning result."
+)
+
+
+def scope_note(config: PlannerConfig) -> str:
+    """What this run's coverage figure does and does not include."""
+    return SCOPE_NOTE_ARM if config.robot.enabled else SCOPE_NOTE
 
 TRACKER_CAVEAT = (
     "The tracker test covers part, fixture and base only. Occlusion by the ROBOT ARM "
@@ -137,4 +154,36 @@ def provenance(config: PlannerConfig) -> dict:
         "note": ("the unmeasured block is the one to look at before believing a coverage "
                  "figure; max_incidence_deg is the most sensitive of them and "
                  "fov_anchor_distance_mm the one that moves the viewpoint count by ~20%"),
+    }
+
+
+def derived_block(config: PlannerConfig) -> dict:
+    """The `surface_bias` profile: what it produced, and which layer wrote each key.
+
+    One semantic input ("does this part have to be scanned completely, or does a regular
+    program matter more?") drives six keys, and the report has to say so per key - both
+    the value and whether it came from the base file, from the profile or from an explicit
+    override. Without that, "why is min_gain 200?" is unanswerable from the report, which
+    is how a derived parameter turns into a mystery number (merge plan 6.6).
+    """
+    derived = dict(getattr(config, "derived", {}) or {})
+    keys = ("min_gain_mm2_per_step", "min_stroke_mm", "seed_dirs",
+            "order_axis_weight_mm_per_deg", "parallel_weight", "repair_budget_share")
+    return {
+        "surface_bias": config.target.surface_bias,
+        "surface_bias_source": getattr(config, "surface_bias_source", "base"),
+        "derived_keys": {key: {"value": getattr(config.stroke, key),
+                               "source": derived.get(key, "profile")} for key in keys},
+        "note": ("0.0 is coverage first (grow further, accept more broken bands), 0.5 is "
+                 "the shipped behaviour - at which every key below equals its factory "
+                 "value - and 1.0 is regular programs first (stop earlier, fewer corners). "
+                 "Writing a key explicitly in an override file always beats the profile, "
+                 "which is why the source is recorded per key"),
+        "excluded_on_purpose": {
+            "scanner.max_incidence_deg": config.scanner.max_incidence_deg,
+            "scanner.range_mm": list(config.scanner.range_mm),
+            "reason": ("sensor physics, not taste: bending either of these to buy coverage "
+                       "would fake a capability and make the report look better while the "
+                       "cell cannot scan it"),
+        },
     }

@@ -21,44 +21,27 @@ Two details change whether a point looks reachable:
   another configuration before blaming the planner.
 * J moves are more permissive than L moves and match the "bring the scanner to a
   pose" intent, so J with FINE termination is the default for a review.
+
+A sweep and a reposition are two different moves and are emitted as two different
+instructions. The straight `L` section between two points is what the coverage figure was
+computed from, so it stays straight; the one point the planner labels as a joint travel
+(`role` `joint`, the pre-point of a joint route) is a reposition and is emitted with
+`travel_motion` (a joint move by default, at a percentage speed, because that is what a
+workshop flies a reposition with). Which point is which comes from `role`, the label
+`scanplan.path` writes into the point table.
 """
 
 from __future__ import annotations
 
-import re
 from datetime import datetime
 
 from scanplan.roboguide.wpr import fanuc_num
 
-# What the controller accepts in the speed field of a motion instruction: a percentage, or a
-# rate with a unit. Anything else is a typo that would otherwise be written into the program
-# and rejected on the machine, so it is refused here where the message can say why.
-_SPEED = re.compile(
-    r"^\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>%|mm/sec|mm/s|deg/sec|deg/s|sec)?\s*$",
-    re.IGNORECASE)
-
-
-def check_speed(speed: str, motion: str = "J") -> str:
-    """Validate a FANUC speed field and return it normalised.
-
-    A percentage is the only form that means the same thing for both motion types; a rate
-    without a unit is ambiguous, so it is refused rather than guessed at.
-    """
-    text = str(speed).strip()
-    found = _SPEED.match(text)
-    if found is None:
-        raise ValueError(f"speed {speed!r} is not a FANUC speed: use e.g. '100%' or "
-                         "'250mm/sec'")
-    value = float(found.group("value"))
-    unit = (found.group("unit") or "").lower()
-    if value <= 0.0:
-        raise ValueError(f"speed {speed!r} must be positive")
-    if unit == "%" and value > 100.0:
-        raise ValueError(f"speed {speed!r} is over 100 percent")
-    if motion.upper() == "J" and unit in ("mm/sec", "mm/s"):
-        raise ValueError(f"a joint move cannot be given a linear speed ({speed!r}): "
-                         "use a percentage, or switch motion.type to L")
-    return text
+# The role `scanplan.path` gives the pre-point of a joint travel: the head is brought to it
+# with a joint move, carrying the next sweep's pose, and the short straight approach into
+# the sweep follows it. It is the only point in an `L` program whose move is not straight -
+# a `traverse` or `reorient` point belongs to the straight-only routes, so those stay `L`.
+REPOSITION_ROLES = ("joint",)
 
 
 def _pos_block(index: int, kind: str, uframe: int, utool: int, config: str, payload) -> str:
@@ -85,6 +68,11 @@ def _pos_block(index: int, kind: str, uframe: int, utool: int, config: str, payl
     )
 
 
+def _is_reposition(point: dict) -> bool:
+    """Whether this point exists only to carry the head between two sweeps."""
+    return str(point.get("role", "")).strip().lower() in REPOSITION_ROLES
+
+
 def build_ls(
     points: list[dict],
     *,
@@ -94,11 +82,13 @@ def build_ls(
     motion: str = "J",
     speed: str = "100%",
     termination: str = "FINE",
+    travel_motion: str = "J",
+    travel_speed: str = "100%",
+    travel_termination: str = "CNT100",
     config: str = "N U T, 0, 0, 0",
     comment: str = "scan viewpoints",
     constant: str = "",
     home_joints=None,
-    joint_blocks: bool = False,
     stamp: datetime | str | None = None,
 ) -> str:
     """Render the whole `.LS` program.
@@ -112,27 +102,37 @@ def build_ls(
     only valid at `CNT0`-like termination, because the linear segment between two points
     - the thing the coverage was computed from - is what gets flown.
 
-    Per-point overrides. Each point may carry its own `config`, `motion`, `termination` and
-    `joints_deg`; the arguments here are the defaults. That is not a convenience: one
-    Cartesian pose has up to eight joint solutions and only some are inside the limits, so a
-    single CONFIG string for the whole program is exactly how every point ended up pinned to
-    the same branch. `joint_blocks=True` writes `P[n]` as joint angles for points that have
-    them, which removes the controller's choice altogether - the most direct fix, and the
-    one that needs the model to be right.
+    `travel_motion`, `travel_speed` and `travel_termination` are for the repositions of an
+    `L` program: a point whose `role` is `joint` is the pre-point of a joint travel, the
+    head crossing between two sweeps in mid air, and it is the one move that may leave the
+    straight line. A `J` program is a reachability review where every point is a joint move
+    already, so the travel settings are not read there; `travel_motion="L"` gives back the
+    uniform straight program.
+
+    A joint reposition does not follow the straight segment anything was measured on - the
+    exclusion is what "sweeps nothing" buys, not a claim that the joint path is checked.
     """
     if isinstance(stamp, str):
         stamp_text = stamp
     else:
         stamp_text = (stamp or datetime.now()).strftime("%y-%m-%d  TIME %H:%M:%S")
-    speed = check_speed(speed, motion)
 
-    def command(index: int, point_motion: str, point_termination: str,
-                point_speed: str, is_joint: bool = False) -> str:
-        # a joint representation point can only be reached with a joint move, and
-        # FANUC takes a percentage speed for those
-        if point_motion.upper() == "L" and not is_joint:
-            return f"L P[{index}] {point_speed} {point_termination.upper()}"
-        return f"J P[{index}] {point_speed} FINE"
+    def command(index: int, is_joint: bool = False, reposition: bool = False) -> str:
+        # a joint move takes a percentage speed on FANUC, never a mm/sec one, and that
+        # covers both the joint representation points and a joint reposition
+        if is_joint:
+            return f"J P[{index}] {travel_speed} FINE"
+        if motion.upper() == "L":
+            # a sweep is the segment the coverage figure was computed from; a retract, or
+            # the approach dive into the next sweep, is a segment the clearance check
+            # measured. Both stay straight. The pre-point of a joint travel is the head
+            # crossing between two sweeps in mid air, carrying the next pose - nothing is
+            # claimed about what it sweeps, so it takes the travel moves, at the percentage
+            # speed FANUC wants for a joint move.
+            if reposition and travel_motion.upper() == "J":
+                return f"J P[{index}] {travel_speed} {travel_termination.upper()}"
+            return f"L P[{index}] {speed} {termination.upper()}"
+        return f"J P[{index}] {speed} FINE"
 
     mn_lines: list[str] = []
     pos_blocks: list[str] = []
@@ -145,30 +145,20 @@ def build_ls(
         pos_blocks.append(_pos_block(home_index, "joint", uframe, utool, config, home_joints))
 
     point_indices = []
-    point_specs: list[tuple[str, str, str, bool]] = []
+    repositions = []
     for pt in points:
         point_indices.append(next_index)
-        point_config = pt.get("config") or config
-        point_motion = str(pt.get("motion") or motion)
-        point_termination = str(pt.get("termination") or termination)
-        point_speed = check_speed(str(pt.get("speed") or speed), point_motion)
-        joints = pt.get("joints_deg")
-        as_joint = bool(joint_blocks and joints is not None)
-        if as_joint:
-            pos_blocks.append(
-                _pos_block(next_index, "joint", uframe, utool, point_config, joints))
-        else:
-            pos_blocks.append(
-                _pos_block(
-                    next_index,
-                    "cart",
-                    uframe,
-                    utool,
-                    point_config,
-                    (*pt["xyz_mm"].tolist(), *pt["wpr_deg"]),
-                )
+        repositions.append(_is_reposition(pt))
+        pos_blocks.append(
+            _pos_block(
+                next_index,
+                "cart",
+                uframe,
+                utool,
+                config,
+                (*pt["xyz_mm"].tolist(), *pt["wpr_deg"]),
             )
-        point_specs.append((point_motion, point_termination, point_speed, as_joint))
+        )
         next_index += 1
 
     mn_lines.append(f"{len(mn_lines) + 1:>4}:  UFRAME_NUM={uframe} ;")
@@ -176,22 +166,18 @@ def build_ls(
     if constant:
         mn_lines.append(f"{len(mn_lines) + 1:>4}:  {constant} ;")
 
-    spec_for = dict(zip(point_indices, point_specs, strict=True))
-    moves: list[tuple[int, bool]] = []
+    moves: list[tuple[int, bool, bool]] = []
     if home_index:
-        moves.append((home_index, True))
-    # A joint-representation point can only be reached with a joint move; asking for `L`
-    # there is rejected by the controller, so the instruction follows the representation.
-    moves.extend((index, spec_for[index][3]) for index in point_indices)
+        moves.append((home_index, True, False))
+    moves.extend((index, False, reposition)
+                 for index, reposition in zip(point_indices, repositions, strict=True))
     if home_index:
-        moves.append((home_index, True))
+        moves.append((home_index, True, False))
 
-    for index, is_joint in moves:
-        point_motion, point_termination, point_speed, _written = spec_for.get(
-            index, (motion, termination, speed, is_joint))
+    for index, is_joint, reposition in moves:
         mn_lines.append(
             f"{len(mn_lines) + 1:>4}:"
-            f"{command(index, point_motion, point_termination, point_speed, is_joint)}    ;")
+            f"{command(index, is_joint=is_joint, reposition=reposition)}    ;")
     # real FANUC programs simply end after the last instruction; there is no END
     # statement in the instruction list
 

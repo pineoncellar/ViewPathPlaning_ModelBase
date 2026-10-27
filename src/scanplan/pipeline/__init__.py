@@ -31,7 +31,6 @@ from dataclasses import dataclass, field
 from ..candidates import generate
 from ..config import PlannerConfig
 from ..coverage import CoverageResult, evaluate
-from ..kinematics import KinematicGate
 from ..path import PathPlan
 from ..raycast import backend_name
 from ..report import (
@@ -40,6 +39,7 @@ from ..report import (
     viewpoints_from_path,
     viewpoints_from_selection,
 )
+from ..robot import RobotArm, arm_for
 from ..scanner_model import ScannerModel
 from ..scene import Station
 from ..selection import Selection, select
@@ -49,7 +49,6 @@ from ..target_surface import TargetSet, build_target
 from ..tracker import Tracker, visible_mask
 from .delivery import _finish_stroke_plan, _group_selection, _stroke_builder
 from .outputs import write_outputs
-from .progress import ProgressHook, ProgressReporter
 from .ranking import _rank
 from .refine import RefineState, refine_rounds
 
@@ -76,30 +75,24 @@ class PlanResult:
     path: PathPlan | None = None
     strokes: StrokeCoverage | None = None
     pose_only_coverage_pct: float | None = None
+    robot: RobotArm | None = None
 
 
 def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
          tracker: Tracker | None = None, split: SheetSplit | None = None,
-         log: Callable[[str], None] | None = None,
-         progress: ProgressHook | None = None) -> PlanResult:
+         log: Callable[[str], None] | None = None) -> PlanResult:
     """Plan the scan of one face of the blank, and report what was missed.
 
     `face` defaults to the configuration; `"auto"` plans both faces and keeps the one
     with the higher coverage, which is the only reliable way to answer "which side is
     up", and records both figures in `face_candidates`.
-
-    `progress(stage, fraction, detail)` is optional and reports where the run actually
-    is. The bands below are the run's real stages, not a time estimate; a caller that
-    ignores it sees exactly the same planning as before.
     """
     say = log or (lambda message: print(message, flush=True))
-    reporter = ProgressReporter(progress)
     started = time.time()
     requested = cfg.target.face if face is None else face
     if requested not in FACES:
         raise ValueError(f"face must be one of {FACES}, not {requested!r}")
 
-    alignment_rep = reporter.band("segmentation", 0.0, 0.03)
     say("station alignment checks")
     # A diagnostic, not a measurement: 40k samples per model is ample for the distances
     # and clearances it reports, and it runs on every plan including the two-face "auto"
@@ -107,24 +100,18 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
     checks = station.check_alignment(seed=cfg.seed, samples=40_000)
     for warning in checks["warnings"]:
         say(f"  WARNING: {warning}")
-    alignment_rep(1.0, f"alignment checks: {len(checks['warnings'])} warnings")
 
     if split is None:
-        split_rep = reporter.band("segmentation", 0.03, 0.10)
         say("splitting the blank into its two faces")
-        split_rep(0.05, "splitting the blank")
         split = split_sheet(station.part, band_deg=cfg.target.band_deg, knn=cfg.target.knn,
                             seed=cfg.seed, log=log)
-        split_rep(1.0, "blank split into its two faces")
 
     if requested == "auto":
         candidates: dict[str, PlanResult] = {}
-        for option, low, high in (("upper", 0.10, 0.55), ("lower", 0.55, 1.0)):
-            face_rep = reporter.band("segmentation", low, high)
-            face_rep(0.0, f"planning the {option} face")
+        for option in ("upper", "lower"):
             try:
                 candidates[option] = _plan_face(station, cfg, split, option, tracker,
-                                               checks, started, log, progress=face_rep)
+                                               checks, started, log)
             except ValueError as error:
                 say(f"  {option} face cannot be planned: {error}")
         if not candidates:
@@ -141,78 +128,47 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
         result.report["face_candidates"] = result.face_candidates
         return result
 
-    face_rep = reporter.band("segmentation", 0.10, 1.0)
-    face_rep(0.0, f"planning the {requested} face")
-    return _plan_face(station, cfg, split, requested, tracker, checks, started, log,
-                      progress=face_rep)
-
-
-def _pose_tie(coverage: CoverageResult, kin) -> list[float] | None:
-    """Per-pose joint room, or None when the gate is off.
-
-    Used only to separate candidates whose covered area is equal: the choice of which of two
-    equally good poses to deliver should prefer the one further from a limit, not the one
-    that happened to be generated first.
-    """
-    if kin is None or not kin.active:
-        return None
-    values: list[float] = []
-    for pose in coverage.poses:
-        verdict = kin.check(pose.position, pose.axis, pose.roll_deg)
-        values.append(verdict.solution.j5_margin_deg
-                      if verdict.ok and verdict.solution is not None else -1e9)
-    return values
+    return _plan_face(station, cfg, split, requested, tracker, checks, started, log)
 
 
 def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: str,
                tracker: Tracker | None, checks: dict, started: float,
-               log: Callable[[str], None] | None,
-               progress: ProgressReporter | None = None) -> PlanResult:
+               log: Callable[[str], None] | None) -> PlanResult:
     """Plan one named face, from target sampling through to the report."""
     say = log or (lambda message: print(message, flush=True))
-    base = progress if progress is not None else ProgressReporter()
     model = ScannerModel(cfg.scanner)
-    target_rep = base.band("segmentation", 0.0, 0.10)
-    target_rep(0.02, f"sampling the {face} target face")
     target = build_target(station.part, split, face, station, cfg, log=log)
     if len(target.samples.points) == 0:
         raise ValueError(f"the {face} target face produced no samples to scan")
-    target_rep(1.0, f"{len(target.samples.points)} target samples")
 
     gate = None
     if tracker is not None:
         obstacles = station.obstacles()
         gate = lambda positions: visible_mask(tracker, positions, obstacles)  # noqa: E731
 
-    # The joint-limit gate. Off by default (`robot.enabled=false`), and when off every call
-    # below is a no-op, which is what keeps the pre-2026-10-22 result reproducible.
-    kin = KinematicGate(cfg.robot)
-    if kin.active:
-        say(f"kinematic gate on: {cfg.robot.model}, limits {kin.robot.limits_source}")
+    # The arm is built once per face, not once per query: the derated windows and the chain
+    # never change during a run, and the planner asks about thousands of poses.
+    robot = arm_for(cfg.robot)
+    if robot is None:
+        say("joint limits: not checked (robot.enabled is off)")
+    else:
+        say(f"joint limits: {robot.spec.name}, every axis derated to "
+            f"{cfg.robot.joint_limit_margin:.0%} of its workspace-table travel "
+            f"(J1 {robot.allowed_table_deg[0][0]:.1f}..{robot.allowed_table_deg[0][1]:.1f} deg"
+            f" least to most restrictive)")
 
-    cand_rep = base.band("candidates", 0.10, 0.22)
     say(f"generating candidates for the {face} face")
-    cand_rep(0.0, "aiming the candidate ladder")
     poses = generate(target.samples.points, target.samples.normals, cfg.scanner,
-                     seed=cfg.seed, log=log, progress=cand_rep.tick("aims"))
-    cand_rep(1.0, f"{len(poses)} candidates")
-
-    occ_rep = base.band("occlusion", 0.22, 0.60)
+                     seed=cfg.seed, log=log)
     mark = time.time()
     coverage = evaluate(poses, target.samples, station, model, cfg, visible=gate,
-                        gate=kin, log=log, progress=occ_rep.tick("poses"))
-    occ_rep(1.0, f"{len(coverage.poses)} poses in {time.time() - mark:.0f} s")
+                        robot=robot, log=log)
     say(f"  pose coverage took {time.time() - mark:.0f} s")
     mark = time.time()
 
-    select_rep = base.band("occlusion", 0.60, 0.64)
-    select_rep(0.2, "selecting the minimum covering set")
     pose_selection = select(coverage, coverage.area_mm2,
-                            coverage_target_pct=cfg.target.coverage_target_pct,
-                            tie=(_pose_tie(coverage, kin)), log=log)
-    select_rep(1.0, f"{len(pose_selection.chosen)} poses at "
-                    f"{pose_selection.coverage_pct:.2f}%")
-    builder = _stroke_builder(cfg, target, station, model, gate, kin)
+                            coverage_target_pct=cfg.target.coverage_target_pct, log=log)
+    builder = _stroke_builder(cfg, target, station, model, gate, robot=robot)
     if builder is None:
         say("  stroke planning is off: the delivered set is single poses")
     stroke_cov: StrokeCoverage | None = None
@@ -222,32 +178,18 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     # before every stroke, so appending poses shifts each stroke's row - see `_shift_rows`.
     selection_poses = len(coverage.poses)
     if builder is not None:
-        stroke_gen_rep = base.band("strokes", 0.64, 0.74)
         say("growing scan strokes from the aim grid")
-        stroke_gen_rep(0.0, "growing strokes from the aim grid")
-        grown = builder.generate(target.samples.points, target.samples.normals,
-                                 aim_grid_mm=cfg.scanner.aim_grid_mm, log=log,
-                                 progress=stroke_gen_rep.tick("seeds"))
-        stroke_gen_rep(1.0, f"{len(grown)} strokes generated")
-        stroke_eval_rep = base.band("strokes", 0.74, 0.86)
-        stroke_cov = builder.evaluate(grown, log=log,
-                                      progress=stroke_eval_rep.tick("strokes"))
-        stroke_eval_rep(1.0, f"{len(stroke_cov.strokes)} strokes kept")
-        group_rep = base.band("strokes", 0.86, 0.90)
-        group_rep(0.2, "grouping poses and strokes")
+        stroke_cov = builder.evaluate(
+            builder.generate(target.samples.points, target.samples.normals,
+                             aim_grid_mm=cfg.scanner.aim_grid_mm, log=log),
+            log=log)
         combined = combine(coverage, stroke_cov)
         selection = _group_selection(combined, coverage, stroke_cov, cfg, log=log)
-        group_rep(1.0, f"{len(selection.chosen)} items at {selection.coverage_pct:.2f}%")
         say(f"  stroke stage took {time.time() - mark:.0f} s")
         say(f"  pose-only reference: {len(pose_selection.chosen)} viewpoints at "
             f"{pose_selection.coverage_pct:.2f}%; strokes reach "
             f"{len(selection.chosen)} items at {selection.coverage_pct:.2f}%")
         selection_poses = len(coverage.poses)
-        refine_low, refine_high = 0.90, 0.94
-
-    if builder is None:
-        # Pose-only delivery: the refine rounds are the rest of the work before the report.
-        refine_low, refine_high = 0.64, 0.94
 
     counters = dict(coverage.counters)
     counters["refine_rounds"] = 0
@@ -256,8 +198,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     state = RefineState(coverage=coverage, combined=combined, stroke_cov=stroke_cov,
                         selection=selection, selection_poses=selection_poses,
                         counters=counters)
-    refine_rounds(state, builder, target, station, model, cfg, gate, kin=kin, log=log,
-                  progress=base.band("strokes", refine_low, refine_high))
+    refine_rounds(state, builder, target, station, model, cfg, gate, robot=robot, log=log)
     coverage, combined = state.coverage, state.combined
     stroke_cov, selection = state.stroke_cov, state.selection
     counters = state.counters
@@ -265,12 +206,9 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     path: PathPlan | None = None
     swept_pct: float | None = None
     if builder is not None and stroke_cov is not None:
-        finish_rep = base.band("strokes", 0.94, 0.97)
-        finish_rep(0.05, "building the delivered path")
         selection, path, swept_pct = _finish_stroke_plan(
             combined, coverage, stroke_cov, selection, pose_selection, target, station,
-            model, cfg, gate, kin=kin, log=log, progress=finish_rep)
-        finish_rep(1.0, "delivered path built")
+            model, cfg, gate, robot=robot, log=log)
     counters.update({key: value for key, value in combined.counters.items()})
 
     if path is not None:
@@ -278,21 +216,18 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     else:
         viewpoints = viewpoints_from_selection(selection, combined, target.samples)
     say(f"reporting: {len(viewpoints)} points cover {selection.coverage_pct:.2f}%")
-    report_rep = base.band("report", 0.97, 1.0)
-    report_rep(0.05, "writing the coverage report")
     report = build_report(config=cfg, model=model, station=station, split=split,
                           target=target, coverage=combined, selection=selection,
                           viewpoints=viewpoints, tracker=tracker, checks=checks,
-                          path=path, strokes=stroke_cov,
-                          kinematics=kin,
+                          path=path, strokes=stroke_cov, robot=robot,
                           swept_coverage_pct=swept_pct,
                           pose_only_coverage_pct=pose_selection.coverage_pct,
                           runtime={"seconds": round(time.time() - started, 1),
                                    "ray_backend": backend_name()},
                           log=log)
     report["counters"] = counters
-    report_rep(1.0, "report ready")
     return PlanResult(config=cfg, station=station, split=split, target=target,
                       coverage=combined, selection=selection, viewpoints=viewpoints,
                       report=report, checks=checks, tracker=tracker, path=path,
-                      strokes=stroke_cov, pose_only_coverage_pct=pose_selection.coverage_pct)
+                      strokes=stroke_cov, robot=robot,
+                      pose_only_coverage_pct=pose_selection.coverage_pct)

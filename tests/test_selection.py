@@ -55,72 +55,7 @@ def test_greedy_runs_to_completion_and_leaves_nothing_for_repair():
     assert np.array_equal(selection.covered, cov.pool_reach())
 
 
-def test_lambda_moves_the_choice_from_cheap_to_large():
-    """`lambda` is the exchange rate between coverage and corners.
-
-    At 0 the density greedy takes the cheap candidate first (10 units for 1 corner beats
-    100 for 100); as lambda grows the cost stops mattering and the big one is taken first.
-    This is the whole mechanism behind the budget search, so it is asserted directly.
-    """
-    from scanplan.selection import select_groups
-
-    cov = fake_coverage(sets=[np.arange(100), np.arange(100, 110)], n_targets=110)
-    cheap = select_groups(cov, [100.0, 1.0], repair_ok=[False, False])
-    assert cheap.chosen[0] == 1
-    large = select_groups(cov, [100.0, 1.0], repair_ok=[False, False], lam=100.0)
-    assert large.chosen[0] == 0
-
-
-def test_equal_areas_are_broken_by_the_declared_preference():
-    """Exact ties used to be decided by candidate order, which is not a reason."""
-    from scanplan.selection import select_groups
-
-    cov = fake_coverage(sets=[np.array([0]), np.array([0])], n_targets=1)
-    without = select_groups(cov, [1.0, 1.0], repair_ok=[False, False])
-    assert without.chosen == [0]
-    with_tie = select_groups(cov, [1.0, 1.0], repair_ok=[False, False], tie=[0.0, 5.0])
-    assert with_tie.chosen == [1]
-
-
-def test_the_skeleton_weight_can_flip_a_close_score_but_not_a_clear_one():
-    """The weight is a nudge bounded by the configured 1.3, not a policy."""
-    from scanplan.selection import select_groups
-
-    close = fake_coverage(sets=[np.arange(1000), np.arange(1000, 2150)], n_targets=2150)
-    assert select_groups(close, [1.0, 1.0],
-                         repair_ok=[False, False]).chosen[0] == 1        # 1150 > 1000
-    assert select_groups(close, [1.0, 1.0], repair_ok=[False, False],
-                         weight=[1.3, 1.0]).chosen[0] == 0               # 1300 > 1150
-
-    clear = fake_coverage(sets=[np.arange(1000), np.arange(1000, 3000)], n_targets=3000)
-    assert select_groups(clear, [1.0, 1.0], repair_ok=[False, False],
-                         weight=[1.3, 1.0]).chosen[0] == 1               # 2000 > 1300
-
-
-def test_an_excluded_candidate_is_replaced_not_lost():
-    """The hard gate bans a row; the selection must cover that area another way."""
-    from scanplan.selection import select_groups
-
-    cov = fake_coverage(sets=[np.arange(4), np.arange(2)], n_targets=4)
-    offered = select_groups(cov, [1.0, 1.0], repair_ok=[False, False])
-    assert offered.chosen == [0]
-    banned = select_groups(cov, [1.0, 1.0], repair_ok=[False, False],
-                           exclude=[True, False])
-    assert banned.chosen == [1]
-    assert banned.coverage_pct < offered.coverage_pct      # and it says so
-
-
-def test_an_exclusion_mask_of_the_wrong_length_is_refused():
-    from scanplan.selection import select_groups
-
-    cov = fake_coverage(sets=[np.array([0])], n_targets=1)
-    with pytest.raises(ValueError, match="exclusion"):
-        select_groups(cov, [1.0], exclude=[False, True])
-
-
-def test_select_still_accepts_no_tie_at_all():
-    cov = fake_coverage(sets=[np.array([0, 1]), np.array([1, 2])], n_targets=3)
-    assert select(cov, cov.area_mm2, tie=None).chosen
+def test_every_reachable_sample_is_covered_once_repair_has_run():
     cov = fake_coverage(sets=[np.array([0]), np.array([1]), np.array([2])], n_targets=4)
     selection = select(cov, cov.area_mm2)
     assert np.array_equal(selection.covered, cov.pool_reach())

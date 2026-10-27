@@ -8,8 +8,9 @@ would collide); and the uncovered regions clustered into a short list of blocks.
 
 Must also state what it does NOT include:
 
-* coverage is GEOMETRIC reachability only - robot reachability, joint limits and
-  robot collision are decided later, in ROBOGUIDE;
+* coverage is GEOMETRIC reachability, filtered by the arm's joint window when
+  `robot.enabled` is set - the limits themselves are enforced, ROBOT COLLISION is
+  decided later, in ROBOGUIDE;
 * tracker visibility does not include robot-arm occlusion;
 * when a measured scanner parameter is still a placeholder, say which one, so
   nobody reads the coverage figure as a prediction.
@@ -33,6 +34,7 @@ from ..config import PlannerConfig
 from ..coverage import CoverageResult
 from ..path import PathPlan
 from ..raycast import backend_name
+from ..robot import RobotArm
 from ..scanner_model import ScannerModel
 from ..scene import Station
 from ..selection import Selection
@@ -48,14 +50,15 @@ from ..viewpoints import (  # noqa: F401  (re-exported for the exporters)
 from .coverage import angle_diversity_block, cluster_points, coverage_block
 from .definition import (
     PLACEHOLDERS_NOTE,
-    SCOPE_NOTE,
     TRACKER_CAVEAT,
     definition_block,
+    derived_block,
     placeholders_block,
     provenance,
+    scope_note,
 )
-from .kinematics import budget_block, kinematics_block, surface_profile_block
 from .program import program_block
+from .robot import robot_block
 from .strokes import stroke_block, write_strokes_json
 from .summary import summary_lines, summary_text
 from .viewpoints import write_samples_csv, write_viewpoints_csv, write_viewpoints_json
@@ -82,7 +85,7 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
                  selection: Selection, viewpoints,
                  tracker: Tracker | None = None, checks: dict | None = None,
                  path: PathPlan | None = None, strokes: StrokeCoverage | None = None,
-                 kinematics=None,
+                 robot: RobotArm | None = None,
                  swept_coverage_pct: float | None = None,
                  pose_only_coverage_pct: float | None = None,
                  runtime: dict | None = None, log=None) -> dict:
@@ -95,21 +98,20 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
         "viewpoints_repair": sum(1 for vp in viewpoints if vp.source == "repair"),
         "viewpoints_transition": sum(1 for vp in viewpoints if vp.role != "coverage"),
         **coverage_block(config=config, model=model, station=station, target=target,
-                         coverage=coverage, selection=selection, say=say),
-        "program": program_block(config, viewpoints, path),
+                         coverage=coverage, selection=selection, robot=robot, say=say),
+        "program": program_block(config, viewpoints, path, selection),
         "stroke_plan": stroke_block(strokes, path, swept_coverage_pct,
                                     pose_only_coverage_pct),
         "angle_diversity": angle_diversity_block(coverage, selection.chosen, path),
-        "kinematics": kinematics_block(config, viewpoints, path, kinematics),
-        "budget": budget_block(config, path),
+        "robot": robot_block(robot, config),
         "parameter_provenance": provenance(config),
-        "surface_profile": surface_profile_block(config),
+        "derived_parameters": derived_block(config),
         "viewpoint_records": [viewpoint.as_dict() for viewpoint in viewpoints],
         "tracker": tracker.describe() if tracker is not None else {
             "name": None, "position_mm": None,
             "note": "no tracker pose supplied: the tracker constraint was not applied",
         },
-        "scope": SCOPE_NOTE,
+        "scope": scope_note(config),
         "tracker_caveat": TRACKER_CAVEAT,
         "placeholders_note": PLACEHOLDERS_NOTE,
         "placeholders": placeholders_block(config, tracker),

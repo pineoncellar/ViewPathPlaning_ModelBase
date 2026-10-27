@@ -43,73 +43,18 @@ def quick_cfg(cfg):
     return replace(cfg, scanner=replace(cfg.scanner, refine_rounds=0))
 
 
+@pytest.fixture(scope="session")
+def capped_cfg(quick_cfg):
+    """The same profile with a point cap the synthetic part cannot meet for free."""
+    return replace(quick_cfg, target=replace(quick_cfg.target, max_points=24))
+
+
 def test_same_config_and_seed_give_the_same_viewpoint_set(clamped_plate, quick_cfg):
     first = plan(clamped_plate.station, quick_cfg, face="upper")
     second = plan(clamped_plate.station, quick_cfg, face="upper")
     assert [tuple(viewpoint.position) for viewpoint in first.viewpoints] \
         == [tuple(viewpoint.position) for viewpoint in second.viewpoints]
     assert first.report["coverage_pct"] == second.report["coverage_pct"]
-
-
-def test_progress_reports_the_real_stages_and_never_rewinds(clamped_plate, quick_cfg):
-    """The bar is driven by the pipeline's own stages, not by a guessed time curve."""
-    events: list[tuple[str, float, str]] = []
-
-    def hook(stage: str, fraction: float, detail: str = "") -> None:
-        events.append((stage, fraction, detail))
-
-    plan(clamped_plate.station, quick_cfg, face="upper", progress=hook)
-
-    assert events, "a run with a hook must report something"
-    stages = {stage for stage, _fraction, _detail in events}
-    assert {"segmentation", "candidates", "occlusion", "report"} <= stages
-    fractions = [fraction for _stage, fraction, _detail in events]
-    assert fractions == sorted(fractions), "the bar must not rewind"
-    assert all(0.0 <= fraction <= 1.0 for fraction in fractions)
-    assert fractions[0] < fractions[-1] == pytest.approx(1.0)
-
-
-def test_a_run_without_a_hook_is_unchanged(clamped_plate, quick_cfg):
-    """The CLI and the scripts pass no hook; adding progress must not move a number."""
-    silent = plan(clamped_plate.station, quick_cfg, face="upper")
-    listened = plan(clamped_plate.station, quick_cfg, face="upper",
-                    progress=lambda stage, fraction, detail="": None)
-    assert [tuple(viewpoint.position) for viewpoint in silent.viewpoints] \
-        == [tuple(viewpoint.position) for viewpoint in listened.viewpoints]
-    assert silent.report["coverage_pct"] == listened.report["coverage_pct"]
-
-
-def test_a_point_budget_is_respected_and_reported(clamped_plate, quick_cfg):
-    """`max_points` is a hard ceiling on delivered points, and the report says why it hit."""
-    tight = replace(quick_cfg, target=replace(quick_cfg.target, max_points=12))
-    result = plan(clamped_plate.station, tight, face="upper")
-    assert result.path is not None
-    assert result.path.turns <= 12
-    assert result.report["budget"]["verdict"] in ("target_bound", "budget_bound", "exhausted")
-    assert result.report["budget"]["delivered_points"] == result.path.turns
-    assert result.report["budget"]["trials"]          # the frontier was sampled
-
-
-def test_an_unbudgeted_run_says_so(clamped_plate, quick_cfg):
-    result = plan(clamped_plate.station, quick_cfg, face="upper")
-    assert result.report["budget"]["max_points"] is None
-    assert result.report["budget"]["verdict"] == "unbudgeted"
-
-
-def test_the_surface_profile_is_reported_with_its_sources(clamped_plate, quick_cfg):
-    result = plan(clamped_plate.station, quick_cfg, face="upper")
-    block = result.report["surface_profile"]
-    assert block["surface_bias"] == pytest.approx(0.5)
-    assert block["sources"]["stroke.min_stroke_mm"] == "base"
-    assert block["anchors"]["0.5"]["min_stroke_mm"] == pytest.approx(150.0)
-
-
-def test_the_kinematics_block_is_present_and_off_by_default(clamped_plate, quick_cfg):
-    result = plan(clamped_plate.station, quick_cfg, face="upper")
-    block = result.report["kinematics"]
-    assert block["enabled"] is False
-    assert block["points_without_solution"] == 0
-    assert result.report["evaluation"]["rejected_kinematics"] == 0
 
 
 def test_the_target_excludes_the_clamped_region_but_not_the_opposite_face(clamped_plate,
@@ -318,6 +263,49 @@ def test_every_reported_reason_is_one_the_footprint_vocabulary_defines(clamped_p
     from scanplan.coverage import REASONS
     result = plan(clamped_plate.station, quick_cfg, face="upper")
     assert set(result.report["uncovered_by_reason"]) <= set(REASONS)
+
+
+def test_a_point_cap_is_never_exceeded(clamped_plate, capped_cfg):
+    """The cap is a hard gate: the delivered program must fit inside it.
+
+    Delivered points are counted by BUILDING the path, because a connector is one point or
+    two depending on the route and the lift it needed. Counting estimates is how a budget
+    turns back into a silent truncation.
+    """
+    result = plan(clamped_plate.station, capped_cfg, face="upper")
+    assert len(result.viewpoints) <= capped_cfg.target.max_points
+    program = result.report["program"]
+    assert program["max_points"] == capped_cfg.target.max_points
+    assert program["bound"] in ("target_bound", "budget_bound", "exhausted")
+    assert program["budget"] is not None
+    assert program["budget"]["evaluations"] >= 1
+
+
+def test_without_a_cap_the_budget_layer_does_not_run(clamped_plate, quick_cfg):
+    """`max_points = null` must leave the selection and the ordering alone."""
+    result = plan(clamped_plate.station, quick_cfg, face="upper")
+    assert result.report["program"]["max_points"] is None
+    assert result.report["program"]["budget"] is None
+    assert result.report["program"]["bound"] in ("target_bound", "budget_bound", "exhausted")
+
+
+def test_a_cap_costs_coverage_and_says_so(clamped_plate, quick_cfg):
+    """Meeting the cap with less coverage is reported as budget-bound, not hidden."""
+    free = plan(clamped_plate.station, quick_cfg, face="upper")
+    tightened = replace(quick_cfg, target=replace(quick_cfg.target, max_points=16))
+    tight = plan(clamped_plate.station, tightened, face="upper")
+    assert len(tight.viewpoints) <= 16
+    assert tight.selection.coverage_pct <= free.selection.coverage_pct + 1e-9
+    if tight.selection.coverage_pct + 1e-9 < free.selection.coverage_pct:
+        assert tight.report["program"]["bound"] == "budget_bound"
+
+
+def test_the_report_says_which_of_the_three_limits_stopped_the_run(clamped_plate, quick_cfg):
+    """Exactly one of target_bound / budget_bound / exhausted, for every run."""
+    result = plan(clamped_plate.station, quick_cfg, face="upper")
+    bound = result.report["program"]["bound"]
+    assert bound in ("target_bound", "budget_bound", "exhausted")
+    assert "target_bound" in result.report["program"]["bound_note"]
 
 
 def test_write_outputs_produces_every_documented_file(clamped_plate, quick_cfg, tmp_path):

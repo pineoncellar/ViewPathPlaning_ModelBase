@@ -5,8 +5,9 @@ in the planner with a closed form); the two sampling steps behave as documented,
 the middle and fine at the ends; every stroke the generator emits is legal on the segment
 it claims; the path keeps each stroke's two ends adjacent and counts its interrupts; the
 group selection prefers one long sweep over the poses it replaces; pruning only removes
-what the target allows; and the exporter refuses to re-sort a stroke plan, because that
-would silently split a sweep in two.
+what the target allows; the exporter refuses to re-sort a stroke plan, because that
+would silently split a sweep in two; and that the program it writes keeps its sweeps
+straight while the move between two sweeps is a joint reposition.
 
 Every fixture is synthetic: customer CAD must never be committed.
 """
@@ -23,12 +24,14 @@ from conftest import box, mesh_from_triangles, plate_triangles, write_station_fi
 from scanplan.config import load_config
 from scanplan.coverage import CoverageResult
 from scanplan.path import (
+    LEVEL_JOINT,
     LEVEL_ONE_CORNER,
     LEVEL_STRAIGHT,
+    LEVEL_TWO_CORNERS,
     ROLE_COVERAGE,
+    ROLE_JOINT,
     ROLE_REORIENT,
     ROLE_RETRACT,
-    ROLE_TRAVERSE,
     PathPoint,
     build_path,
     order_strokes,
@@ -38,6 +41,7 @@ from scanplan.path import (
 )
 from scanplan.pipeline import plan, write_outputs
 from scanplan.roboguide import adapt
+from scanplan.rolls import roll_for_axis
 from scanplan.scanner_model import ScannerModel, ScannerPose
 from scanplan.selection import select_groups
 from scanplan.strokes import (
@@ -176,45 +180,115 @@ def test_the_generator_does_not_offer_two_strokes_over_the_same_line():
     assert first in kept and same_line_shorter not in kept
 
 
-def test_a_pose_change_becomes_a_reorientation_and_a_translation_does_not(bench, cfg):
+def test_a_short_same_pose_move_is_straight_and_a_pose_change_is_a_joint_travel(bench, cfg):
+    """Rule: a joint move is inserted only where it buys something.
+
+    A short hop between two identical poses stays straight at every level - inserting a
+    joint move there would add a corner and change nothing else. A pose change is what the
+    joint route exists for, and it is reported as such.
+    """
     model = ScannerModel(cfg.scanner)
-    rolled_back = replace(cfg, stroke=replace(cfg.stroke, connector_level=2))
-    same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
-                 horizontal_stroke(-150.0, 150.0, y=80.0)]
-    path = build_path(same_pose, cfg=rolled_back, station=bench, model=model,
-                      start_near=np.zeros(3))
-    assert path.interrupts_a == 1 and path.interrupts_b == 0
-    roles = [point.role for point in path.points]
-    assert roles == [ROLE_COVERAGE, ROLE_COVERAGE, ROLE_RETRACT, ROLE_TRAVERSE,
-                     ROLE_COVERAGE, ROLE_COVERAGE]
-    # each stroke's two ends stay adjacent, which is what makes the sweep happen at all
-    ids = [point.stroke_id for point in path.points]
-    assert ids == [0, 0, 0, 1, 1, 1]
-
-    tilted = Stroke(start=np.array([0.0, 120.0, PLATE_TOP_MM + 300.0]),
-                    end=np.array([200.0, 120.0, PLATE_TOP_MM + 260.0]),
-                    axis=np.array([0.0, 0.4, -0.9165]))
-    mixed = build_path([horizontal_stroke(-150.0, 150.0), tilted], cfg=rolled_back,
-                       station=bench, model=model, start_near=np.zeros(3))
-    assert mixed.interrupts_b == 1
-    assert ROLE_REORIENT in [point.role for point in mixed.points]
-
-
-def test_the_default_connector_drops_the_reorient_corner(bench, cfg):
-    """L1: retract, then fly straight in, so a same-pose move costs one corner not two."""
-    model = ScannerModel(cfg.scanner)
-    assert cfg.stroke.connector_level == 1
+    assert cfg.stroke.connector_level == 2, "the joint route is the shipped default"
     same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
                  horizontal_stroke(-150.0, 150.0, y=80.0)]
     path = build_path(same_pose, cfg=cfg, station=bench, model=model,
                       start_near=np.zeros(3))
-    assert [point.role for point in path.points] == [
-        ROLE_COVERAGE, ROLE_COVERAGE, ROLE_RETRACT, ROLE_COVERAGE, ROLE_COVERAGE]
     assert path.interrupts_a == 1 and path.interrupts_b == 0
+    roles = [point.role for point in path.points]
+    assert roles == [ROLE_COVERAGE, ROLE_COVERAGE, ROLE_RETRACT, ROLE_COVERAGE,
+                     ROLE_COVERAGE]
     assert path.connector_levels == {LEVEL_ONE_CORNER: 1}
-    # every route keeps positive clearance, or the point of the level is lost
+    # each stroke's two ends stay adjacent, which is what makes the sweep happen at all
+    ids = [point.stroke_id for point in path.points]
+    assert ids == [0, 0, 0, 1, 1]
+
+    tilted = Stroke(start=np.array([0.0, 120.0, PLATE_TOP_MM + 300.0]),
+                    end=np.array([200.0, 120.0, PLATE_TOP_MM + 260.0]),
+                    axis=np.array([0.0, 0.4, -0.9165]))
+    mixed = build_path([horizontal_stroke(-150.0, 150.0), tilted], cfg=cfg,
+                       station=bench, model=model, start_near=np.zeros(3))
+    assert mixed.interrupts_b == 1
+    assert ROLE_JOINT in [point.role for point in mixed.points]
+    assert mixed.connector_levels == {LEVEL_JOINT: 1}
+
+
+def test_the_joint_route_puts_the_next_pose_on_the_joint_move(bench, cfg):
+    """The L/J/L shape, and why the pre-point carries the NEXT pose.
+
+    If the pre-point kept the previous pose, the whole turn would be left to the short
+    straight approach - which is exactly the long-straight-move-with-a-turn-inside-it the
+    joint route exists to avoid. The assertion is on the pose, not on the role: the role is
+    a label, the pose is what the machine flies.
+    """
+    model = ScannerModel(cfg.scanner)
+    far_apart = [horizontal_stroke(-600.0, -300.0), horizontal_stroke(300.0, 600.0)]
+    path = build_path(far_apart, cfg=cfg, station=bench, model=model,
+                      start_near=np.zeros(3))
+    assert [point.role for point in path.points] == [
+        ROLE_COVERAGE, ROLE_COVERAGE, ROLE_RETRACT, ROLE_JOINT, ROLE_COVERAGE,
+        ROLE_COVERAGE]
+    assert path.connector_levels == {LEVEL_JOINT: 1}
     assert path.min_clearance_mm > 0.0
-    assert path.violations == []
+
+    last, retract, pre_point, entry = path.points[1:5]
+    # the lift keeps the pose it lifted from ...
+    assert np.allclose(retract.axis, last.axis) and retract.roll_deg == last.roll_deg
+    assert np.allclose(retract.position - last.position, -last.axis
+                       * np.linalg.norm(retract.position - last.position))
+    # ... and the pre-point already holds the next sweep's pose, so the approach that
+    # follows is a straight dive along the next optical axis
+    assert np.allclose(pre_point.axis, entry.axis)
+    assert pre_point.roll_deg == entry.roll_deg
+    approach = entry.position - pre_point.position
+    assert np.allclose(approach, entry.axis * np.linalg.norm(approach))
+    assert cfg.stroke.retract_clearance_mm <= np.linalg.norm(approach)
+
+    # the threshold is the knob: raise it past the travel and the same move stays straight
+    stretched = replace(cfg, stroke=replace(cfg.stroke, joint_travel_min_mm=1000.0))
+    straight = build_path(far_apart, cfg=stretched, station=bench, model=model,
+                          start_near=np.zeros(3))
+    assert LEVEL_JOINT not in straight.connector_levels
+    assert straight.connector_levels == {LEVEL_ONE_CORNER: 1}
+
+
+def test_a_straight_only_site_never_gets_a_joint_move(bench, cfg):
+    """`connector_level=1` caps the joint route away, whatever the geometry asks for."""
+    model = ScannerModel(cfg.scanner)
+    straight_only = replace(cfg, stroke=replace(cfg.stroke, connector_level=1))
+    tilted = Stroke(start=np.array([0.0, 120.0, PLATE_TOP_MM + 300.0]),
+                    end=np.array([200.0, 120.0, PLATE_TOP_MM + 260.0]),
+                    axis=np.array([0.0, 0.4, -0.9165]))
+    path = build_path([horizontal_stroke(-150.0, 150.0), tilted], cfg=straight_only,
+                      station=bench, model=model, start_near=np.zeros(3))
+    assert path.interrupts_b == 1, "the pose still has to change, joint move or not"
+    assert ROLE_JOINT not in [point.role for point in path.points]
+    assert LEVEL_JOINT not in path.connector_levels
+
+
+def test_the_straight_fallback_splits_the_rotation_between_flight_and_dive(bench, cfg):
+    """When the fly-in cannot spread the turn fast enough, the straight site gets two corners.
+
+    `max_rot_deg_per_mm` is tightened past what any lift can satisfy, so the compressed
+    straight shape is refused and the transition falls back to retract + re-orient + dive -
+    still straight, with the rotation shared by both segments. The joint route is not a
+    candidate here because the level forbids it.
+    """
+    model = ScannerModel(cfg.scanner)
+    tight = replace(cfg, stroke=replace(cfg.stroke, connector_level=1,
+                                        max_rot_deg_per_mm=0.05))
+    tilted = Stroke(start=np.array([0.0, 120.0, PLATE_TOP_MM + 300.0]),
+                    end=np.array([200.0, 120.0, PLATE_TOP_MM + 260.0]),
+                    axis=np.array([0.0, 0.4, -0.9165]))
+    path = build_path([horizontal_stroke(-150.0, 150.0), tilted], cfg=tight,
+                      station=bench, model=model, start_near=np.zeros(3))
+    assert path.connector_levels == {LEVEL_TWO_CORNERS: 1}
+    assert [point.role for point in path.points][-4:] == [
+        ROLE_RETRACT, ROLE_REORIENT, ROLE_COVERAGE, ROLE_COVERAGE]
+    # the re-orient point keeps the pose it came from, which is what makes the dive carry
+    # the second half of the turn
+    reorient = path.points[-3]
+    assert np.allclose(reorient.axis, path.points[1].axis)
+    assert not np.allclose(reorient.axis, path.points[-1].axis)
 
 
 def test_connector_level_zero_needs_two_identical_poses_and_a_clear_line(bench, cfg):
@@ -286,10 +360,16 @@ def test_a_pure_roll_change_counts_as_a_rotation():
                        roll_deg=30.0, role=ROLE_COVERAGE, source="greedy")
     assert pose_gap_deg(straight.axis, straight.roll_deg, rolled.axis, rolled.roll_deg) \
         == pytest.approx(30.0, abs=1e-6)
-    # and it reduces to the axis angle when the roll is the same
+    # With the seed roll policy the frames follow their own axes, so a tilt costs the tilt.
+    # (Both checks below use the policy's roll: with the bare frame reference the same tilt
+    # crosses the helper axis and the delivered frame really does jump, which is the whole
+    # reason the policy exists - see tests/test_rolls.py.)
     tilted = PathPoint(position=np.zeros(3), axis=np.array([0.0, 0.4472, -0.8944]),
-                       roll_deg=0.0, role=ROLE_COVERAGE, source="greedy")
-    assert pose_gap_deg(straight.axis, 0.0, tilted.axis, 0.0) == pytest.approx(26.565, abs=1e-3)
+                       roll_deg=roll_for_axis(np.array([0.0, 0.4472, -0.8944])),
+                       role=ROLE_COVERAGE, source="greedy")
+    level = replace(straight, roll_deg=roll_for_axis(np.array([0.0, 0.0, -1.0])))
+    assert pose_gap_deg(level.axis, level.roll_deg, tilted.axis, tilted.roll_deg) \
+        == pytest.approx(26.565, abs=1e-3)
 
 
 def test_the_ordering_prices_a_pose_change_and_sorts_like_poses_together(bench, cfg):
@@ -417,6 +497,53 @@ def test_exporting_a_stroke_plan_refuses_to_re_sort(tmp_path):
     assert "CNT0" in text and "FINE" not in text
     assert contract["program"]["termination"] == "CNT0"
     assert contract["program"]["strokes"] == [0, 1]
+
+
+def test_a_stroke_plan_repositions_between_sweeps_with_a_joint_move(tmp_path):
+    """A sweep stays straight; the one joint travel between sweeps is the exception.
+
+    The `joint` role is the pre-point of the joint route: the head crossing between two
+    sweeps in mid air, carrying the next pose. It is the move emitted as a joint move, at
+    the percentage speed FANUC wants for one. The retract and the approach into the next
+    sweep keep the straight move: those are the segments the clearance check measured, and
+    a `traverse` or `reorient` point belongs to a straight-only route, so it stays `L`.
+    """
+    def point(index, position, role, stroke_id=0):
+        return {"id": index, "position": position, "axis": [0.0, 0.0, -1.0],
+                "roll_deg": 0.0, "stroke_id": stroke_id, "role": role}
+
+    points = [
+        point(0, [0.0, 0.0, 300.0], ROLE_COVERAGE),
+        point(1, [200.0, 0.0, 300.0], ROLE_COVERAGE),
+        point(2, [200.0, 0.0, 400.0], ROLE_RETRACT),
+        point(3, [20.0, 120.0, 400.0], ROLE_JOINT, stroke_id=1),
+        point(4, [20.0, 120.0, 300.0], ROLE_COVERAGE, stroke_id=1),
+        point(5, [220.0, 120.0, 300.0], ROLE_COVERAGE, stroke_id=1),
+    ]
+    contract = adapt.export(points, tmp_path, prog_name="SCAN_B", motion="L",
+                            speed="100 mm/sec", termination="CNT0", order=False)
+    text = (tmp_path / "SCAN_B.LS").read_text(encoding="ascii")
+    instructions = [line.split(":", 1)[1].strip().rstrip(";").strip()
+                    for line in text.splitlines() if ":L P[" in line or ":J P[" in line]
+    assert instructions == [
+        "L P[1] 100 mm/sec CNT0",
+        "L P[2] 100 mm/sec CNT0",
+        "L P[3] 100 mm/sec CNT0",   # the lift, straight
+        "J P[4] 100% CNT100",       # the joint travel, the only one in the program
+        "L P[5] 100 mm/sec CNT0",   # the approach into the sweep
+        "L P[6] 100 mm/sec CNT0",
+    ]
+    assert contract["program"]["motion"] == "L"
+    assert contract["program"]["travel_motion"] == "J"
+    assert contract["program"]["travel_speed"] == "100%"
+    assert contract["program"]["travel_termination"] == "CNT100"
+    assert any("joint travel move" in note for note in contract["not_modelled"])
+
+    straight = adapt.export(points, tmp_path / "straight", prog_name="SCAN_B", motion="L",
+                            speed="100 mm/sec", termination="CNT0", order=False,
+                            travel_motion="L")
+    assert straight["program"]["travel_motion"] == "L"
+    assert "J P[" not in (tmp_path / "straight" / "SCAN_B.LS").read_text(encoding="ascii")
 
 
 def test_the_shipped_configuration_delivers_strokes_and_says_so(clamped_plate):

@@ -8,9 +8,11 @@
     "Every switch that the point-count work turned on is turned back off here:",
     "  coverage_target_pct          null    greedy runs until nothing new is covered",
     "  cost_model                   millimetres   the upstream design's pricing",
-    "  connector_level              2       retract + re-orient point between sweeps",
+    "  connector_level              2       keep two inserted points per transition",
     "  order_axis_weight_mm_per_deg 0       order by distance alone",
     "  max_prune_rounds             8       the old round limit",
+    "roll_mode                    frame   the old explicit zero roll instead of the",
+    "                                     reference posture (tool x on station +X)",
     "",
     "Two differences cannot be switched off, and they are deliberate:",
     "  1. The selection score is gain / max(cost, eps) instead of gain / (cost + 1). The +1 was",
@@ -28,19 +30,19 @@
     "never wrote into the program. That is the accounting bug being fixed, not a regression, and it",
     "can only ever ADD points to the delivery.",
     "",
+    "Since 2026-10-26 that 405-point baseline still holds, because connector_level 2 still inserts",
+    "two points per transition - but the second one is now the pre-point of a JOINT travel (it",
+    "carries the next sweep's pose, so the wrist turns while the arm travels) instead of a",
+    "re-orient point that kept the previous pose. The old all-straight two-corner shape is no",
+    "longer selectable: connector_level 1 gives an all-straight program, at the cost of one",
+    "inserted point per transition where the fly-in can spread the rotation on its own. That is",
+    "why the two point counts of this profile and of the straight-only one are not the same number.",
+    "",
     "It also turns up 12 connector violations that the old program could not have shown, because",
     "those connections did not exist in it: 5 routes keep negative clearance, 7 cannot spread a",
     "90-136 deg flip over the largest lift within max_rot_deg_per_mm. That is why scenario 'deliver",
     "every chosen item' and scenario 'price the choice in corners and order it by pose' are not",
-    "alternatives: the second is what makes the first survive a clearance check.",
-    "",
-    "`lock_roll: false` belongs to the same list. Fixing the roll at seed time from the axis",
-    "changes which samples a constant-pose sweep can reach (the footprint is 600 x 500, not a",
-    "disc), so it cannot be part of a faithful v1 reproduction - even though it is the right",
-    "behaviour for the shipped profile.",
-    "`pool_mode: grid` is on that list too: the shipped profile now also lays rail lines and a",
-    "tilted side-scan family, and this profile has to use the aim grid alone to stay comparable",
-    "with the 405-point baseline it was measured against."
+    "alternatives: the second is what makes the first survive a clearance check."
   ],
   "target": {
     "coverage_target_pct": null,
@@ -52,10 +54,6 @@
     "connector_level": 2,
     "order_axis_weight_mm_per_deg": 0.0,
     "max_prune_rounds": 8,
-    "lock_roll": false,
-    "scan_gate": false,
-    "hard_gate": false,
-    "pool_mode": "grid",
-    "side_scan_tilt_deg": 0.0
+    "roll_mode": "frame"
   }
 }

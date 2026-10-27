@@ -187,20 +187,10 @@ def test_leak_reasons_name_the_blocking_mesh(clamped_plate, model_placeholder, c
     assert reasons[0] == "blocked_by_fixture"
 
 
-def test_a_point_facing_away_from_every_pose_is_reported_as_not_facing(clamped_plate,
-                                                                     model_placeholder, cfg):
-    """`not_facing` is the specific answer: no line in the ladder sees the back."""
+def test_a_point_facing_away_from_every_pose_is_never_in_view(clamped_plate,
+                                                              model_placeholder, cfg):
     samples = upside_down_samples(120.0)
     reasons = attribute_uncovered(samples.points, samples.normals, ladder_poses(),
-                                 clamped_plate.station, model_placeholder, cfg)
-    assert set(reasons) == {"not_facing"}
-
-
-def test_an_empty_pool_leaves_every_point_never_in_view(clamped_plate,
-                                                        model_placeholder, cfg):
-    """With nothing to test against, no cause can be claimed - not even "it faces away"."""
-    samples = upside_down_samples(60.0)
-    reasons = attribute_uncovered(samples.points, samples.normals, [],
                                  clamped_plate.station, model_placeholder, cfg)
     assert set(reasons) == {"never_in_view"}
 
@@ -263,7 +253,7 @@ def test_the_counters_record_what_was_rejected(clamped_plate, model_placeholder,
     result = evaluate(ladder_poses(), head_on_samples(60.0), clamped_plate.station,
                       model_placeholder, cfg)
     assert set(result.counters) == {"rejected_clearance", "rejected_tracker",
-                                    "rejected_kinematics", "rejected_no_points", "rays"}
+                                    "rejected_joint_limit", "rejected_no_points", "rays"}
     assert result.counters["rays"] > 0
     assert result.counters["rejected_clearance"] == 0
 

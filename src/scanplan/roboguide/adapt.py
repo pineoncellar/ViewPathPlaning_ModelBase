@@ -83,14 +83,9 @@ def viewpoints_to_points(viewpoints) -> list[dict]:
                 "wpr_deg": wpr.rot_to_fanuc_wpr(rotation),
                 "stroke_id": _field(item, "stroke_id", None),
                 "role": _field(item, "role", "coverage"),
-                # Per-point joint evidence, when the kinematic gate ran. `config` is written
-                # into the P[n] block; `joints_deg` is what a joint-representation point
-                # needs, and is None otherwise.
-                "config": _field(item, "config", None),
-                "joints_deg": _field(item, "joints_deg", None),
             }
         )
-    return wpr.unwrap_wpr(points)
+    return points
 
 
 def apply_placement(
@@ -214,6 +209,9 @@ def _contract_blocks(
     place,
     motion: str,
     speed: str,
+    travel_motion: str,
+    travel_speed: str,
+    travel_termination: str,
     config: str,
     roundtrip: float,
     ordering: dict,
@@ -292,6 +290,16 @@ def _contract_blocks(
             "prog_name": prog_name,
             "motion": motion.upper(),
             "speed": speed,
+            "travel_motion": travel_motion.upper(),
+            "travel_speed": travel_speed,
+            "travel_termination": str(travel_termination).upper(),
+            "travel_note": (
+                "the pre-point of a joint travel (role `joint`, the point that carries the "
+                "next sweep's pose in mid air between two sweeps) is a reposition, not a "
+                "scan: it is the one move emitted as a joint move, at a percentage speed, "
+                "while every other move keeps the straight motion/speed above. The joint "
+                "travel settings are read only for a straight (L) program"
+            ),
             "config_string": config,
             "config_note": (
                 "the CONFIG string hints which posture solution to take; if ROBOGUIDE "
@@ -311,6 +319,13 @@ def _contract_blocks(
             "Corner rounding at CNT > 0 is not modelled: the scan geometry assumes the "
             "TCP follows the straight segments, and a rounded corner sweeps less on its "
             "convex side than the line it replaces.",
+            "A joint travel move does not follow the straight segment the clearance "
+            "check measured: the head is repositioned between two sweeps with a joint "
+            "move, whose TCP path is the controller's, so the reported body clearance "
+            "holds for the straight moves (the sweeps, the retracts and the dives) and "
+            "not for a curved reposition. Confirm the travel moves in ROBOGUIDE before "
+            "letting the cell run them, or re-export with the travel motion set to L to "
+            "keep every move on the straight line.",
         ],
         "extents_mm": extents,
     }
@@ -327,8 +342,10 @@ def export(
     motion="J",
     speed="100%",
     termination="FINE",
+    travel_motion="J",
+    travel_speed="100%",
+    travel_termination="CNT100",
     config="N U T, 0, 0, 0",
-    joint_blocks: bool = False,
     order=True,
 ) -> dict:
     """Write `<NAME>.LS`, `<NAME>_points.csv`, `<NAME>_frame.json` and return the contract.
@@ -342,6 +359,10 @@ def export(
     for - the kind of error that survives every visual check. Passing `stroke_id`
     through therefore forces the delivered order, and asking for a re-sort is an error
     rather than a silent re-sort.
+
+    `travel_motion`/`travel_speed`/`travel_termination` decide how the repositions of an
+    `L` program are emitted: see `ls.build_ls`. They are carried into the contract so the
+    workshop can see which moves are joint moves without reading the program.
     """
     name = wpr.normalise_prog_name(prog_name)
     points = viewpoints_to_points(viewpoints)
@@ -357,7 +378,6 @@ def export(
     if place:
         rotation_place, translation_place = parse_pose(place)
         points = apply_placement(points, rotation_place, translation_place)
-    points = wpr.unwrap_wpr(points)
     if uframe is None:
         uframe = 0 if place else 1
 
@@ -393,9 +413,11 @@ def export(
         motion=motion,
         speed=speed,
         termination=termination,
+        travel_motion=travel_motion,
+        travel_speed=travel_speed,
+        travel_termination=travel_termination,
         config=config,
         comment=_COMMENT,
-        joint_blocks=joint_blocks,
     )
     ls_path = out_dir / f"{name}.LS"
     csv_path = out_dir / f"{name}_points.csv"
@@ -416,6 +438,9 @@ def export(
         place=place,
         motion=motion,
         speed=speed,
+        travel_motion=travel_motion,
+        travel_speed=travel_speed,
+        travel_termination=travel_termination,
         config=config,
         roundtrip=roundtrip,
         ordering=ordering,

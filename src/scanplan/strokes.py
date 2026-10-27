@@ -44,6 +44,8 @@ from scipy.sparse import csr_matrix
 from .config import PlannerConfig
 from .coverage import CoverageResult
 from .geometry import tangents, unit
+from .raycast import nearest_across
+from .robot import RobotArm
 from .rolls import roll_for_axis
 from .scanner_model import ScannerModel, ScannerPose, measure_mask
 from .scene import Station
@@ -232,9 +234,10 @@ class StrokeCoverage:
         return float(100.0 * self.area_mm2[self.pool_reach()].sum() / self.target_area_mm2)
 
 
-_COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_kinematics",
+_COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_joint_limit",
                  "rejected_no_points", "rejected_short", "rejected_flat", "rays",
-                 "stroke_positions")
+                 "stroke_positions", "grow_rays", "broken_on_range", "broken_on_incidence",
+                 "broken_on_clearance", "broken_on_tracker", "broken_on_joint_limit")
 
 
 def merge_counts(first: dict[str, int], second: dict[str, int],
@@ -276,22 +279,25 @@ class StrokeBuilder:
                  cfg: PlannerConfig, *,
                  visible: Callable[[np.ndarray], np.ndarray] | None = None,
                  obstacles: dict | None = None,
-                 gate=None):
+                 robot: RobotArm | None = None):
         self.samples = samples
         self.station = station
         self.model = model
         self.cfg = cfg
         self.visible = visible
-        self.gate = gate
+        self.robot = robot
         self._obstacles = obstacles
         self.points = np.asarray(samples.points, dtype=float).reshape(-1, 3)
         self.normals = np.asarray(samples.normals, dtype=float).reshape(-1, 3)
         self.area = np.asarray(samples.area_mm2, dtype=float)
         self.params = cfg.stroke
-        # Built on first use: a plan without the scan gate never pays for it, and the
-        # radius is exactly the scanner's far range, so a ball query is a superset of
-        # everything `geometry_mask` could accept.
-        self._tree = None
+        # Why growth stopped, per reason: a band that ends because the surface ran out of
+        # measuring range is a different fact from one that ends because the head would hit
+        # the fixture, and the report has to be able to tell them apart. `joint_limit` is
+        # the same idea one level harder: the band ended because the arm ran out of travel.
+        self.broken = dict.fromkeys(("range", "incidence", "clearance", "tracker",
+                                     "joint_limit"), 0)
+        self.grow_rays = 0
 
     @property
     def obstacles(self) -> dict:
@@ -321,7 +327,12 @@ class StrokeBuilder:
         return bool(np.all(self.visible(np.asarray(positions, dtype=float).reshape(-1, 3))))
 
     def segment_ok(self, start, end) -> tuple[bool, float]:
-        """Legality of one short move: clearance and tracker at every check step."""
+        """Legality of one short move: clearance and tracker at every check step.
+
+        This is the TRANSITION criterion - the module docstring of `path` says why: a
+        transition is not a scan, so what matters is that the head fits, not what it can
+        see. Growth uses `measuring_window` on top of it.
+        """
         start = np.asarray(start, dtype=float).reshape(3)
         end = np.asarray(end, dtype=float).reshape(3)
         length = float(np.linalg.norm(end - start))
@@ -333,78 +344,40 @@ class StrokeBuilder:
             return False, margin
         return self.tracker_sees(positions), margin
 
-    def scan_segment_ok(self, start, end, axis, roll_deg: float) -> tuple[bool, float]:
-        """Legality of one short move *as a scan*, not merely as a move.
+    def measuring_window(self, axis, roll_deg: float, position) -> tuple[bool, str]:
+        """Can the head MEASURE from this position at all?
 
-        `segment_ok` answers "does the head fit and stay tracked", which is the right
-        question for a transition: a transition is not a scan and promises no coverage.
-        A growth step is a scan, so it must also answer "is there still anything to scan
-        from here" - at every check step, not only at the coarse coverage steps. The
-        difference is not cosmetic: the old code measured coverage every
-        `coverage_step_mm` (100) but advanced in `extend_step_mm` (25) steps, so a stroke
-        could grow up to one coverage step past the point where the footprint still held a
-        sample in range, and the report counted the whole thing.
+        Growth is a scan, not a transition, so a growth step has to answer the conditions
+        a scan answers. `segment_ok` only covers clearance and the tracker; the measuring
+        range and the incidence limit were left to the coverage mask, which evaluates them
+        per target sample. That is enough to stop a band for the wrong recorded reason, but
+        not to keep it legal: the mask says "this pose covers nothing here", which the gain
+        rule then reads as "not worth another step", while the truth is "out of range".
 
-        The test is `geometry_mask` - footprint, range and incidence, all ray-free - so this
-        costs a ball query and a handful of dot products per position.
+        So the gate here is the head's own window: one ray along the optical axis, and the
+        first hit must be inside `scanner.range_mm` and inside `max_incidence_deg`. A ray
+        that misses the part entirely is NOT a failure - the footprint can still cover
+        samples beside the head, and a miss is not evidence of anything.
+
+        Returns `(ok, reason)` with `reason` empty when the window is fine.
         """
-        start = np.asarray(start, dtype=float).reshape(3)
-        end = np.asarray(end, dtype=float).reshape(3)
-        length = float(np.linalg.norm(end - start))
-        count = max(1, int(np.ceil(length / self.params.check_step_mm)))
-        fractions = np.linspace(0.0, 1.0, count + 1)[:, None]
-        positions = start[None, :] * (1.0 - fractions) + end[None, :] * fractions
-        fits, margin = self.fits_at(positions)
-        if not fits:
-            return False, margin
-        if not self.tracker_sees(positions):
-            return False, margin
-        if not self.gate_ok(positions, axis, roll_deg):
-            return False, margin
-        if not self._reaches_any(positions, axis, roll_deg):
-            return False, margin
-        return True, margin
-
-    def gate_ok(self, positions, axis, roll_deg: float) -> bool:
-        """Whether the arm can hold every one of these poses.
-
-        Checked at the same check steps as clearance, and for the same reason: the gate
-        belongs to the legality of the sweep, not to its accounting. A stroke that leaves
-        the joint envelope halfway along is not a stroke that covers less - it is a stroke
-        the controller refuses to run.
-        """
-        if self.gate is None or not self.gate.active:
-            return True
-        for position in np.asarray(positions, dtype=float).reshape(-1, 3):
-            if not self.gate.check(position, axis, roll_deg).ok:
-                return False
-        return True
-
-    def _reaches_any(self, positions, axis, roll_deg: float) -> bool:
-        """Whether every position still sees at least one sample within the envelope."""
-        for position in np.asarray(positions, dtype=float).reshape(-1, 3):
-            pose = ScannerPose(position=position,
-                               axis=unit(np.asarray(axis, dtype=float).reshape(3)),
-                               roll_deg=float(roll_deg))
-            near = self._neighbourhood(position)
-            if len(near) == 0:
-                return False
-            if not self.model.geometry_mask(pose, self.points[near],
-                                            self.normals[near]).any():
-                return False
-        return True
-
-    def _neighbourhood(self, position) -> np.ndarray:
-        """Indices of the samples close enough to be inside the scanner's range."""
-        if self._tree is None:
-            from scipy.spatial import cKDTree
-
-            self._tree = cKDTree(self.points) if len(self.points) else None
-        if self._tree is None:
-            return np.zeros(0, dtype=np.int64)
-        found = self._tree.query_ball_point(np.asarray(position, dtype=float).reshape(3),
-                                            float(self.cfg.scanner.range_mm[1]) + 1e-6)
-        return np.asarray(found, dtype=np.int64)
+        origins = np.asarray(position, dtype=float).reshape(1, 3)
+        direction = unit(np.asarray(axis, dtype=float))
+        distance, names, triangles = nearest_across(self.obstacles, origins,
+                                                    direction.reshape(1, 3))
+        self.grow_rays += 1
+        hit = float(distance[0])
+        if not np.isfinite(hit):
+            return True, ""
+        low, high = self.model.params.range_mm
+        if not low <= hit <= high:
+            return False, "range"
+        mesh = self.obstacles[str(names[0])].mesh
+        normal = np.asarray(mesh.face_normals[int(triangles[0])], dtype=float).reshape(1, 3)
+        cosine = float(self.model.incidence_cos(direction.reshape(1, 3), normal)[0])
+        if cosine < self.model.cos_incidence_limit:
+            return False, "incidence"
+        return True, ""
 
     # -- generation ---------------------------------------------------------
 
@@ -429,110 +402,23 @@ class StrokeBuilder:
             normal = unit(normals[index])
             position = points[index] + normal * distance
             axis = -normal
-            # Roll decided here, from the axis alone, before any coverage is measured.
-            # Doing it later would invalidate the measurement it is supposed to improve.
-            roll = roll_for_axis(axis) if self.params.lock_roll else 0.0
-            chosen.append((ScannerPose(position=position, axis=axis, roll_deg=roll),
+            chosen.append((ScannerPose(position=position, axis=axis,
+                                       roll_deg=self.roll_for(axis)),
                            int(index) + int(seed_offset)))
         return chosen
 
-    def rail_seeds(self, points, normals, *, spacing_mm: float,
-                   seed_offset: int = 0) -> list[tuple[ScannerPose, int]]:
-        """Seeds laid on the part's own rail lines rather than on a square aim grid.
+    def roll_for(self, axis) -> float:
+        """The roll of a seed, decided here and never re-picked for a coverage point.
 
-        This is the placement rule the raster implementation got right, borrowed without its
-        code: take the LONGEST principal axis of the face as the line direction, lay parallel
-        lines across it, and grow strokes along them. Three things follow, and all three are
-        about the delivered program rather than the numbers: the lines run along the long
-        side so there are fewer of them, the tool's local x ends up near the station +X so the
-        exported R stays near zero, and the bands are parallel, which is the only shape a
-        snake order can walk without a turn per band.
-
-        The spacing rule is the one that matters in practice: both ends are pulled in by a
-        tenth of a step, and a face narrower than one step gets a single line down its
-        middle rather than zero lines and no sweep at all.
+        The roll turns the field-of-view rectangle, so it is part of what the stroke
+        covers: choosing it after the coverage evaluation would make the reported figure
+        describe a sweep the program does not fly. `reference` is the qianduan2 rule that
+        keeps tool x on station +X and the exported R near zero; `frame` is the old
+        explicit zero, kept so a preset can still reproduce itself.
         """
-        points = np.asarray(points, dtype=float).reshape(-1, 3)
-        normals = np.asarray(normals, dtype=float).reshape(-1, 3)
-        if len(points) < 4 or float(spacing_mm) <= 0.0:
-            return []
-        middle_normal = unit(normals.mean(axis=0))
-        first, second = tangents(middle_normal)
-        centre = points.mean(axis=0)
-        flat = points - centre
-        across_first = flat @ first
-        across_second = flat @ second
-        spread = np.cov(np.stack([across_first, across_second]))
-        values, vectors = np.linalg.eigh(spread)
-        longest = vectors[:, int(np.argmax(values))]
-        along = unit(first * float(longest[0]) + second * float(longest[1]))
-        across = unit(np.cross(middle_normal, along))
-
-        u = points @ along
-        v = points @ across
-        low, high = float(v.min()), float(v.max())
-        step = float(spacing_mm)
-        if high - low <= step:
-            lines = np.array([0.5 * (low + high)])
-        else:
-            margin = 0.1 * step
-            inner_low, inner_high = low + margin, high - margin
-            count = max(1, int(np.floor((inner_high - inner_low) / step)) + 1)
-            lines = np.linspace(inner_low, inner_high, count)
-        middle_u = float(np.mean(u))
-        chosen: list[tuple[ScannerPose, int]] = []
-        for line in lines:
-            # the sample closest to this line, biased towards its middle along the line
-            score = np.abs(v - line) + 1e-3 * np.abs(u - middle_u)
-            index = int(np.argmin(score))
-            normal = unit(normals[index])
-            axis = -normal
-            roll = roll_for_axis(axis) if self.params.lock_roll else 0.0
-            chosen.append((ScannerPose(position=points[index] + normal
-                                       * float(self.cfg.scanner.standoff_mm),
-                                       axis=axis, roll_deg=roll),
-                           int(index) + int(seed_offset)))
-        return chosen
-
-    def side_scan_seeds(self, points, normals, *, aim_grid_mm: float,
-                        seed_offset: int = 0) -> list[tuple[ScannerPose, int]]:
-        """Seeds whose optical axis is tilted off the normal, for walls and deep pockets.
-
-        A head-on sweep cannot reach a standing wall: the footprint is parallel to it and the
-        incidence climbs past the limit within a few millimetres. Tilting the axis puts the
-        footprint across the wall instead. Two tilt directions are laid, towards each tangent,
-        because which one is free depends on the neighbouring geometry.
-
-        The shading caveat is real and is why this family is switchable: a tilted sweep sees
-        the surface at the incidence the limit allows, so its data is worse than a head-on
-        sweep of the same area. It is there to cover what nothing else can, not to compete.
-        """
-        tilt = float(self.params.side_scan_tilt_deg)
-        if tilt <= 0.0:
-            return []
-        from .candidates import aim_indices
-        from .geometry import tilt_axis
-
-        points = np.asarray(points, dtype=float).reshape(-1, 3)
-        normals = np.asarray(normals, dtype=float).reshape(-1, 3)
-        if len(points) == 0:
-            return []
-        chosen: list[tuple[ScannerPose, int]] = []
-        # Twice the aim spacing: the family exists to reach what the head-on ladder cannot,
-        # not to compete with it on area it already covers, and every seed costs a grown
-        # stroke and a set of rays. At the aim spacing this tripled the stroke stage for a
-        # fraction of a percent.
-        for index in aim_indices(points, float(aim_grid_mm) * 2.0):
-            normal = unit(normals[index])
-            first, _second = tangents(normal)
-            for sign in (1.0, -1.0):
-                axis = -tilt_axis(-normal, first * sign, tilt)
-                roll = roll_for_axis(axis) if self.params.lock_roll else 0.0
-                chosen.append((ScannerPose(position=points[index] + normal
-                                           * float(self.cfg.scanner.standoff_mm),
-                                           axis=axis, roll_deg=roll),
-                               int(index) + int(seed_offset)))
-        return chosen
+        if self.params.roll_mode == "reference":
+            return roll_for_axis(axis)
+        return 0.0
 
     def grow(self, seed: ScannerPose, seed_index: int) -> list[Stroke]:
         """Grow one seed into strokes: one per tangent line, each extended both ways.
@@ -579,14 +465,26 @@ class StrokeBuilder:
         facing it rather than at an arbitrary length. Legality is checked every
         `extend_step_mm`, coverage every `coverage_step_mm`: that is the whole point of
         having two steps, and it is what keeps the growth inside the runtime budget.
+
+        Legality here is the SCAN criterion, not the transition one: clearance and tracker
+        (`segment_ok`) plus the head's own measuring window - range and incidence - which
+        is what stops a band from growing into a region it can no longer measure. A band
+        that stops for one of those reasons is counted under its own name, because "the
+        surface curves away" and "the head would hit the fixture" ask for different fixes.
         """
         params = self.params
         step = float(params.extend_step_mm)
         origin = np.asarray(seed.position, dtype=float)
         low = origin.copy()
         high = origin.copy()
+        # A stroke is one continuous move, so the two growth halves have to share the
+        # configuration the arm is in as it crosses the seed. Solving it once and threading
+        # it outwards is what makes the two halves one flyable path instead of two paths
+        # that happen to meet in the middle on different elbows.
+        joints = self._seed_joints(seed)
         for sign in (1.0, -1.0):
             current = origin.copy()
+            side_joints = joints
             bearing = float(params.coverage_step_mm)
             while True:
                 trial = current + sign * step * np.asarray(direction, dtype=float)
@@ -595,13 +493,19 @@ class StrokeBuilder:
                         else float(np.linalg.norm(high - trial)))
                 if span > params.max_stroke_mm + _EPS:
                     break
-                if params.scan_gate:
-                    legal, _margin = self.scan_segment_ok(current, trial, seed.axis,
-                                                          seed.roll_deg)
-                else:
-                    legal, _margin = self.segment_ok(current, trial)
+                legal, _margin = self.segment_ok(current, trial)
                 if not legal:
+                    self.broken["clearance" if _margin <= 0.0 else "tracker"] += 1
                     break
+                measurable, reason = self.measuring_window(seed.axis, seed.roll_deg, trial)
+                if not measurable:
+                    self.broken[reason] += 1
+                    break
+                if self.robot is not None:
+                    side_joints = self._joint_step(seed, trial, side_joints)
+                    if side_joints is None:
+                        self.broken["joint_limit"] += 1
+                        break
                 bearing += step
                 if bearing + _EPS >= params.coverage_step_mm:
                     pose = ScannerPose(position=trial,
@@ -620,36 +524,29 @@ class StrokeBuilder:
                 low = current
         return low, high, covered
 
+    def _seed_joints(self, seed: ScannerPose):
+        """The configuration at the seed, or None when the arm cannot reach it at all."""
+        if self.robot is None:
+            return None
+        reach = self.robot.solve(seed.frame, seed.position)
+        return None if reach is None else reach.joints_deg
+
+    def _joint_step(self, seed: ScannerPose, position, reference):
+        """The configuration at `position` continuing `reference`, or None when there is
+        none inside the arm's window. Called only when an arm is configured."""
+        reach = self.robot.solve(seed.frame, np.asarray(position, dtype=float), reference)
+        return None if reach is None else reach.joints_deg
+
     def generate(self, points, normals, *, aim_grid_mm: float,
                  seed_offset: int = 0,
-                 progress: Callable[[int, int], None] | None = None,
                  log: Callable[[str], None] | None = None) -> list[Stroke]:
-        """Seeds -> grown strokes -> de-duplicated, in that order.
-
-        The pool is the union of three seed families: the aim-grid ladder, the rail lines and
-        the tilted side-scan family. They are grown by the same rule and evaluated by the same
-        pass, which is what keeps "the pool got better" from meaning "there is a second
-        algorithm in here".
-        """
+        """Seeds -> grown strokes -> de-duplicated, in that order."""
         say = log or (lambda _message: None)
-        if self.params.pool_mode == "rails":
-            seeds = self.rail_seeds(points, normals, spacing_mm=aim_grid_mm,
-                                    seed_offset=seed_offset)
-        elif self.params.pool_mode == "grid":
-            seeds = self.seeds(points, normals, aim_grid_mm=aim_grid_mm,
-                               seed_offset=seed_offset)
-        else:
-            seeds = self.seeds(points, normals, aim_grid_mm=aim_grid_mm,
-                               seed_offset=seed_offset)
-            seeds.extend(self.rail_seeds(points, normals, spacing_mm=aim_grid_mm,
-                                         seed_offset=seed_offset))
-            seeds.extend(self.side_scan_seeds(points, normals, aim_grid_mm=aim_grid_mm,
-                                              seed_offset=seed_offset))
+        seeds = self.seeds(points, normals, aim_grid_mm=aim_grid_mm,
+                           seed_offset=seed_offset)
         grown: list[Stroke] = []
-        for done, (seed, index) in enumerate(seeds):
+        for seed, index in seeds:
             grown.extend(self.grow(seed, index))
-            if progress is not None:
-                progress(done + 1, len(seeds))
         unique = dedupe(grown, self.params.dedupe_mm)
         say(f"  stroke generation: {len(seeds)} seeds -> {len(grown)} grown -> "
             f"{len(unique)} kept (<= {self.params.max_stroke_mm:g} mm each)")
@@ -658,7 +555,6 @@ class StrokeBuilder:
     # -- evaluation ---------------------------------------------------------
 
     def evaluate(self, strokes: Sequence[Stroke], *,
-                 progress: Callable[[int, int], None] | None = None,
                  log: Callable[[str], None] | None = None) -> StrokeCoverage:
         """Coverage of every stroke, dropping the ones that cannot physically be flown."""
         say = log or (lambda _message: None)
@@ -670,9 +566,7 @@ class StrokeBuilder:
         kept: list[Stroke] = []
         smallest_margin = np.inf
 
-        for done, stroke in enumerate(strokes):
-            if progress is not None:
-                progress(done + 1, len(strokes))
+        for stroke in strokes:
             check = stroke.check_positions_mm(params.check_step_mm)
             fits, margin = self.fits_at(check)
             smallest_margin = min(smallest_margin, margin)
@@ -681,9 +575,6 @@ class StrokeBuilder:
                 continue
             if not self.tracker_sees(check):
                 counters["rejected_tracker"] += 1
-                continue
-            if not self.gate_ok(check, stroke.axis, stroke.roll_deg):
-                counters["rejected_kinematics"] += 1
                 continue
             positions = stroke.positions_mm(params.coverage_step_mm,
                                             params.check_step_mm)
@@ -714,6 +605,8 @@ class StrokeBuilder:
             quality.append(best[index])
             tracker_ok.append(True)
 
+        counters.update({f"broken_on_{key}": int(value) for key, value in self.broken.items()})
+        counters["grow_rays"] = int(self.grow_rays)
         say(f"  evaluated {len(strokes)} strokes: "
             f"{ {key: counters[key] for key in _COUNTER_KEYS} }")
         return StrokeCoverage(
