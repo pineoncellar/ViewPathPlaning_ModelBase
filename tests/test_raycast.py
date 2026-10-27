@@ -81,6 +81,23 @@ def test_mismatched_input_lengths_are_refused(flat_plate):
         RayCaster(flat_plate).nearest(np.zeros((2, 3)), np.zeros((3, 3)))
 
 
+def test_a_degenerate_ray_is_a_miss_and_does_not_lose_its_neighbours(flat_plate):
+    # A degenerate triangle normal arrives as a zero-length direction, and the pure-Python
+    # backend turns that into NaN bounds that rtree refuses for the WHOLE batch. One bad
+    # sample in a part must not cost the run, so it is a miss and the rest still answer -
+    # including the rays in later chunks, which is why the offsets are row numbers.
+    origins = np.array([[5.0, 5.0, 10.0]] * 4)
+    directions = np.array([[0.0, 0.0, -1.0], [0.0, 0.0, 0.0],
+                           [np.nan, 0.0, 0.0], [0.0, 0.0, -1.0]])
+    distance, triangle = RayCaster(flat_plate, chunk=2).nearest(origins, directions)
+    assert float(distance[0]) == pytest.approx(10.0 - 0.7, abs=1e-6)
+    assert triangle[0] >= 0
+    assert np.isinf(distance[1]) and triangle[1] == -1
+    assert np.isinf(distance[2]) and triangle[2] == -1
+    assert float(distance[3]) == pytest.approx(10.0 - 0.7, abs=1e-6)
+    assert triangle[3] >= 0
+
+
 def test_the_backend_is_named_and_is_one_of_the_two_documented_ones():
     assert backend_name() in {"embree", "trimesh-python"}
     assert isinstance(EMBREE_AVAILABLE, bool)

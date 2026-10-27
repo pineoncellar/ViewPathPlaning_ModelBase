@@ -28,6 +28,22 @@ from collections.abc import Mapping
 import numpy as np
 
 DEFAULT_CHUNK = 250_000
+# The pure-Python backend materialises every candidate (ray, triangle) pair of a chunk
+# before it narrows them down, and a ray that grazes the surface can have hundreds of
+# candidates: 110k raster rays against a 110k-triangle shell asked for a 2.5 GB array.
+# The accelerated backend has no such step, so its chunk stays large.
+FALLBACK_CHUNK = 2_000
+
+
+def _batch_failure(error: BaseException) -> bool:
+    """Whether an intersector error is about the batch, not about the mesh or the code.
+
+    `rtree` refuses a bounding box whose mins exceed its maxes - which a pathological ray
+    can produce - and the pure-Python backend allocates candidates for the whole chunk.
+    Both shrink with the chunk, so they are retried rather than raised. Matched by name so
+    `rtree` does not become an import this module needs.
+    """
+    return isinstance(error, MemoryError) or type(error).__name__ == "RTreeError"
 
 
 def _fallback_intersector_class():
@@ -106,13 +122,25 @@ def _as_rays(origins, directions) -> tuple[np.ndarray, np.ndarray]:
 class RayCaster:
     """Nearest-hit queries against one mesh, in chunks so memory stays bounded."""
 
-    def __init__(self, mesh, chunk: int = DEFAULT_CHUNK):
+    def __init__(self, mesh, chunk: int | None = None):
         self.mesh = mesh
-        self.chunk = max(1, int(chunk))
+        self.chunk = max(1, int(chunk if chunk is not None else (
+            DEFAULT_CHUNK if EMBREE_AVAILABLE else FALLBACK_CHUNK)))
         self._intersector = _INTERSECTOR_CLASS(mesh)
 
     def nearest(self, origins, directions) -> tuple[np.ndarray, np.ndarray]:
-        """Distance and triangle index of the first hit, `inf`/`-1` where a ray misses."""
+        """Distance and triangle index of the first hit, `inf`/`-1` where a ray misses.
+
+        A ray with a non-finite origin or direction, or a direction of zero length, is a
+        miss rather than an error: the backends disagree about those (embree ignores them,
+        the pure-Python one hands NaN bounds to rtree and dies), and a degenerate triangle
+        normal on a real STL is not a reason to lose a whole run. Such rays never reach the
+        intersector, so the chunk offsets become the row numbers of the rays that were cast.
+
+        A batch the backend cannot box or hold is retried at half the size, and a single ray
+        that still fails is a miss; that keeps one grazing ray on a dense shell from taking
+        the whole batch with it.
+        """
         origins, directions = _as_rays(origins, directions)
         count = len(origins)
         distance = np.full(count, np.inf)
@@ -120,18 +148,34 @@ class RayCaster:
         if count == 0:
             return distance, triangle
 
-        for start in range(0, count, self.chunk):
-            stop = min(start + self.chunk, count)
-            index_tri, index_ray, locations = self._intersector.intersects_id(
-                origins[start:stop], directions[start:stop],
-                multiple_hits=False, return_locations=True,
-            )
+        usable = np.flatnonzero(
+            np.isfinite(origins).all(axis=1)
+            & np.isfinite(directions).all(axis=1)
+            & (np.linalg.norm(directions, axis=1) > 0.0))
+        chunk = self.chunk
+        start = 0
+        while start < len(usable):
+            rows = usable[start:start + chunk]
+            try:
+                index_tri, index_ray, locations = self._intersector.intersects_id(
+                    origins[rows], directions[rows],
+                    multiple_hits=False, return_locations=True,
+                )
+            except Exception as error:
+                if not _batch_failure(error):
+                    raise
+                if len(rows) == 1:
+                    start += 1
+                    continue
+                chunk = max(1, len(rows) // 2)
+                continue
+            start += len(rows)
             if len(index_ray) == 0:
                 continue
             hits = np.asarray(locations, dtype=float).reshape(-1, 3)
-            rows = start + np.asarray(index_ray, dtype=np.int64)
-            distance[rows] = np.linalg.norm(hits - origins[rows], axis=1)
-            triangle[rows] = np.asarray(index_tri, dtype=np.int64)
+            hit_rows = rows[np.asarray(index_ray, dtype=np.int64)]
+            distance[hit_rows] = np.linalg.norm(hits - origins[hit_rows], axis=1)
+            triangle[hit_rows] = np.asarray(index_tri, dtype=np.int64)
         return distance, triangle
 
 
