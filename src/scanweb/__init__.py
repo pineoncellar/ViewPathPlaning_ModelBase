@@ -31,7 +31,13 @@ from urllib.parse import parse_qs, urlsplit
 import numpy as np
 import trimesh
 
-from scanplan.config import load_config, override
+from scanplan.config import (
+    FAST_MIN_SAMPLE_GRID_MM,
+    FAST_SAMPLE_GRID_MM,
+    fast_preset,
+    load_config,
+    override,
+)
 from scanplan.pipeline import plan, write_outputs
 from scanplan.registration import RigidRegistration, fit_points
 from scanplan.report import (
@@ -269,6 +275,18 @@ def _write_planning_report(path: Path, *, run_id: str, prog_name: str,
     face_text = ", ".join(f"{value:.4f}" for value in face_axis)
     coverage = float(report.get("coverage_pct", 0))
     target_area = float(report.get("target_face_mm2", 0)) / 1e6
+    fast = report.get("fast_mode", {}) or {}
+    fast_banner = ""
+    if fast.get("enabled"):
+        # A downloadable report outlives the screen it was made on, so the warning has to
+        # be in the file itself and above the numbers, not in a footnote below them.
+        fast_banner = (
+            '<section><div class="warn"><b>本次运行为快速模式</b>：采样网格 '
+            f'{float(fast.get("sample_grid_mm") or 0.0):g} mm，视线遮挡'
+            f'{"已建模" if fast.get("occlusion_modelled") else "未建模"}。'
+            "覆盖率数字只描述路径的形状，<b>不能作为验收依据</b>；引用任何数字前请去掉快速"
+            "模式重跑一次。</div></section>"
+        )
     body = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>扫描规划报告 · {html.escape(prog_name)}</title>
@@ -304,6 +322,7 @@ code{{color:#315c82}}
 </style></head><body><main>
 <header><h1>扫描路径规划报告</h1>
 <p>运行编号 {html.escape(run_id)} · 程序 {html.escape(prog_name)}</p></header>
+{fast_banner}
 <section><h2>主要结果</h2><div class="metrics">
 <div class="metric"><span>目标面覆盖率</span><b>{coverage:.2f}%</b></div>
 <div class="metric"><span>扫描视点</span><b>{int(report.get('viewpoints', 0))}</b></div>
@@ -386,6 +405,11 @@ def _public_config() -> dict:
         "speed_mm_s": float(config.motion.speed_mm_s),
         "config_source": config.source,
         "parameter_sources": dict(config.parameter_sources),
+        # The two grids, so the page can label the choice with the numbers it will use
+        # instead of hard-coding a promise about how fast a run is.
+        "sample_grid_mm": float(config.target.sample_grid_mm),
+        "fast_grid_mm": FAST_SAMPLE_GRID_MM,
+        "fast_min_grid_mm": FAST_MIN_SAMPLE_GRID_MM,
     }
 
 
@@ -395,13 +419,26 @@ def _delivery_config(data: dict):
     The two modes differ in the PLANNING unit, not only in the export: "pose" is the v1
     deliverable of isolated stops, so it switches the stroke stage off. Re-sorting the
     export order would not make a stroke plan pose-only.
+
+    Fast mode is applied LAST and by the same `fast_preset` the command line uses, so the
+    page and `scanplan plan --fast` cannot drift apart. `single_face=False` because this
+    job asks for one face already: claiming the preset's face saving here would be a
+    report saying it did something it did not.
     """
     config = load_config(data.get("config_path"))
     mode = str(data.get("delivery_mode") or "stroke").strip().lower()
     if mode not in ("stroke", "pose"):
         raise ValueError("delivery mode must be 'stroke' or 'pose'")
     if mode == "pose":
-        return override(config, stroke={"enabled": False})
+        config = override(config, stroke={"enabled": False})
+    if data.get("fast"):
+        grid = data.get("fast_grid_mm")
+        config = fast_preset(
+            config,
+            grid=FAST_SAMPLE_GRID_MM if grid is None else float(grid),
+            no_occlusion=bool(data.get("fast_no_occlusion")),
+            single_face=False,
+        )
     return config
 
 
@@ -673,6 +710,10 @@ def solve_job(data: dict, progress=None) -> dict:
         "target_face_mm2": float(result.report.get("target_face_mm2", 0.0)),
         "face": str(result.report.get("face", "")),
         "uncovered_by_reason": result.report.get("uncovered_by_reason", {}),
+        # The report's own `fast_mode` block, passed through rather than re-derived: the
+        # page must not be able to describe a faster run than the one that happened.
+        "fast": result.report.get("fast_mode", {"enabled": False}),
+        "sample_grid_mm": float(config.target.sample_grid_mm),
         "scan_face_axis_vehicle": face_axis_vehicle.tolist(),
         "scan_face_axis_measured_frame": scan_axis_target.tolist(),
         "measured_frame": registration.frame_label,

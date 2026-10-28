@@ -470,8 +470,13 @@ def override(config: PlannerConfig, **sections) -> PlannerConfig:
 
 
 def fast_preset(config: PlannerConfig, *, grid: float = FAST_SAMPLE_GRID_MM,
-                no_occlusion: bool = False) -> PlannerConfig:
+                no_occlusion: bool = False,
+                single_face: bool = True) -> PlannerConfig:
     """The fast run: coarse sampling grid, one face, and the state that says so.
+
+    `single_face=False` is for a caller that already plans one face on its own terms (the
+    web UI always asks for the upper face), so the preset must not claim a speedup it did
+    not cause - the report's `layers` says exactly what was changed.
 
     Deliberately NOT in this preset:
 
@@ -485,12 +490,16 @@ def fast_preset(config: PlannerConfig, *, grid: float = FAST_SAMPLE_GRID_MM,
     The grid and the face are written into `target`, not carried as flags, so the report
     shows what actually ran.
     """
-    layers = ["sample_grid", "single_face"]
+    layers = ["sample_grid"]
+    target: dict[str, object] = {"sample_grid_mm": float(grid)}
+    if single_face:
+        layers.append("single_face")
+        target["face"] = "upper"
     if no_occlusion:
         layers.append("no_occlusion")
     return override(
         config,
-        target={"sample_grid_mm": float(grid), "face": "upper"},
+        target=target,
         fast={"enabled": True, "no_occlusion": bool(no_occlusion),
               "layers": tuple(layers)},
     )

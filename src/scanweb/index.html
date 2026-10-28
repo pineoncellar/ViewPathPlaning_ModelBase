@@ -92,6 +92,17 @@
             </div>
             <p class="inline-hint">扫掠模式把相邻视点连成连续扫描带，覆盖率描述的是真正扫过的区域，LS 里用 L 直线 + CNT0 连续走；纯位姿模式是旧版行为，只给孤立位姿，点与点之间的运动不做任何保证。</p>
 
+            <div class="form-row">
+              <div><label class="field-label" for="fastMode">规划速度</label>
+                <select class="text-input" id="fastMode">
+                  <option value="accurate" selected>精确 · 3 mm 采样</option>
+                  <option value="fast">快速 · 10 mm 采样（约 2 分钟）</option>
+                </select>
+              </div>
+            </div>
+            <label class="check-row"><input id="fastNoOcclusion" type="checkbox" disabled>快速模式下跳过遮挡测试（更快，但可能"隔着零件"覆盖到采样点）</label>
+            <p class="inline-hint">快速模式只把采样网格放粗一档（3 mm → 10 mm），不关扫描带、不改关节检查步长——J5 超程正是发生在扫描带的直线扫掠段上。它换来的是"几分钟一条完整路径"，用于反复迭代关节解算；<b>覆盖率数字只描述路径形状，不能当验收依据</b>。报告里会有 <code>fast_mode</code> 块和 <code>FAST MODE</code> 摘要行。</p>
+
             <div class="section-label config-title"><span>现场定位点</span><small>先在 3D 模型上点选，再输入实测坐标</small></div>
             <div class="axis-row">
               <span class="field-label" style="margin:0">定位点数量</span>

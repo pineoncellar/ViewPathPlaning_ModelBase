@@ -880,6 +880,8 @@ function payload(includeMeshes) {
     max_registration_error_mm: Number($("errorLimit").value),
     prog_name: program,
     delivery_mode: $("scanMode").value,
+    fast: $("fastMode").value === "fast",
+    fast_no_occlusion: $("fastMode").value === "fast" && $("fastNoOcclusion").checked,
     run_name: runName || undefined,
     run_id: /^[A-Za-z0-9_-]{1,64}$/.test(runName) ? runName : undefined
   };
@@ -1318,6 +1320,12 @@ function renderResult(result) {
     ["交付模式", result.delivery_mode === "stroke"
       ? "扫掠模式 · 连续扫描带"
       : "纯位姿模式（旧版）"],
+    ["规划速度", result.fast && result.fast.enabled
+      ? "快速 · " + Number(result.fast.sample_grid_mm).toFixed(0) + " mm 采样 · 遮挡"
+        + (result.fast.occlusion_modelled ? "已建模" : "未建模")
+        + "（数字只描述路径形状，不能当验收依据）"
+      : "精确" + (result.sample_grid_mm
+        ? " · " + Number(result.sample_grid_mm).toFixed(0) + " mm 采样" : "")],
     ["扫描面外法向（整车）", "[" + result.scan_face_axis_vehicle.map((value) => Number(value).toFixed(3)).join(", ") + "]"],
     ["目标面面积", (Number(result.target_face_mm2) / 1e6).toFixed(4) + " m²"],
     ["配准 RMS / 最大误差", result.registration_rms_error_mm.toFixed(3) + " / " + result.registration_max_error_mm.toFixed(3) + " mm"],
@@ -1334,7 +1342,8 @@ function renderResult(result) {
   for (const [label, value] of details) {
     const item = document.createElement("div");
     item.className = "detail-item"
-      + (label === "未覆盖原因" || label === "输出目录" ? " wide" : "");
+      + (label === "未覆盖原因" || label === "输出目录" || label === "规划速度"
+        ? " wide" : "");
     const title = document.createElement("span");
     title.textContent = label;
     const content = document.createElement("b");
@@ -1420,6 +1429,10 @@ function syncSetupFromResult(result) {
   };
   if (result.program_name) $("progName").value = result.program_name;
   if (result.delivery_mode) $("scanMode").value = result.delivery_mode;
+  const wasFast = !!(result.fast && result.fast.enabled);
+  $("fastMode").value = wasFast ? "fast" : "accurate";
+  $("fastNoOcclusion").checked = wasFast && !result.fast.occlusion_modelled;
+  $("fastNoOcclusion").disabled = !wasFast;
   if (Number.isFinite(Number(result.uframe))) {
     $("measureFrame").value = String(Number(result.uframe));
   }
@@ -1675,6 +1688,11 @@ function bindEvents() {
   $("scanAxis").addEventListener("change", () => {
     updateAxisBadge("手动选择：" + AXIS_LABELS[currentAxis()]);
     requestRender();
+  });
+  $("fastMode").addEventListener("change", () => {
+    const fast = $("fastMode").value === "fast";
+    $("fastNoOcclusion").disabled = !fast;
+    if (!fast) $("fastNoOcclusion").checked = false;
   });
   $("measureFrame").addEventListener("change", () => {
     state.registration = null;
@@ -2080,6 +2098,16 @@ async function applyServerDefaults() {
     const config = await response.json();
     const mode = $("scanMode");
     if (mode && config.delivery_mode) mode.value = config.delivery_mode;
+    // The labels carry the grid each choice will actually run, so they cannot drift from
+    // the configuration the server holds.
+    const accurate = document.querySelector('#fastMode option[value="accurate"]');
+    if (accurate && config.sample_grid_mm) {
+      accurate.textContent = "精确 · " + Number(config.sample_grid_mm).toFixed(0) + " mm 采样";
+    }
+    const fast = document.querySelector('#fastMode option[value="fast"]');
+    if (fast && config.fast_grid_mm) {
+      fast.textContent = "快速 · " + Number(config.fast_grid_mm).toFixed(0) + " mm 采样（约 2 分钟）";
+    }
   } catch (_error) {
     /* keep the built-in default */
   }

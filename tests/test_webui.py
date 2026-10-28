@@ -52,6 +52,10 @@ def test_the_page_defaults_come_from_the_shipped_configuration():
     assert config["surface_bias"] == pytest.approx(0.5)
     assert config["robot_enabled"] is False
     assert config["motion"] in ("J", "L")
+    # The page labels the speed choice with these, so they must describe the same run.
+    assert config["sample_grid_mm"] > 0
+    assert config["fast_grid_mm"] > config["sample_grid_mm"]
+    assert config["fast_min_grid_mm"] <= config["fast_grid_mm"]
     assert set(config["parameter_sources"]) == {
         "stroke.min_gain_mm2_per_step", "stroke.min_stroke_mm", "stroke.seed_dirs",
         "stroke.order_axis_weight_mm_per_deg", "stroke.parallel_weight",
@@ -178,6 +182,78 @@ def test_delivery_mode_reaches_the_planner_not_only_the_exporter():
     assert _delivery_config({"delivery_mode": "pose"}).stroke.enabled is False
     with pytest.raises(ValueError, match="delivery mode"):
         _delivery_config({"delivery_mode": "fast"})
+
+
+def test_the_page_offers_a_fast_run_next_to_the_delivery_mode():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="fastMode"' in page
+    assert 'value="accurate" selected' in page
+    assert 'value="fast"' in page
+    assert 'id="fastNoOcclusion"' in page
+    assert "不能当验收依据" in page
+
+
+def test_fast_reaches_the_planner_through_the_same_preset_the_cli_uses():
+    """Not a second copy of the numbers: the page goes through `fast_preset`."""
+    from scanplan.config import FAST_SAMPLE_GRID_MM
+    from scanweb import _delivery_config
+
+    accurate = _delivery_config({})
+    assert accurate.fast.enabled is False
+
+    fast = _delivery_config({"fast": True})
+    assert fast.fast.enabled is True
+    assert fast.target.sample_grid_mm == FAST_SAMPLE_GRID_MM
+    assert fast.fast.no_occlusion is False
+    # This job already asks for one face, so the preset must not claim that saving.
+    assert fast.fast.layers == ("sample_grid",)
+    assert fast.target.face == accurate.target.face
+
+
+def test_fast_combines_with_the_pose_only_delivery_mode():
+    from scanweb import _delivery_config
+
+    both = _delivery_config({"delivery_mode": "pose", "fast": True})
+    assert both.stroke.enabled is False
+    assert both.fast.enabled is True
+
+
+def test_no_occlusion_is_only_honoured_inside_a_fast_run():
+    from scanweb import _delivery_config
+
+    assert _delivery_config({"fast": True, "fast_no_occlusion": True}).fast.no_occlusion
+    ignored = _delivery_config({"fast": False, "fast_no_occlusion": True})
+    assert ignored.fast.enabled is False
+    assert ignored.fast.no_occlusion is False
+
+
+def test_the_downloadable_report_carries_the_fast_warning(tmp_path):
+    """The HTML outlives the screen it was made on, so the warning is in the file."""
+    from types import SimpleNamespace
+
+    registration = SimpleNamespace(
+        frame_label="robot_uframe_1",
+        cad_points=[np.zeros(3)], measured_points=[np.zeros(3)],
+        residuals_mm=[np.zeros(3)], rms_error_mm=0.0, max_error_mm=0.0,
+    )
+    report = {"coverage_pct": 99.0, "viewpoints": 1, "target_points": 10,
+              "uncovered_points": 0, "face": "upper", "uncovered_by_reason": {}}
+    fast = {"enabled": True, "sample_grid_mm": 10.0, "occlusion_modelled": False,
+            "layers": ["sample_grid", "no_occlusion"]}
+    body = scanweb._write_planning_report(
+        tmp_path / "fast.html", run_id="r1", prog_name="PART01",
+        report=dict(report, fast_mode=fast), registration=registration,
+        face_axis=np.array([0.0, 0.0, 1.0]), downloads=[],
+    ).read_text(encoding="utf-8")
+    assert "快速模式" in body and "不能作为验收依据" in body
+
+    calm = scanweb._write_planning_report(
+        tmp_path / "calm.html", run_id="r2", prog_name="PART01",
+        report=dict(report, fast_mode={"enabled": False}), registration=registration,
+        face_axis=np.array([0.0, 0.0, 1.0]), downloads=[],
+    ).read_text(encoding="utf-8")
+    assert "快速模式" not in calm
 
 
 def test_a_stroke_plan_is_exported_as_delivered_and_flown_as_configured():
