@@ -41,7 +41,7 @@ from ..report import (
     viewpoints_from_selection,
 )
 from ..scanner_model import ScannerModel
-from ..scene import Station
+from ..scene import Station, casters_for
 from ..selection import Selection, select
 from ..sheet_split import SheetSplit, split_sheet
 from ..strokes import StrokeCoverage, combine
@@ -181,7 +181,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
 
     gate = None
     if tracker is not None:
-        obstacles = station.obstacles()
+        obstacles = casters_for(station, cfg)
         gate = lambda positions: visible_mask(tracker, positions, obstacles)  # noqa: E731
 
     # The joint-limit gate. Off by default (`robot.enabled=false`), and when off every call

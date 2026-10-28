@@ -25,6 +25,16 @@ SCOPE_NOTE = (
     "rejected poses back."
 )
 
+FAST_SCOPE_NOTE = (
+    "THIS RUN WAS A FAST RUN, and its numbers are for the shape of the path, not for "
+    "acceptance. What that meant: the target was sampled on {grid:g} mm instead of the "
+    "shipped grid, so the coverage figure is coarser and not comparable with an accurate "
+    "run{extra}. Use it to iterate on the joint model; re-run without --fast before any "
+    "figure is quoted."
+)
+FAST_SCOPE_EXTRA = (", and lines of sight were NOT tested, so a pose may 'cover' a "
+                    "sample through the part or the fixture")
+
 TRACKER_CAVEAT = (
     "The tracker test covers part, fixture and base only. Occlusion by the ROBOT ARM "
     "carrying the scanner is NOT modelled, because there is no robot model at this "
@@ -137,4 +147,37 @@ def provenance(config: PlannerConfig) -> dict:
         "note": ("the unmeasured block is the one to look at before believing a coverage "
                  "figure; max_incidence_deg is the most sensitive of them and "
                  "fov_anchor_distance_mm the one that moves the viewpoint count by ~20%"),
+    }
+
+
+def scope_note(config: PlannerConfig) -> str:
+    """What this run's coverage figure does and does not include.
+
+    A fast run gets its own note rather than a footnote on the accurate one: the whole
+    point of the mode is that its numbers must not be read as acceptance, so the sentence
+    a reader sees first has to say so in its own words.
+    """
+    if not config.fast.enabled:
+        return SCOPE_NOTE
+    extra = FAST_SCOPE_EXTRA if config.fast.no_occlusion else ""
+    return FAST_SCOPE_NOTE.format(grid=config.target.sample_grid_mm, extra=extra)
+
+
+def fast_block(config: PlannerConfig) -> dict:
+    """The machine-readable record that this run was fast, and what that changed.
+
+    Separate from `scope` because a program may read this one: a consumer that finds
+    `enabled: true` can refuse the run instead of parsing prose.
+    """
+    fast = config.fast
+    if not fast.enabled:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "layers": list(fast.layers),
+        "sample_grid_mm": config.target.sample_grid_mm,
+        "face": config.target.face,
+        "occlusion_modelled": not fast.no_occlusion,
+        "caveat": ("fast mode trades accuracy for iteration speed: the coverage figure "
+                   "describes a coarser sample set, and it is not an acceptance result"),
     }

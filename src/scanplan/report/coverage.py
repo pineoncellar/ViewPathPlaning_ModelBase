@@ -56,10 +56,16 @@ def coverage_block(*, config: PlannerConfig, model: ScannerModel, station: Stati
     leak_points = np.asarray(target.samples.points)[uncovered]
     leak_normals = np.asarray(target.samples.normals)[uncovered]
     leak_areas = np.asarray(target.samples.area_mm2)[uncovered]
-    say(f"  attributing {len(leak_points)} uncovered samples")
-    leak_reasons = attribute_uncovered(leak_points, leak_normals, coverage.poses,
-                                       station, model, config, obstacles=station.obstacles(),
-                                       tracker_ok=coverage.tracker_ok)
+    if config.fast.no_occlusion:
+        # Every reason this would produce is a sight-line verdict, and a fast run does not
+        # model sight lines. Naming them would be inventing an explanation.
+        leak_reasons = np.full(len(leak_points), "not_attributed", dtype=object)
+        say(f"  {len(leak_points)} uncovered samples not attributed (fast mode)")
+    else:
+        say(f"  attributing {len(leak_points)} uncovered samples")
+        leak_reasons = attribute_uncovered(leak_points, leak_normals, coverage.poses,
+                                          station, model, config,
+                                          tracker_ok=coverage.tracker_ok)
 
     counts: dict[str, int] = {}
     for reason in leak_reasons:

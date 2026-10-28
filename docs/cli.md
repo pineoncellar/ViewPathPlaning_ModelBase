@@ -25,6 +25,37 @@ uv run scanplan view --viewpoints output/<零件>/viewpoints.json \
 `--max-faces`（3D 视图里每个模型的显示面数上限）、`--quiet`。
 模板见 [`configs/station.example.json`](../configs/station.example.json)。
 
+### 快速模式：`--fast`
+
+迭代关节模型时需要一条几分钟就能重跑一遍的路径，而不是半小时：
+
+```bash
+uv run scanplan plan --station input/<工位>.json --fast --out output/<零件>-fast/
+```
+
+`--fast` 只做两件事，都是把**已有**的键写成粗一档的值，所以报告里显示的就是实际生效值：
+
+* `target.sample_grid_mm` → 10 mm（`--fast-grid MM` 可改，下限 8 mm）；
+* `target.face` → `upper`（显式 `--face` 仍然优先）。
+
+实测（1.05 m² 真实零件、同一条命令只改网格）：3 mm / `face auto` = 1724 s，
+10 mm / `face auto` = 223 s；再降到单面约再省一半。加速来自采样点数——覆盖率成本是
+`带位置数 × 采样点数`，与射线算法无关。
+
+配套的两个开关：
+
+* `--no-occlusion`：覆盖率阶段完全不测视线遮挡（只有和 `--fast` 同用才合法）。约再省
+  10–15%，但姿态可能"隔着零件覆盖"到采样点。报告的未覆盖归因会变成 `not_attributed`。
+* `--config configs/fast.json`：`--fast` 的等价预设文件，供脚本与网页端使用。
+
+**快速模式的数字不能当验收依据**，这不是提示而是机制：报告的 `fast_mode` 块
+（机读）、`scope` 文案、以及控制台的 `FAST MODE` 行都会写明，且 `runtime.fast` 为真。
+引出任何数字之前，去掉 `--fast` 重跑一次。
+
+`--fast` **不**把 `stroke.enabled` 关掉，也不改 `stroke.check_step_mm`：J5 超程发生在
+扫描带的直线扫掠段上，而 `check_step_mm` 同时是关节筛选对直线移动的采样步长——
+改粗它会让"检查"比"被检查的运动"还粗。
+
 > **`--face upper` / `--face lower` 是几何名，不是物理名。** 哪一个面叫"上面"取决于
 > 分面时定向种子的符号，而那个符号并没有锚定到工位文件上：交换它，两个面的名字会互换，
 > 而两面面积、料厚、定向比例**全都一模一样**。报告里因此记录了 `through_axis`（分面认为

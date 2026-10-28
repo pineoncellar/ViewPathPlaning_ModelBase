@@ -48,11 +48,12 @@ from ..viewpoints import (  # noqa: F401  (re-exported for the exporters)
 from .coverage import angle_diversity_block, cluster_points, coverage_block
 from .definition import (
     PLACEHOLDERS_NOTE,
-    SCOPE_NOTE,
     TRACKER_CAVEAT,
     definition_block,
+    fast_block,
     placeholders_block,
     provenance,
+    scope_note,
 )
 from .kinematics import budget_block, kinematics_block, surface_profile_block
 from .program import program_block
@@ -109,7 +110,8 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
             "name": None, "position_mm": None,
             "note": "no tracker pose supplied: the tracker constraint was not applied",
         },
-        "scope": SCOPE_NOTE,
+        "scope": scope_note(config),
+        "fast_mode": fast_block(config),
         "tracker_caveat": TRACKER_CAVEAT,
         "placeholders_note": PLACEHOLDERS_NOTE,
         "placeholders": placeholders_block(config, tracker),
@@ -117,6 +119,7 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
         "evaluation": dict(coverage.counters),
         "alignment_checks": checks,
         "runtime": {"seconds": (runtime or {}).get("seconds"),
-                    "ray_backend": (runtime or {}).get("ray_backend", backend_name())},
+                    "ray_backend": (runtime or {}).get("ray_backend", backend_name()),
+                    "fast": config.fast.enabled},
     }
     return plain(report)

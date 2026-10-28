@@ -10,7 +10,14 @@ import numpy as np
 
 from scanview import VIEWER_FILE_NAME
 
-from ..config import FACES, load_config, override
+from ..config import (
+    FACES,
+    FAST_MIN_SAMPLE_GRID_MM,
+    FAST_SAMPLE_GRID_MM,
+    fast_preset,
+    load_config,
+    override,
+)
 from ..raycast import backend_name
 from ..report import summary_lines
 from ..scene import StationDescription, load_station, load_station_description
@@ -35,6 +42,19 @@ def configure(subparsers) -> None:
     planner.add_argument("--fixture", help="fixture mesh, if no --station is given")
     planner.add_argument("--base", help="base mesh, if no --station is given")
     planner.add_argument("--config", help="configuration override (JSON)")
+    planner.add_argument("--fast", action="store_true",
+                         help="fast run: sample the target on a 10 mm grid and plan one "
+                              "face, so an iteration takes ~2 min instead of ~29. For the "
+                              "SHAPE of the path - the coverage figure is not an "
+                              "acceptance result")
+    planner.add_argument("--fast-grid", type=float, metavar="MM",
+                         help=f"sampling grid for --fast (default "
+                              f"{FAST_SAMPLE_GRID_MM:g}, minimum "
+                              f"{FAST_MIN_SAMPLE_GRID_MM:g})")
+    planner.add_argument("--no-occlusion", action="store_true",
+                         help="inside a fast run, do not test lines of sight at all "
+                              "(faster, but a pose may then 'cover' a sample through the "
+                              "part); requires --fast")
     planner.add_argument("--coverage-target", dest="coverage_target",
                          help="acceptance coverage in percent, or 'none' to run until the "
                               "coverage stops growing; overrides the configuration for "
@@ -62,6 +82,12 @@ def run(args, parser: argparse.ArgumentParser) -> int:
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
         parser.error(f"cannot read the configuration: {error}")
         return 2
+
+    if cfg.fast.enabled:
+        say(f"FAST run: {', '.join(cfg.fast.layers) or 'preset'}; "
+            f"{cfg.target.sample_grid_mm:g} mm grid, face {cfg.target.face}, sight lines "
+            f"{'NOT ' if cfg.fast.no_occlusion else ''}modelled - these numbers describe "
+            "the SHAPE of the path, not an acceptance result")
 
     try:
         description = _station_description(args, parser)
@@ -95,20 +121,36 @@ def run(args, parser: argparse.ArgumentParser) -> int:
 
 
 def _apply_overrides(cfg, args, parser: argparse.ArgumentParser):
-    """Apply the flags that are not part of the configuration file merge."""
-    if args.coverage_target is None:
-        return cfg
-    raw = str(args.coverage_target).strip().lower()
-    if raw in ("none", "null", ""):
-        value = None
-    else:
-        try:
-            value = float(raw)
-        except ValueError:
-            parser.error(f"--coverage-target takes a percentage or 'none', not "
-                         f"{args.coverage_target!r}")
-            return cfg
-    return override(cfg, target={"coverage_target_pct": value})
+    """Apply the flags that are not part of the configuration file merge.
+
+    Order matters and is documented in the log: the JSON file goes on first (in
+    `load_config`), the fast preset next, and an explicit `--coverage-target` last, so the
+    most specific thing said on the command line always wins.
+    """
+    if args.fast_grid is not None and not args.fast:
+        parser.error("--fast-grid only means something with --fast")
+    if args.no_occlusion and not args.fast:
+        parser.error("--no-occlusion only means something with --fast: switching sight "
+                     "lines off is only honest inside a run that says it is fast")
+    if args.fast:
+        grid = FAST_SAMPLE_GRID_MM if args.fast_grid is None else float(args.fast_grid)
+        if grid < FAST_MIN_SAMPLE_GRID_MM:
+            parser.error(f"--fast-grid must be at least {FAST_MIN_SAMPLE_GRID_MM:g} mm; "
+                         f"{grid:g} mm would cost the same time as an accurate run")
+        cfg = fast_preset(cfg, grid=grid, no_occlusion=bool(args.no_occlusion))
+    if args.coverage_target is not None:
+        raw = str(args.coverage_target).strip().lower()
+        if raw in ("none", "null", ""):
+            value = None
+        else:
+            try:
+                value = float(raw)
+            except ValueError:
+                parser.error(f"--coverage-target takes a percentage or 'none', not "
+                             f"{args.coverage_target!r}")
+                return cfg
+        cfg = override(cfg, target={"coverage_target_pct": value})
+    return cfg
 
 
 def _station_description(args, parser: argparse.ArgumentParser) -> StationDescription:

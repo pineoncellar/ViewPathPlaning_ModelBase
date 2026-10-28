@@ -97,6 +97,9 @@ class Station:
 
         All three block sight lines, so the coverage stage needs them together, and
         building an intersector per call would dominate a real part's runtime.
+
+        Go through :func:`casters_for` rather than calling this directly: that is where a
+        fast run decides not to model sight lines at all.
         """
         if self._obstacles is None:
             self._obstacles = {
@@ -136,6 +139,21 @@ class Station:
         if kwargs.get("base_plane_mm") is None and self.description.mounting_plane_z_mm:
             kwargs["base_plane_mm"] = self.description.mounting_plane_z_mm
         return check_alignment(self, **kwargs)
+
+
+def casters_for(station: Station, config) -> dict[str, RayCaster]:
+    """The sight-line blockers for this run: the three meshes, or none at all.
+
+    One function because this is the only place the decision is allowed to be made. A
+    fast run (`fast.no_occlusion`) gets an empty mapping, and `measure_mask` already
+    treats that as "nothing blocks": `nearest_across({})` returns infinity for every ray,
+    so `blocked` is all-false and the mask is exactly `geometry_mask`. Nothing else has to
+    know; nothing else may special-case it.
+
+    Not used by `split_sheet`'s mirror pass, which needs real rays to find the two faces
+    of the blank - without that pass there is no target surface to be fast about.
+    """
+    return {} if config.fast.no_occlusion else station.obstacles()
 
 
 def read_transform(values) -> np.ndarray:

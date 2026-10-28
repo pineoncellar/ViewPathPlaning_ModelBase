@@ -67,6 +67,13 @@ def summary_lines(report: dict) -> list[str]:
     if budget.get("max_points") is not None:
         lines.append(f"budget                 {budget.get('verdict')} at "
                      f"{budget.get('delivered_points')} of {budget['max_points']} points")
+    fast = report.get("fast_mode", {})
+    if fast.get("enabled"):
+        what = ", ".join(fast.get("layers") or []) or "no layer recorded"
+        lines.append(
+            f"FAST MODE              {what}; {fast.get('sample_grid_mm'):g} mm grid, "
+            f"occlusion {'modelled' if fast.get('occlusion_modelled') else 'NOT modelled'}"
+            " - these numbers are for the shape of the path, not for acceptance")
     return lines
 
 

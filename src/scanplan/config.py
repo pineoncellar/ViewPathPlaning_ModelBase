@@ -342,6 +342,39 @@ def surface_profile(bias: float) -> dict[str, dict[str, float]]:
     return {"stroke": derived}
 
 
+# The sampling grid a fast run is allowed to use, and the coarsest value it must not
+# exceed. 10 mm is what the 2026-10-28 A/B measured 7.7x end to end on the real part
+# (3 mm: 1724 s, 10 mm: 223 s, `face: auto` both); 8 mm is the floor, so a "fast" run
+# that is still at 3 mm is refused instead of being trusted for being labelled fast.
+FAST_SAMPLE_GRID_MM = 10.0
+FAST_MIN_SAMPLE_GRID_MM = 8.0
+
+
+@dataclass(frozen=True)
+class FastParams:
+    """The two things a fast run changes that no ordinary key can express.
+
+    Everything else a fast run does - the sampling grid, which face - is written into
+    the ordinary keys by :func:`fast_preset`, so the report shows the value actually in
+    force instead of a flag nobody can audit. What is left here is the state itself and
+    the one semantic switch: whether lines of sight are modelled at all.
+
+    `layers` is the record of what the preset changed, carried so the report can say
+    "this run was fast, and here is what that meant" without re-deriving it from the
+    numbers - which would be circular, because the numbers are the thing not to trust.
+
+    The default is off, and off must be bit-for-bit the pre-2026-10-28 behaviour.
+    """
+
+    enabled: bool
+    no_occlusion: bool
+    layers: tuple[str, ...] = ()
+
+    @classmethod
+    def disabled(cls) -> FastParams:
+        return cls(enabled=False, no_occlusion=False, layers=())
+
+
 @dataclass(frozen=True)
 class PlannerConfig:
     scanner: ScannerParams
@@ -352,6 +385,7 @@ class PlannerConfig:
     occlusion_tol_mm: float
     seed: int
     robot: RobotParams = field(default_factory=RobotParams.disabled)
+    fast: FastParams = field(default_factory=FastParams.disabled)
     source: str = ""
     override: str | None = None
     # Where each surface-derived `stroke` value came from: `base`, `profile(bias=x)` or
@@ -435,6 +469,33 @@ def override(config: PlannerConfig, **sections) -> PlannerConfig:
     return replacement
 
 
+def fast_preset(config: PlannerConfig, *, grid: float = FAST_SAMPLE_GRID_MM,
+                no_occlusion: bool = False) -> PlannerConfig:
+    """The fast run: coarse sampling grid, one face, and the state that says so.
+
+    Deliberately NOT in this preset:
+
+    * `stroke.check_step_mm` / `extend_step_mm`. They look like an easy 1.5-2.5x, but
+      `check_step_mm` is also the sampling step `RobotArm.along` uses for a straight move
+      in the joint screen, so coarsening it here would make the very check a fast run
+      exists to feed coarser than the motion it is checking.
+    * `stroke.enabled = False`. The J5 over-travel in `output/run_j5_real_upper.log`
+      happens along the straight sweeps, so a path without sweeps cannot reproduce it.
+
+    The grid and the face are written into `target`, not carried as flags, so the report
+    shows what actually ran.
+    """
+    layers = ["sample_grid", "single_face"]
+    if no_occlusion:
+        layers.append("no_occlusion")
+    return override(
+        config,
+        target={"sample_grid_mm": float(grid), "face": "upper"},
+        fast={"enabled": True, "no_occlusion": bool(no_occlusion),
+              "layers": tuple(layers)},
+    )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return read_json(path)
 
@@ -471,6 +532,8 @@ def _build(data: dict[str, Any], source: str, override: str | None,
     motion = _section(data, "motion", MotionParams)
     robot = (_section(data, "robot", RobotParams) if "robot" in data
              else RobotParams.disabled())
+    fast = (_section(data, "fast", FastParams) if "fast" in data
+            else FastParams.disabled())
     config = PlannerConfig(
         scanner=scanner,
         target=target,
@@ -480,6 +543,7 @@ def _build(data: dict[str, Any], source: str, override: str | None,
         occlusion_tol_mm=float(data["occlusion_tol_mm"]),
         seed=int(data["seed"]),
         robot=robot,
+        fast=fast,
         source=source,
         override=override,
         parameter_sources=dict(parameter_sources or {}),
@@ -489,7 +553,7 @@ def _build(data: dict[str, Any], source: str, override: str | None,
 
 
 def _reject_unknown(data: dict[str, Any]) -> None:
-    known = {"scanner", "target", "tracker", "stroke", "motion", "robot",
+    known = {"scanner", "target", "tracker", "stroke", "motion", "robot", "fast",
              "occlusion_tol_mm", "seed"}
     unknown = sorted(k for k in data if k not in known and not k.startswith("_"))
     if unknown:
@@ -502,6 +566,7 @@ def _reject_unknown(data: dict[str, Any]) -> None:
         ("stroke", StrokeParams),
         ("motion", MotionParams),
         ("robot", RobotParams),
+        ("fast", FastParams),
     ):
         body = data.get(section, {})
         allowed = {f.name for f in fields(cls)}
@@ -614,6 +679,7 @@ def _validate(config: PlannerConfig) -> None:
     _validate_strokes(config.stroke)
     _validate_surface(target)
     _validate_robot(config.robot)
+    _validate_fast(config)
     if config.motion.type not in MOTION_TYPES:
         raise ValueError(f"'motion.type' must be one of {MOTION_TYPES}, "
                          f"not {config.motion.type!r}")
@@ -622,6 +688,20 @@ def _validate(config: PlannerConfig) -> None:
                          f"not {config.motion.termination!r}")
     if config.motion.speed_mm_s <= 0.0:
         raise ValueError("'motion.speed_mm_s' must be positive")
+
+
+def _validate_fast(config: PlannerConfig) -> None:
+    fast = config.fast
+    if fast.no_occlusion and not fast.enabled:
+        # Turning sight lines off on its own would quietly change what "coverage" means
+        # in a run that does not announce itself as fast.
+        raise ValueError("'fast.no_occlusion' needs 'fast.enabled': switching the "
+                         "occlusion test off is only honest inside a fast run")
+    if fast.enabled and config.target.sample_grid_mm < FAST_MIN_SAMPLE_GRID_MM:
+        raise ValueError(
+            f"a fast run needs target.sample_grid_mm >= {FAST_MIN_SAMPLE_GRID_MM:g} mm, "
+            f"not {config.target.sample_grid_mm:g}: at the shipped grid it would cost the "
+            "same time as an accurate run and only be slower to distrust")
 
 
 def _validate_strokes(stroke: StrokeParams) -> None:

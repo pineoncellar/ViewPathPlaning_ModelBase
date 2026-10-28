@@ -152,12 +152,45 @@ uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
                    --prog-name PART01 --joint-blocks --out output/<零件>/
 ```
 
+## 快速模式（`fast` 段）
+
+迭代关节模型时要一条"几分钟就能重跑"的路径，用它换掉每次半小时的等待。**它不是精确模式
+的替代品**：数字只描述路径形状，不能当验收依据。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `fast.enabled` | `false` | 本次运行是快速模式；报告、scope、摘要据此改口径 |
+| `fast.no_occlusion` | `false` | 覆盖率阶段不做视线遮挡；必须与 `enabled` 同时为真 |
+| `fast.layers` | `[]` | 预设改过哪几层（`sample_grid` / `single_face` / `no_occlusion`），进报告 |
+
+加速不靠新算法，靠**降采样点数**：覆盖率成本是 `带位置数 × 采样点数`，所以真正被调的是
+`target.sample_grid_mm`（3 → 10，实测 7.7×）和 `target.face`（`auto` → `upper`，2×）。
+`scanplan plan --fast` 就是把这两个已有键写粗一档，因此报告里显示的是实际生效值，而不是
+一个无法审计的开关。
+
+两条刻意的边界：
+
+- **不关扫描带**（`stroke.enabled` 不动）。J5 超程发生在带的直线扫掠段上，没有带的路径
+  复现不了它。
+- **不改 `stroke.check_step_mm`**。它同时是关节筛选对直线移动的采样步长，调粗它等于让
+  检查比被检查的运动还粗。
+
+`fast.enabled` 为真而 `sample_grid_mm` 仍小于 8 mm 会被 `_validate` 拒绝——一个还在
+3 mm 网格上的"快速模式"只会更慢地被怀疑。`fast.no_occlusion` 单独打开同样被拒绝。
+
+```bash
+uv run scanplan plan --station input/<工位>.json --fast --out output/<零件>-fast/
+uv run scanplan plan --station input/<工位>.json --config configs/fast.json --out output/<零件>-fast/
+```
+
 ## 改完看哪里
 
 - `coverage_report.json`：`parameter_provenance`（每个参数的出处）、`surface_profile`
   （bias、派生出的有效值、逐键来源）、`kinematics`（限位来源、J5 直方图、分支直方图、
-  min margin、最大步长与超限点数）、`budget`（verdict、每档 λ 的试验记录）；
-- `summary.txt`：Joints 与 Budget 两行（没开关节门时不出现 Joints）；
+  min margin、最大步长与超限点数）、`budget`（verdict、每档 λ 的试验记录）、
+  `fast_mode`（是否快速模式、改了哪几层、视线遮挡是否建模）；
+- `summary.txt`：Joints 与 Budget 两行（没开关节门时不出现 Joints）；快速模式另有一行
+  `FAST MODE`；
 - 一条守着的不变量：`coverage_pct` **等于**路径里所有覆盖点的并集；`swept_coverage_pct`
   另算过渡段顺手扫到的面积，只作参考、不参与验收；
 - 网页端显示的默认值来自 `GET /api/config`，也就是服务端**实际会用的**那份配置——页面说
