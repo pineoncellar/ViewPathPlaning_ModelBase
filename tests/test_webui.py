@@ -671,3 +671,171 @@ def test_the_page_shows_server_stages_instead_of_a_time_curve():
     # The old estimator saturated at 99% after a minute and looked stuck; it must not
     # come back as the primary source.
     assert "Math.exp(-seconds / 26)" not in script
+
+# --- saved setups ----------------------------------------------------------
+#
+# The point of a setup is that a restart costs one click instead of a re-import plus a
+# re-pick, so these tests are about the round trip: the same meshes, the same points on
+# them, and the same typed coordinates come back, and saving twice under one name means
+# the second save, not two half-configurations.
+
+
+def setup_stl_bytes(box_mesh) -> str:
+    return base64.b64encode(box_mesh.export(file_type="stl")).decode("ascii")
+
+
+def a_setup(point: float = 1.0, *, name: str = "PART01") -> dict:
+    return {
+        "name": name,
+        "setup": {
+            "point_count": 3,
+            "cad_points_vehicle_mm": [[point, 0.0, 0.0], [100.0, 0.0, 0.0],
+                                      [0.0, 80.0, 0.0]],
+            "measured_points_mm": [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"]],
+            "scan_face_axis": "-Y",
+            "uframe": 0,
+            "error_limit_mm": "2.5",
+            "prog_name": "PART01",
+            "run_name": name,
+            "delivery_mode": "pose",
+            "fast": "fast",
+            "fast_no_occlusion": True,
+        },
+    }
+
+
+def test_a_saved_setup_returns_the_meshes_and_the_picks(tmp_path, monkeypatch):
+    from scanweb import load_setup, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    support = trimesh.creation.box(extents=[20.0, 20.0, 20.0])
+    payload = a_setup()
+    payload["setup"]["model_names"] = {"part": "零件v2.stl", "support": "夹具.stl"}
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(support)},
+                         "support": {"stl_base64": setup_stl_bytes(support)}}
+    saved = save_setup(payload)
+    assert saved["models"] == ["part", "support"]
+
+    restored = load_setup("PART01")
+    assert restored["setup"]["cad_points_vehicle_mm"][0] == [1.0, 0.0, 0.0]
+    assert restored["setup"]["measured_points_mm"][1] == ["4", "5", "6"]
+    assert restored["setup"]["scan_face_axis"] == "-Y"
+    assert restored["setup"]["uframe"] == 0
+    assert restored["setup"]["delivery_mode"] == "pose"
+    assert restored["setup"]["fast"] == "fast"
+    assert restored["setup"]["fast_no_occlusion"] is True
+    # The names the operator picked, so a restore shows the same files, not `part.stl`.
+    assert restored["setup"]["model_names"] == {"part": "零件v2.stl", "support": "夹具.stl"}
+    # The bytes are what the picks were made against, so they must come back identical.
+    assert base64.b64decode(restored["models"]["part"]["stl_base64"]) \
+        == base64.b64decode(payload["models"]["part"]["stl_base64"])
+    assert "base" not in restored["models"]
+
+
+def test_saving_the_same_name_replaces_the_previous_setup(tmp_path, monkeypatch):
+    from scanweb import _setup_list, load_setup, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    payload = a_setup(1.0)
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+    payload = a_setup(9.0)
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+
+    assert len(_setup_list()) == 1
+    assert load_setup("PART01")["setup"]["cad_points_vehicle_mm"][0] == [9.0, 0.0, 0.0]
+
+
+def test_a_setup_describes_exactly_the_meshes_it_was_saved_with(tmp_path, monkeypatch):
+    from scanweb import _setup_dir, load_setup, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    payload = a_setup()
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)},
+                         "support": {"stl_base64": setup_stl_bytes(box)},
+                         "base": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+    assert (_setup_dir("PART01") / "base.stl").is_file()
+
+    payload = a_setup()
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)},
+                         "support": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+    # A part removed from the page must not come back from the previous save.
+    assert not (_setup_dir("PART01") / "base.stl").is_file()
+    assert set(load_setup("PART01")["models"]) == {"part", "support"}
+
+
+def test_a_name_that_is_not_a_run_id_still_gets_its_own_folder(tmp_path, monkeypatch):
+    """Chinese names are normal here, and two of them must not collide."""
+    from scanweb import _setup_dir, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    for name in ("一号件", "A B", "A_B"):
+        payload = a_setup(name=name)
+        payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)}}
+        save_setup(payload)
+    assert _setup_dir("一号件") != _setup_dir("A B")
+    assert _setup_dir("A B") != _setup_dir("A_B")
+    # A Chinese name stays readable on disk instead of collapsing to a hash.
+    assert "一号件" in _setup_dir("一号件").name
+    assert _setup_dir("PART01") == (tmp_path / "output" / "web_runs" / "setups"
+                                    / "PART01").resolve()
+
+
+def test_a_malformed_setup_is_refused_rather_than_stored(tmp_path, monkeypatch):
+    from scanweb import save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    models = {"part": {"stl_base64": setup_stl_bytes(box)}}
+
+    bad_count = a_setup()
+    bad_count["setup"]["point_count"] = 5
+    with pytest.raises(ValueError, match="point_count"):
+        save_setup({**bad_count, "models": models})
+
+    bad_axis = a_setup()
+    bad_axis["setup"]["scan_face_axis"] = "+A"
+    with pytest.raises(ValueError, match="scan_face_axis"):
+        save_setup({**bad_axis, "models": models})
+
+    bad_point = a_setup()
+    bad_point["setup"]["cad_points_vehicle_mm"] = [[1.0, 2.0]]
+    with pytest.raises(ValueError, match="cad_points_vehicle_mm"):
+        save_setup({**bad_point, "models": models})
+
+    with pytest.raises(ValueError, match="方案名称"):
+        save_setup({"name": "  ", "setup": a_setup()["setup"], "models": models})
+
+
+def test_deleting_a_setup_removes_its_folder(tmp_path, monkeypatch):
+    from scanweb import delete_setup, load_setup, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    payload = a_setup()
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+
+    assert delete_setup("PART01") is True
+    assert delete_setup("PART01") is False
+    with pytest.raises(ValueError, match="没有名为"):
+        load_setup("PART01")
+
+
+def test_the_page_offers_saving_and_restoring_a_setup():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+    script = (Path(scanweb.__file__).parent / "app.js").read_text(encoding="utf-8")
+
+    for element in ("setupSelect", "saveSetup", "loadSetup", "deleteSetup"):
+        assert 'id="' + element + '"' in page
+    assert "/api/setup/list" in script
+    assert "/api/setup/save" in script
+    assert "/api/setup?name=" in script
+    # The meshes travel with the save: without them a restart still needs a re-import.
+    assert "stl_base64" in script

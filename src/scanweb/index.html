@@ -33,6 +33,17 @@
             <label class="field-label" for="runName">本次运行名称</label>
             <input class="text-input" id="runName" maxlength="64" placeholder="留空则按时间自动命名">
 
+            <div class="section-label"><span>方案</span><small>重启程序后一键恢复模型、定位点与坐标</small></div>
+            <div class="axis-row">
+              <select class="text-input" id="setupSelect" aria-label="已保存的方案">
+                <option value="">（尚未保存方案）</option>
+              </select>
+              <button class="secondary-button" id="saveSetup" type="button">保存当前配置</button>
+              <button class="secondary-button" id="loadSetup" type="button">读取</button>
+              <button class="secondary-button" id="deleteSetup" type="button">删除</button>
+            </div>
+            <p class="inline-hint">保存的是「本次运行名称」下的整套现场配置：三个模型文件、在 3D 模型上选的定位点、手动填入的现场坐标，以及扫描面/坐标系/误差限/交付模式/规划速度。同名保存会覆盖旧的。文件在 <code>output/web_runs/setups/</code> 下，一个方案一个文件夹。</p>
+
             <div class="section-label"><span>工位模型</span><small>毫米单位 · STL / STEP / IGES 等</small></div>
             <div class="upload-grid">
               <label class="upload-card" for="partFile">

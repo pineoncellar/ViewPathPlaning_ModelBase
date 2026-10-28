@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import html
 import json
 import re
@@ -1498,9 +1499,232 @@ def _augment_datums(record: dict, run_id: str) -> dict:
     return merged
 
 
+# --- saved setups ----------------------------------------------------------
+#
+# A setup is everything the page had typed and clicked before a run: the three meshes,
+# the datum points taken on the model, and the coordinates typed for them. It exists
+# because restarting the server to change the algorithm used to cost a re-import plus a
+# re-pick, and that is exactly the loop the joint-model work runs in.
+#
+# The MESHES are copied, not referenced: the browser never has a path to give, only the
+# bytes it read. `setup.json` carries the rest, so one file describes a setup and the
+# folder beside it holds what the picks were made against.
+
+SETUP_MODELS = ("part", "support", "base")
+SETUP_NAME_LIMIT = 64
+
+
+def _setups_root() -> Path:
+    root = (Path.cwd() / "output" / "web_runs" / "setups").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _setup_slug(name: str) -> str:
+    """A folder for a setup name, safe for any name an operator types.
+
+    A name the run-id pattern already accepts is used verbatim, so the folder is readable
+    and two such names can never share one. Anything else - a Chinese name, a date, a
+    sentence - is reduced to its safe characters plus a digest of the whole name, which is
+    what keeps "A B" and "A_B" from writing over each other.
+    """
+    if _SAFE_RUN_ID.fullmatch(name):
+        return name
+    # `\w` keeps letters of any script, so a Chinese name stays readable on disk; path
+    # separators are not word characters, which is what makes the result safe.
+    slug = re.sub(r"[^\w\-]+", "_", name, flags=re.UNICODE).strip("_")[:40] or "setup"
+    return f"{slug}-{hashlib.sha1(name.encode('utf-8')).hexdigest()[:8]}"
+
+
+def _setup_coords(value, *, name: str, count: int):
+    """A list of `count` numbers, refused rather than truncated when it is not one."""
+    if not isinstance(value, (list, tuple)) or len(value) != count:
+        raise ValueError(f"{name} must be {count} numbers")
+    numbers = []
+    for item in value:
+        try:
+            number = float(item)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name} must be {count} numbers") from error
+        if not np.isfinite(number):
+            raise ValueError(f"{name} must be {count} finite numbers")
+        numbers.append(number)
+    return numbers
+
+
+def _setup_points(value, *, name: str):
+    if not isinstance(value, list) or len(value) > 4:
+        raise ValueError(f"{name} must be a list of at most 4 points")
+    return [_setup_coords(point, name=name, count=3) for point in value]
+
+
+def _clean_setup(body: dict) -> dict:
+    """The page's configuration, written through a whitelist.
+
+    Whitelisted rather than passed through because this file is read back into form
+    fields on the next start: a stale or hand-edited key must not be able to put anything
+    unexpected in front of an operator who is about to plan a real part.
+    """
+    point_count = body.get("point_count", 3)
+    try:
+        point_count = int(point_count)
+    except (TypeError, ValueError) as error:
+        raise ValueError("point_count must be 3 or 4") from error
+    if point_count not in (3, 4):
+        raise ValueError("point_count must be 3 or 4")
+
+    measured = body.get("measured_points_mm", [])
+    if not isinstance(measured, list) or len(measured) > 4:
+        raise ValueError("measured_points_mm must be a list of at most 4 points")
+    measured_rows = []
+    for row in measured:
+        values = row if isinstance(row, list) else []
+        measured_rows.append([str(value)[:32] for value in values[:3]]
+                             + [""] * (3 - len(values[:3])))
+
+    axis = str(body.get("scan_face_axis") or "+Z")
+    if axis not in ("+X", "-X", "+Y", "-Y", "+Z", "-Z"):
+        raise ValueError("scan_face_axis must be one of the six unit axes")
+    mode = str(body.get("delivery_mode") or "stroke")
+    if mode not in ("stroke", "pose"):
+        raise ValueError("delivery_mode must be 'stroke' or 'pose'")
+    speed = str(body.get("fast") or "accurate")
+    if speed not in ("accurate", "fast"):
+        raise ValueError("fast must be 'accurate' or 'fast'")
+
+    raw_names = body.get("model_names")
+    model_names = {}
+    if isinstance(raw_names, dict):
+        # The filenames the operator chose, so a restored setup shows the same names it
+        # was saved with instead of the canonical `part.stl` / `support.stl`.
+        model_names = {kind: str(value)[:120] for kind, value in raw_names.items()
+                       if kind in SETUP_MODELS and value}
+
+    return {
+        "point_count": point_count,
+        "cad_points_vehicle_mm": _setup_points(
+            body.get("cad_points_vehicle_mm", []), name="cad_points_vehicle_mm"),
+        "measured_points_mm": measured_rows,
+        "scan_face_axis": axis,
+        "uframe": 0 if str(body.get("uframe")) == "0" else 1,
+        "error_limit_mm": str(body.get("error_limit_mm") or "3.0")[:32],
+        "prog_name": str(body.get("prog_name") or "")[:16],
+        "run_name": str(body.get("run_name") or "")[:64],
+        "delivery_mode": mode,
+        "fast": speed,
+        "fast_no_occlusion": bool(body.get("fast_no_occlusion")),
+        "model_names": model_names,
+    }
+
+
+def _setup_dir(name: str) -> Path:
+    folder = (_setups_root() / _setup_slug(name)).resolve()
+    if folder.parent != _setups_root():
+        raise ValueError("invalid setup name")
+    return folder
+
+
+def save_setup(data: dict) -> dict:
+    """Store one setup: the meshes as files, everything else in `setup.json`.
+
+    Overwrites a setup of the same name on purpose - "save the current configuration"
+    means the current one, and a version pile beside it would be a different feature.
+    """
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise ValueError("方案名称不能为空")
+    if len(name) > SETUP_NAME_LIMIT:
+        raise ValueError(f"方案名称最多 {SETUP_NAME_LIMIT} 个字符")
+    body = data.get("setup")
+    if not isinstance(body, dict):
+        raise ValueError("setup must be an object")
+    cleaned = _clean_setup(body)
+    models = data.get("models") or {}
+    if not isinstance(models, dict):
+        raise ValueError("models must be an object")
+
+    folder = _setup_dir(name)
+    folder.mkdir(parents=True, exist_ok=True)
+    written = []
+    for kind in SETUP_MODELS:
+        payload = models.get(kind)
+        raw = (b"" if not isinstance(payload, dict) or not payload.get("stl_base64")
+               else _decode_stl_bytes(payload, kind))
+        target = folder / f"{kind}.stl"
+        if raw:
+            target.write_bytes(raw)
+            written.append(kind)
+        elif target.is_file():
+            # A setup describes exactly the meshes it was saved with; a part removed from
+            # the page must not come back from the previous save.
+            target.unlink()
+    record = {
+        "name": name,
+        "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "models": written,
+        "setup": cleaned,
+    }
+    (folder / "setup.json").write_text(
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return record
+
+
+def _setup_record(name: str) -> dict | None:
+    path = _setup_dir(name) / "setup.json"
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _setup_list() -> list[dict]:
+    """Every saved setup, newest first, without the meshes."""
+    entries = []
+    for path in _setups_root().glob("*/setup.json"):
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(loaded, dict):
+            continue
+        entries.append({
+            "name": str(loaded.get("name") or path.parent.name),
+            "saved_at": loaded.get("saved_at"),
+            "models": list(loaded.get("models") or []),
+            "point_count": (loaded.get("setup") or {}).get("point_count", 3),
+        })
+    entries.sort(key=lambda entry: str(entry["saved_at"] or ""), reverse=True)
+    return entries
+
+
+def load_setup(name: str) -> dict:
+    """One setup, meshes included, in the shape the page reassembles in a single click."""
+    record = _setup_record(name)
+    if record is None:
+        raise ValueError(f"没有名为 {name!r} 的方案")
+    folder = _setup_dir(name)
+    models = {}
+    for kind in SETUP_MODELS:
+        path = folder / f"{kind}.stl"
+        if path.is_file():
+            models[kind] = {"stl_base64": base64.b64encode(path.read_bytes()).decode("ascii")}
+    return {**record, "models": models}
+
+
+def delete_setup(name: str) -> bool:
+    folder = _setup_dir(name)
+    if not (folder / "setup.json").is_file():
+        return False
+    shutil.rmtree(folder, ignore_errors=True)
+    return True
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "ScanplanWeb/1.0"
-
     def do_GET(self) -> None:
         route = urlsplit(self.path)
         if route.path in ("/", "/index.html"):
@@ -1542,6 +1766,19 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if route.path == "/api/history":
             self._json_response(200, {"ok": True, "runs": _history_runs()})
+            return
+        if route.path == "/api/setup/list":
+            self._json_response(200, {"ok": True, "setups": _setup_list()})
+            return
+        if route.path == "/api/setup":
+            name = parse_qs(route.query).get("name", [""])[0]
+            if not name:
+                self.send_error(400, "invalid setup name")
+                return
+            try:
+                self._json_response(200, {"ok": True, "setup": load_setup(name)})
+            except ValueError as error:
+                self._json_response(404, {"ok": False, "error": str(error)})
             return
         if route.path == "/api/history/detail":
             query = parse_qs(route.query)
@@ -1623,7 +1860,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path not in (
             "/api/register", "/api/solve", "/api/convert", "/api/history/delete",
-            "/api/relocate",
+            "/api/relocate", "/api/setup/save", "/api/setup/delete",
         ):
             self.send_error(404)
             return
@@ -1680,6 +1917,17 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json_response(
                     200, {"ok": True, "result": _preview_registration(data)}
                 )
+                return
+            if self.path == "/api/setup/save":
+                self._json_response(200, {"ok": True,
+                                         "setup": save_setup(data)})
+                return
+            if self.path == "/api/setup/delete":
+                name = str(data.get("name") or "")
+                if not name:
+                    raise ValueError("方案名称不能为空")
+                self._json_response(200, {"ok": True,
+                                         "deleted": delete_setup(name)})
                 return
             if self.path == "/api/relocate":
                 token = _progress_token(data)

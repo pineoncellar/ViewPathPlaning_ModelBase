@@ -1731,6 +1731,9 @@ function bindEvents() {
   });
   $("solveButton").addEventListener("click", solve);
   $("relocateButton").addEventListener("click", relocate);
+  $("saveSetup").addEventListener("click", saveCurrentSetup);
+  $("loadSetup").addEventListener("click", loadSelectedSetup);
+  $("deleteSetup").addEventListener("click", deleteSelectedSetup);
   $("relocateLimit").addEventListener("input", () => {
     $("errorLimit").value = $("relocateLimit").value;
     state.registration = null;
@@ -2088,11 +2091,199 @@ async function deleteHistoryRun(run) {
   }
 }
 
+/* ---------- saved setups ---------- */
+
+// A setup is the whole on-site configuration: the three meshes, the points picked on the
+// model, and the coordinates typed for them. It exists so restarting the server to change
+// the algorithm does not cost a re-import plus a re-pick - which is exactly the loop the
+// joint-model work runs in. The meshes travel as bytes because the browser has no path to
+// give; the server copies them beside the JSON.
+
+function setupName() {
+  return $("runName").value.trim() || $("progName").value.trim().toUpperCase();
+}
+
+function currentSetup() {
+  return {
+    point_count: state.pointCount,
+    cad_points_vehicle_mm: state.picked.slice(0, state.pointCount),
+    measured_points_mm: state.measured.slice(0, state.pointCount),
+    scan_face_axis: currentAxis(),
+    uframe: $("measureFrame").value,
+    error_limit_mm: $("errorLimit").value,
+    prog_name: $("progName").value.trim().toUpperCase(),
+    run_name: $("runName").value.trim(),
+    delivery_mode: $("scanMode").value,
+    fast: $("fastMode").value,
+    fast_no_occlusion: $("fastNoOcclusion").checked,
+    model_names: {
+      part: state.models.part ? state.models.part.sourceName : "",
+      support: state.models.support ? state.models.support.sourceName : "",
+      base: state.models.base ? state.models.base.sourceName : ""
+    }
+  };
+}
+
+async function refreshSetups(keep) {
+  const select = $("setupSelect");
+  if (!select) return;
+  const wanted = keep || select.value;
+  try {
+    const response = await fetch("/api/setup/list");
+    const body = await response.json();
+    const setups = (body && body.setups) || [];
+    select.replaceChildren();
+    if (!setups.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "（尚未保存方案）";
+      select.append(option);
+      return;
+    }
+    for (const setup of setups) {
+      const option = document.createElement("option");
+      option.value = setup.name;
+      const saved = setup.saved_at ? " · " + String(setup.saved_at).replace("T", " ").slice(0, 19) : "";
+      option.textContent = setup.name + " · " + (setup.models || []).length + " 模型 · P"
+        + (setup.point_count || 3) + saved;
+      select.append(option);
+    }
+    if (wanted && [...select.options].some((option) => option.value === wanted)) select.value = wanted;
+  } catch (_error) {
+    /* the panel keeps working without the list */
+  }
+}
+
+async function saveCurrentSetup() {
+  const name = setupName();
+  if (!name) {
+    toast("先填写「本次运行名称」或 LS 程序名，用它作为方案名");
+    return;
+  }
+  if (!state.models.part || !state.models.support) {
+    toast("至少导入零件与夹具之后再保存方案");
+    return;
+  }
+  $("saveSetup").disabled = true;
+  try {
+    await prepareMeshPayload();
+    const models = {};
+    for (const kind of ["part", "support", "base"]) {
+      if (state.models[kind] && state.models[kind].base64) {
+        models[kind] = { stl_base64: state.models[kind].base64 };
+      }
+    }
+    const response = await fetch("/api/setup/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, setup: currentSetup(), models })
+    });
+    const body = await response.json();
+    if (!response.ok || !body.ok) throw new Error(body.error || "保存方案失败");
+    await refreshSetups(name);
+    toast("方案「" + name + "」已保存");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    $("saveSetup").disabled = false;
+  }
+}
+
+async function loadSelectedSetup() {
+  const name = $("setupSelect").value;
+  if (!name) {
+    toast("先选择一个已保存的方案");
+    return;
+  }
+  $("loadSetup").disabled = true;
+  try {
+    const response = await fetch("/api/setup?name=" + encodeURIComponent(name));
+    const body = await response.json();
+    if (!response.ok || !body.ok) throw new Error(body.error || "读取方案失败");
+    const record = body.setup || {};
+    const saved = record.setup || {};
+    const models = record.models || {};
+
+    state.picked = [];
+    state.registration = null;
+    state.autoFace = false;
+    $("pickAxis").classList.remove("active");
+    for (const kind of ["part", "support", "base"]) {
+      const payload = models[kind];
+      if (!payload || !payload.stl_base64) continue;
+      const names = saved.model_names || {};
+      const fileName = names[kind] || (kind + ".stl");
+      const file = new File([base64ToBuffer(payload.stl_base64)], fileName,
+        { type: "model/stl" });
+      await loadModel(kind, file);
+    }
+    // Only now the picks: importing the part clears them and re-recommends the axis.
+    state.pointCount = Number(saved.point_count) === 4 ? 4 : 3;
+    document.querySelectorAll("[data-point-count]").forEach((button) => {
+      button.classList.toggle("active", Number(button.dataset.pointCount) === state.pointCount);
+    });
+    state.picked = (saved.cad_points_vehicle_mm || []).slice(0, state.pointCount);
+    const rows = saved.measured_points_mm || [];
+    state.measured = Array.from({ length: 4 }, (_, index) => {
+      const row = Array.isArray(rows[index]) ? rows[index] : [];
+      return [0, 1, 2].map((axis) => (row[axis] === undefined || row[axis] === null ? "" : String(row[axis])));
+    });
+
+    if (saved.scan_face_axis) $("scanAxis").value = saved.scan_face_axis;
+    if (saved.uframe !== undefined && saved.uframe !== null) {
+      $("measureFrame").value = String(Number(saved.uframe) === 0 ? 0 : 1);
+    }
+    if (saved.error_limit_mm) {
+      $("errorLimit").value = saved.error_limit_mm;
+      $("relocateLimit").value = saved.error_limit_mm;
+    }
+    if (saved.prog_name) $("progName").value = saved.prog_name;
+    if (saved.run_name) $("runName").value = saved.run_name;
+    if (saved.delivery_mode) $("scanMode").value = saved.delivery_mode;
+    $("fastMode").value = saved.fast === "fast" ? "fast" : "accurate";
+    $("fastNoOcclusion").disabled = $("fastMode").value !== "fast";
+    $("fastNoOcclusion").checked = $("fastMode").value === "fast" && Boolean(saved.fast_no_occlusion);
+
+    updateAxisBadge("方案：" + (saved.scan_face_axis ? AXIS_LABELS[saved.scan_face_axis] : "未记录"));
+    renderDatumRows();
+    registrationRequest += 1;
+    window.clearTimeout(registrationTimer);
+    fitView();
+    updateSolveAvailability();
+    scheduleRegistrationCheck();
+    toast("已读取方案「" + name + "」");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    $("loadSetup").disabled = false;
+  }
+}
+
+async function deleteSelectedSetup() {
+  const name = $("setupSelect").value;
+  if (!name) {
+    toast("先选择一个已保存的方案");
+    return;
+  }
+  try {
+    const response = await fetch("/api/setup/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    const body = await response.json();
+    if (!response.ok || !body.ok) throw new Error(body.error || "删除方案失败");
+    await refreshSetups("");
+    toast(body.deleted ? "方案「" + name + "」已删除" : "方案「" + name + "」不存在");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
 // Defaults come from the configuration the server will actually run, so the screen and
 // the plan cannot disagree about which deliverable is being asked for. The page keeps
 // working if the endpoint is unavailable: its own default stays in place.
-async function applyServerDefaults() {
-  try {
+async function applyServerDefaults() {  try {
     const response = await fetch("/api/config");
     if (!response.ok) return;
     const config = await response.json();
@@ -2126,3 +2317,4 @@ function init() {
 window.__scanplan = { state, glState, camera, projectPoint, pickScene };
 init();
 applyServerDefaults();
+refreshSetups();
