@@ -94,7 +94,8 @@ uv run scanplan plan --station input/<工位>.json \
 ```
 
 覆盖率目标本身是现场旋钮，可以逐次覆盖：`--coverage-target 87.5`，或 `--coverage-target none`
-跑到耗尽（对应配置里的 `target.coverage_target_pct`，默认 90.0）。
+跑到耗尽（对应配置里的 `target.coverage_target_pct`，默认 90.0）。网页端第 03 步有同名的
+「覆盖率目标（%）」输入框和「不设上限」勾选框，语义与这个参数一致。
 
 ## 候选池与扫描带侧的三道门
 
