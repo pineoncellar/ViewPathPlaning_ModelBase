@@ -107,6 +107,7 @@
               <span class="inline-hint" style="margin:0">超过该值将拒绝规划</span>
             </div>
             <p class="inline-hint">在下方 3D 模型上依次点击零件表面的定位特征；右键或「撤销最后一点」可回退。选点完成后，在模型下方的表格中填写对应的现场坐标。</p>
+            <p class="inline-hint">现场坐标会记在本机浏览器里，下次打开页面时自动回填上一次的输入，确认与本次定位点对应即可；不需要时可点表格上方的「清空现场坐标」。</p>
             <p class="inline-hint">定位与现场坐标填写完整后，在第 3 个模块「路径规划」中填写 LS 程序名并开始规划。</p>
           </section>
 
@@ -147,6 +148,12 @@
             <span><i class="fixture"></i>夹具</span><span><i class="base"></i>底座</span><span><i class="path"></i>扫描路径</span>
           </div>
           <div class="canvas-note"><span id="pickInstruction">先在 3D 模型上点选定位点；点击零件表面即可拾取。</span><span id="canvasCounter">0 / 3</span></div>
+
+          <div class="datum-memory" id="datumMemoryNote" hidden>
+            <span class="datum-memory-icon">↺</span>
+            <span id="datumMemoryText">已载入上次填写的现场坐标。</span>
+            <button class="secondary-button" id="clearDatumMemory" type="button">清空现场坐标</button>
+          </div>
 
           <table class="datum-table" aria-label="定位点坐标">
             <thead><tr><th>点</th><th>CAD / 整车坐标 (mm)</th><th>现场 X</th><th>现场 Y</th><th>现场 Z</th></tr></thead>

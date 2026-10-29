@@ -44,8 +44,10 @@ def summary_lines(report: dict) -> list[str]:
                      f"{strokes.get('delivered_strokes') or strokes['candidates']} delivered "
                      f"of {strokes['candidates']} candidates, swept coverage "
                      f"{strokes['swept_coverage_pct']:.2f}%")
-        for violation in path.get("constraint_violations", []):
-            lines.append(f"CONSTRAINT             {violation}")
+    # Violations are printed whatever the deliverable was: "the joint gate removed four
+    # sweeps" must not be hidden because the stroke stage happened to lose the ranking.
+    for violation in path.get("constraint_violations", []):
+        lines.append(f"CONSTRAINT             {violation}")
     kinematics = report.get("kinematics", {})
     lines += [
         f"ray backend            {report['runtime']['ray_backend']}",
@@ -62,7 +64,13 @@ def summary_lines(report: dict) -> list[str]:
             f"joints                 min margin {kinematics.get('min_margin_deg')} deg, "
             f"worst step {kinematics.get('max_step_deg')} deg "
             f"(limit {kinematics.get('max_step_deg_limit')}), "
+            f"worst J6 step {kinematics.get('max_j6_step_deg')} deg, "
             f"branches {kinematics.get('branch_histogram')}")
+        if kinematics.get("points_without_solution"):
+            lines.append(
+                f"JOINT                  {kinematics['points_without_solution']} delivered "
+                "point(s) have no joint solution inside the usable envelope - the .LS "
+                "export refuses them")
     budget = report.get("budget", {})
     if budget.get("max_points") is not None:
         lines.append(f"budget                 {budget.get('verdict')} at "

@@ -112,6 +112,39 @@ def test_the_kinematics_block_is_present_and_off_by_default(clamped_plate, quick
     assert result.report["evaluation"]["rejected_kinematics"] == 0
 
 
+def test_the_shipped_gate_never_delivers_a_point_the_arm_cannot_hold(clamped_plate):
+    """The shipped configuration runs the joint gate, so nothing unreachable is delivered.
+
+    This plate sits at the robot's own origin, i.e. inside its shoulder envelope, so the
+    honest answer here is "nothing can be scanned" - and an empty deliverable is what the
+    gate must produce, not a program whose points ROBOGUIDE rejects one by one.
+    """
+    from dataclasses import replace as _replace
+
+    from scanplan.config import load_config
+    from scanplan.kinematics import Robot
+
+    shipped = load_config()
+    assert shipped.robot.enabled is True
+    quick = _replace(shipped, scanner=_replace(shipped.scanner, refine_rounds=0))
+    result = plan(clamped_plate.station, quick, face="upper")
+    block = result.report["kinematics"]
+    assert block["enabled"] is True
+    assert block["points_without_solution"] == 0
+    arm = Robot(quick.robot)
+    if not result.viewpoints:
+        # Nothing deliverable is a legitimate answer here (the plate sits inside the arm's
+        # shoulder envelope); what must NOT happen is a non-empty delivery with no joint
+        # evidence. The gate now filters candidates BEFORE the pool cap, so an empty pool
+        # is the normal shape of this outcome.
+        assert result.report["coverage_pct"] == pytest.approx(0.0)
+        assert result.report["viewpoints"] == 0
+    for viewpoint in result.viewpoints:
+        assert viewpoint.joints_deg is not None, (
+            "a delivered point without joints is exactly what the gate exists to prevent")
+        assert arm.feasible(viewpoint.joints_deg)
+
+
 def test_the_target_excludes_the_clamped_region_but_not_the_opposite_face(clamped_plate,
                                                                         quick_cfg):
     result = plan(clamped_plate.station, quick_cfg, face="upper")
@@ -342,8 +375,7 @@ def test_the_3d_view_carries_the_planned_viewpoints(clamped_plate, quick_cfg, tm
 
 def test_the_3d_view_carries_the_program_order_of_the_delivered_points(clamped_plate,
                                                                       quick_cfg):
-    from scanplan.path import (ROLE_COVERAGE, ROLE_REORIENT, ROLE_RETRACT,
-                               ROLE_TRAVERSE)
+    from scanplan.path import ROLE_COVERAGE, ROLE_REORIENT, ROLE_RETRACT, ROLE_TRAVERSE
     from scanview.payload import build_payload
     result = plan(clamped_plate.station, quick_cfg, face="upper")
     records = build_payload(part=clamped_plate.station.part,

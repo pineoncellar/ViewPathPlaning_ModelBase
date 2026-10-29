@@ -15,9 +15,9 @@ import numpy as np
 import pytest
 
 from scanplan.config import RobotParams
-from scanplan.kinematics import Robot, rotation_angle_deg
+from scanplan.kinematics import Robot, rotation_angle_deg, turn_digits
 
-SPREAD = np.array([[-120.0, 120.0], [-50.0, 100.0], [-80.0, 80.0],
+SPREAD = np.array([[-120.0, 120.0], [-50.0, 30.0], [-80.0, 80.0],
                    [-180.0, 180.0], [-100.0, 100.0], [-180.0, 180.0]])
 
 
@@ -100,21 +100,49 @@ def test_config_string_reads_the_joint_values(robot):
     assert positive.endswith(", 0, 0, 0")
 
 
-def test_turn_counts_are_reported_for_the_wrist_axes(robot):
-    assert robot.config_string((0, 0, 0, 370, 30, -370), "N", "U").endswith(", 0, 1, -2")
+def test_the_wrist_letter_can_be_pinned_for_a_controller_that_refuses_one(robot):
+    """This cell's ROBOGUIDE refuses `N U F` outright (ASBN-023), so the letter is pinned.
+
+    The measured rule (`T` for J5 < 0) stays available as `auto`; pinning costs nothing
+    geometrically because the two wrist branches are the same TCP pose.
+    """
+    auto = RobotParams(**{**robot.params.__dict__, "config_wrist_letter": "auto"})
+    assert Robot(auto).config_string((0, 0, 0, 0, 40.0, 0), "N", "U").startswith("N U F")
+    assert Robot(auto).config_string((0, 0, 0, 0, -40.0, 0), "N", "U").startswith("N U T")
+    pinned = RobotParams(**{**robot.params.__dict__, "config_wrist_letter": "T"})
+    assert Robot(pinned).config_string((0, 0, 0, 0, 40.0, 0), "N", "U").startswith("N U T")
+    assert Robot(pinned).config_string((0, 0, 0, 0, -40.0, 0), "N", "U").startswith("N U T")
+
+
+def test_the_turn_digits_stay_zero_inside_the_axis_travel(robot):
+    """A negative turn digit is not a FANUC CONFIG: ROBOGUIDE refuses to load the program.
+
+    The old rule was `floor(j / 360)`, so J1 = -102 deg was written as `-1` and the 2026-10-27
+    delivery stopped at import with ASBN-009 "Configuration error" - the whole file, not the
+    one point. A turn means a revolution past the axis's own range, not a negative angle.
+    """
+    assert robot.config_string((-102.0, 0, 0, 0, 30.0, 0), "N", "U").endswith(", 0, 0, 0")
+    assert robot.config_string((0, 0, 0, 226.0, 30.0, -300.0), "N", "U").endswith(
+        ", 0, 0, 0")
+    # ... and a genuinely wound axis is flagged, not silently mis-written
+    assert turn_digits(-370.0) == -1
+    assert turn_digits(370.0) == 1
 
 
 def test_wraps_accepts_the_equivalent_reading(robot):
-    """370 degrees and 10 degrees are the same physical J6, so both must be offered."""
+    """370 degrees and 10 degrees are the same physical J6, and both readings are legal.
+
+    The usable envelope is the datasheet's +-360 for J4/J6 (the reserve is applied as a
+    margin, not by shrinking the envelope), so 370 is offered as both -350 and 10.
+    """
     assert robot.wraps(5, 370.0) == pytest.approx([-350.0, 10.0])
-    # J4 spans two full turns, so 370 is already legal there as written.
-    assert 370.0 in robot.wraps(3, 370.0)
+    assert robot.wraps(3, 370.0) == pytest.approx([-350.0, 10.0])
 
 
 def test_margins_prefer_the_roomiest_equivalent_reading(robot):
-    """J4 spans +-720, so the reading nearest the middle of that range wins."""
+    """J4 is +-360, so the 200 reading has 160 deg of room and the -160 one has 200."""
     roomy = robot.margins((0, 0, 0, 200.0, 30.0, 0))[3]
-    assert roomy == pytest.approx(560.0)
+    assert roomy == pytest.approx(200.0)
 
 
 def test_a_value_outside_every_reading_has_no_margin(robot):
@@ -125,12 +153,33 @@ def test_a_value_outside_every_reading_has_no_margin(robot):
 def test_j5_margin_prefers_a_mid_band_angle_over_zero(robot):
     """J5 = 0 is the wrist singularity, so the middle of the mechanical range is worst."""
     assert robot.j5_margin((0, 0, 0, 0, 0.0, 0)) < 0.0
-    assert robot.j5_margin((0, 0, 0, 0, 64.0, 0)) > robot.j5_margin((0, 0, 0, 0, 110.0, 0))
-    assert robot.j5_margin((0, 0, 0, 0, 110.0, 0)) > 0.0
+    assert robot.j5_margin((0, 0, 0, 0, 64.0, 0)) > robot.j5_margin((0, 0, 0, 0, 100.0, 0))
+    assert robot.j5_margin((0, 0, 0, 0, 100.0, 0)) > 0.0
 
 
-def test_feasible_rejects_a_point_sitting_on_the_soft_limit(robot):
-    on_limit = (0.0, -60.0, 0.0, 0.0, 64.0, 0.0)
+def test_the_usable_envelope_is_the_datasheet_and_the_reserve_is_a_margin(robot):
+    """No percentage any more: the envelope is the limits, the reserve is `joint_margin_deg`.
+
+    90 % of the range is a different reserve on every axis (18.5 deg on J1, 6.8 on J2, 36 on
+    J4) and nothing about the machine justifies that; a flat 5-10 deg is what the site asked
+    for on 2026-10-28.
+    """
+    assert robot.params.limits_usage_frac == pytest.approx(1.0)
+    assert robot.params.joint_margin_deg == pytest.approx(5.0)
+    assert robot.limits[0] == pytest.approx((-185.0, 185.0))
+    assert robot.limits[1] == pytest.approx((-60.0, 46.0))
+    assert robot.limits[2] == pytest.approx((-122.0, 190.0))
+    assert robot.limits[3] == pytest.approx((-360.0, 360.0))
+    assert robot.limits[4] == pytest.approx((-125.0, 125.0))
+    assert robot.limits[5] == pytest.approx((-360.0, 360.0))
+    # the reserve is what `feasible` enforces inside that envelope
+    assert robot.feasible((0.0, 40.0, 0.0, 0.0, 64.0, 0.0))          # 6 deg from +46
+    assert not robot.feasible((0.0, 43.0, 0.0, 0.0, 64.0, 0.0))      # 3 deg from +46
+    assert not robot.feasible((0.0, 0.0, 0.0, 0.0, 121.0, 0.0))      # 4 deg from +125
+
+
+def test_feasible_rejects_a_point_sitting_on_the_usable_limit(robot):
+    on_limit = (0.0, robot.limits[1][0], 0.0, 0.0, 64.0, 0.0)
     assert robot.margins(on_limit)[1] == pytest.approx(0.0)
     assert not robot.feasible(on_limit)
 
@@ -145,12 +194,21 @@ def test_unreachable_point_has_no_solutions(robot):
 
 def test_limits_source_says_which_envelope_is_in_force(robot):
     """The report has to be able to say "soft" - pretending the datasheet is in force is
-    exactly how a simulation passes and the machine alarms."""
-    assert robot.limits_source.startswith("soft")
+    exactly how a simulation passes and the machine alarms - and it has to name the share,
+    because 90 % of the travel is not the same claim as the whole envelope."""
     params = RobotParams.disabled()
-    same = RobotParams(**{**params.__dict__, "enabled": True, "soft_limits_deg":
-                          params.mechanical_limits_deg})
-    assert Robot(same).limits_source == "mechanical"
+    # the controller's J2 floor (-60) is narrower than the datasheet's (-90), so the
+    # intersection is in force even with no percentage shrink
+    assert robot.limits_source.startswith("soft")
+    assert "5 deg reserved" in robot.limits_source
+    same = RobotParams(**{**params.__dict__, "enabled": True,
+                          "soft_limits_deg": params.mechanical_limits_deg})
+    assert Robot(same).limits_source.startswith("mechanical")
+    shared = RobotParams(**{**params.__dict__, "enabled": True, "limits_usage_frac": 0.9})
+    assert "central 90%" in Robot(shared).limits_source
+    assert Robot(shared).limits[4] == pytest.approx((-112.5, 112.5))
+    no_margin = RobotParams(**{**params.__dict__, "enabled": True, "joint_margin_deg": 0.0})
+    assert Robot(no_margin).limits_source == "soft (intersected with mechanical)"
 
 
 def test_rotation_angle_is_zero_for_identical_frames(robot):

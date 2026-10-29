@@ -14,7 +14,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from scanplan.candidates import aim_indices, dedupe, generate, ladder, refine
+from scanplan.candidates import _cap, aim_indices, dedupe, generate, ladder, refine
 from scanplan.config import load_config
 from scanplan.scanner_model import ScannerPose
 from scanplan.target_surface import sample_face
@@ -39,8 +39,15 @@ def grid_samples(mesh, grid_mm):
 
 
 def expected_ladder_length(params):
-    """Poses one aim point yields: every distance, tilt and roll - the roll always counts."""
-    return len(params.distances_mm) * len(params.tilts_deg) * len(params.rolls_deg)
+    """Poses one aim point yields: every distance, azimuth, tilt and roll.
+
+    The zero tilt repeats across azimuths - there is only one head-on axis - so it counts
+    once: `1 + azimuths * tilted` axes per distance.
+    """
+    azimuths = max(1, int(params.tilt_azimuths))
+    tilted = [value for value in params.tilts_deg if value != 0.0]
+    axes = (1 if len(tilted) < len(params.tilts_deg) else 0) + azimuths * len(tilted)
+    return len(params.distances_mm) * axes * len(params.rolls_deg)
 
 
 def test_every_aim_point_gets_the_full_distance_tilt_roll_ladder(
@@ -92,6 +99,45 @@ def test_the_two_rolls_cover_different_samples_on_a_wide_target(params_placehold
                 for pose in head_on]
     assert coverage[0] != coverage[1]
     assert coverage[0] - coverage[1] and coverage[1] - coverage[0]
+
+
+def test_the_tilt_fan_sweeps_the_full_circle(params_placeholder):
+    """A one-plane ladder approaches each point from two directions; the fan from all of them.
+
+    This is what recovered the coverage: 91 % of the samples the joint gate had left
+    uncovered on 2026-10-28 had a feasible pose somewhere round the normal, so the pool -
+    not the arm - was the limit.
+    """
+    poses = ladder(np.zeros(3), np.array([0.0, 0.0, 1.0]), params_placeholder)
+    tilted = [pose.axis for pose in poses if pose.axis[2] > -0.99]
+    # rounded before the modulo: a -1e-17 radian component would otherwise land on 360.0
+    azimuths = sorted({round(float(np.degrees(np.arctan2(axis[1], axis[0]))), 1) % 360.0
+                       for axis in tilted})
+    assert len(azimuths) == 2 * max(1, int(params_placeholder.tilt_azimuths))
+    assert azimuths[0] == pytest.approx(0.0, abs=1e-6)
+    assert max(abs(float(np.degrees(np.arccos(abs(axis[2])))) - 30.0)
+               for axis in tilted) < 1e-6
+
+
+def test_a_joint_filter_is_applied_before_the_cap(flat_plate, params_placeholder):
+    """Filtering afterwards would spend the budget on poses the arm can never hold."""
+    points, normals = grid_samples(flat_plate, 100.0)
+    posed = replace(params_placeholder, aim_grid_mm=10.0)
+    poses = generate(points, normals, posed, seed=0, max_candidates=50,
+                     keep=lambda pose: pose.roll_deg == 0.0)
+    assert poses
+    assert {pose.roll_deg for pose in poses} == {0.0}
+
+
+def test_the_cap_keeps_every_aim_point_represented():
+    """A uniform random cut leaves whole regions with no candidate at all."""
+    groups = [[ScannerPose(np.array([float(index), 0.0, 0.0]),
+                           np.array([0.0, 0.0, -1.0]), float(step)) for step in range(10)]
+              for index in range(3)]
+    picked = _cap(groups, 6)
+    assert len(picked) == 6
+    assert [sum(1 for pose in picked if pose.position[0] == index)
+            for index in range(3)] == [2, 2, 2]
 
 
 def test_the_tilt_ladder_leans_both_ways_about_the_normal(params_placeholder):

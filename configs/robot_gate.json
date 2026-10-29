@@ -1,6 +1,8 @@
 {
   "_comment": [
-    "Turn the joint-limit gate on, keeping everything else at the shipped defaults.",
+    "The joint-limit gate, spelled out as its own profile.",
+    "Since 2026-10-27 this is also the SHIPPED default (configs/scanner_trackscan49.json),",
+    "so this file is kept as the explicit, self-documenting way to ask for it.",
     "Design: docs/2026-10-22-j5-overtravel-kinematics-gate-design.md (sections 4, 5, 12).",
     "",
     "  scanplan plan --station input/station_fixed.json --config configs/robot_gate.json --out output/robot",

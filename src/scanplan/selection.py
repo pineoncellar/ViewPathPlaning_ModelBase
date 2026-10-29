@@ -95,6 +95,20 @@ def _pick(score: np.ndarray, gains: np.ndarray, tie) -> int:
     return int(close[int(np.argmax(preferences[close]))])
 
 
+def _empty_selection(cov: CoverageResult, target_area: float) -> Selection:
+    """The answer when the candidate pool is empty: deliver nothing, invent nothing.
+
+    Reachable when the joint gate rejects every pose the generator offered - a station the
+    arm simply cannot scan. That is a legitimate outcome and has to come back as an empty
+    plan with the counters that explain it, not as `argmax of an empty sequence` from deep
+    inside the greedy pass.
+    """
+    return Selection(chosen=[], greedy=[], repair=[],
+                     covered=np.zeros(cov.n_targets, dtype=bool), curve=[],
+                     coverage_area_mm2=0.0, target_area_mm2=float(target_area),
+                     sources=np.array([], dtype=object))
+
+
 def select(cov: CoverageResult, area_mm2=None, *,
            coverage_target_pct: float | None = None,
            tie=None,
@@ -127,6 +141,10 @@ def select(cov: CoverageResult, area_mm2=None, *,
     if len(area) != cov.n_targets:
         raise ValueError("one area per target sample is required")
     target_area = float(cov.target_area_mm2)
+    if matrix.shape[0] == 0:
+        say("  selection: the candidate pool is EMPTY - every pose was rejected before "
+            "selection (joint gate, clearance or occlusion), so nothing is delivered")
+        return _empty_selection(cov, target_area)
 
     def covered_pct() -> float:
         return 100.0 * float(area[covered].sum()) / target_area if target_area > 0.0 else 0.0
@@ -219,6 +237,9 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
     if len(banned) != matrix.shape[0]:
         raise ValueError("one exclusion flag per candidate is required")
     target_area = float(cov.target_area_mm2)
+    if matrix.shape[0] == 0:
+        say("  selection: the candidate pool is EMPTY - nothing can be delivered")
+        return _empty_selection(cov, target_area)
 
     def covered_pct() -> float:
         return 100.0 * float(area[covered].sum()) / target_area if target_area > 0.0 else 0.0

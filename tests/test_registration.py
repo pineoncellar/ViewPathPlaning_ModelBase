@@ -120,10 +120,16 @@ def test_ls_registers_viewpoints_to_robot_base(tmp_path, viewpoints_json, capsys
         ],
     }), encoding="utf-8")
     output = tmp_path / "registered"
+    # This test is about the frame math. The synthetic viewpoints are not arm-reachable,
+    # and under UFRAME 0 the export now audits them, so the gate is switched off here -
+    # `test_roboguide_export.py` covers the refusal itself.
+    gate_off = tmp_path / "no_gate.json"
+    gate_off.write_text(json.dumps({"robot": {"enabled": False}}), encoding="utf-8")
 
     assert main([
         "ls", "--viewpoints", str(viewpoints_json), "--prog-name", "REGISTERED",
-        "--registration", str(registration_path), "--out", str(output),
+        "--registration", str(registration_path), "--config", str(gate_off),
+        "--out", str(output),
     ]) == 0
 
     program = (output / "REGISTERED.LS").read_text(encoding="ascii")

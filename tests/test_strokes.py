@@ -14,6 +14,7 @@ Every fixture is synthetic: customer CAD must never be committed.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 
 import numpy as np
@@ -24,11 +25,14 @@ from scanplan.config import load_config
 from scanplan.coverage import CoverageResult
 from scanplan.path import (
     LEVEL_ONE_CORNER,
+    LEVEL_SAFE_PLANE,
     LEVEL_STRAIGHT,
+    LEVEL_TWO_CORNERS,
     ROLE_COVERAGE,
     ROLE_REORIENT,
     ROLE_RETRACT,
     ROLE_TRAVERSE,
+    PathPlan,
     PathPoint,
     build_path,
     order_strokes,
@@ -236,6 +240,170 @@ def test_connector_level_zero_needs_two_identical_poses_and_a_clear_line(bench, 
     assert LEVEL_STRAIGHT not in mixed.connector_levels
 
 
+def test_a_connector_with_no_clear_route_goes_out_through_the_safe_plane(
+        monkeypatch, cfg):
+    """The plane is the last resort before a sweep is dropped, not only an L3 feature.
+
+    Every local route uses one lift for both ends, retracted along each head's own axis. On
+    a pocket that lift has to grow until the horizontal traverse clears the wall, and a lift
+    that big puts the waiting corners out of the arm's reach - so both local routes fail and
+    the sweep used to be dropped. The plane route waits at a fixed height that is both above
+    the wall and reachable, which is the case the fallback exists for.
+
+    Clearance is faked, because the geometry is not the point here: a segment keeps it when
+    it runs along the head's axis (travel under 50 mm horizontally), and a horizontal transit
+    only keeps it above the plane - which is exactly the property the plane is chosen for.
+    """
+    import scanplan.path as path_module
+
+    normal = np.array([0.0, 0.0, 1.0])
+    # off the ladder of retract lifts (50 mm x 1, 2, 3, 4, 6, 8), so a local route cannot
+    # land on the plane by accident and look like the plane route
+    plane = PLATE_TOP_MM + 550.0
+    # the arm cannot hold a corner higher than this, so the lift a local route would need to
+    # get over the wall is out of reach - the plane is the only height that is both clear of
+    # the wall and reachable
+    reach_limit = plane + 40.0
+    asked: list[str] = []
+
+    def fake_margin(first, second, _cfg, _station, _model, visible=None):
+        asked.append(str(getattr(first, "role", "")))
+        top = np.asarray(second.position, dtype=float)
+        bottom = np.asarray(first.position, dtype=float)
+        flat = float(np.linalg.norm((top - bottom)[:2]))
+        if flat <= 50.0:
+            return 100.0, True               # retract / dive along the head's own axis
+        above = min(float(normal @ bottom), float(normal @ top))
+        return (100.0, True) if above >= plane - 1e-6 else (-30.0, True)
+
+    class FakeGate:
+        active = True
+
+        @staticmethod
+        def check(position, axis, roll_deg):
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=float(normal @ np.asarray(position)) <= reach_limit)
+
+    monkeypatch.setattr(path_module, "_segment_margin", fake_margin)
+    previous = PathPoint(position=np.array([0.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                         role=ROLE_COVERAGE, source="greedy", stroke_id=0)
+    entry = PathPoint(position=np.array([400.0, 0.0, PLATE_TOP_MM + 300.0]),
+                      axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                      role=ROLE_COVERAGE, source="greedy", stroke_id=1)
+    plan = PathPlan(points=[])
+    route = path_module._connector(previous, entry, cfg, plan, station=None, model=None,
+                                   strict=True, normal=normal, plane=plane, kin=FakeGate())
+    assert route is not None, "a blocked sweep must not be dropped while the plane is open"
+    assert plan.connector_levels == {LEVEL_SAFE_PLANE: 1}
+    assert asked, "the local routes have to be tried before the plane"
+    assert [point.role for point in route] == [ROLE_RETRACT, ROLE_TRAVERSE]
+    # both waiting points sit on the plane, so the traverse between them stays outside
+    for point in route:
+        assert float(normal @ point.position) == pytest.approx(plane, abs=1e-6)
+    assert plan.violations == []
+
+    # without a plane normal the local routes are all there is, and the only straight line
+    # between the two poses runs BELOW the wall (-30 mm): the connector is refused, because
+    # a transit through the part is not a route. The evidence is still booked.
+    blocked = PathPlan(points=[])
+    without = path_module._connector(previous, entry, cfg, blocked,
+                                     station=None, model=None, strict=True,
+                                     kin=FakeGate())
+    assert without is None
+    assert any("is refused" in line and "30.0 mm inside" in line
+               for line in blocked.violations)
+
+
+def test_a_route_the_arm_cannot_hold_falls_back_to_a_direct_move(monkeypatch, cfg):
+    """Joint feasibility is not negotiable, but the sweep is not lost over it either.
+
+    `stroke.hard_gate: false` means "deliver a sweep whose transit passes close to the
+    fixture and list the route" - it does NOT mean "deliver a corner the arm cannot reach".
+    When no corner on any route is reachable, both ENDS are still points the gate accepted,
+    so the move between them is a direct one: executable, and recorded on its own line.
+    Refusing it instead threw away 4 of 7 sweeps and 15 of 17 poses on the 2026-10-28
+    station (95.9% selected becoming 51.4% delivered).
+    """
+    import scanplan.path as path_module
+
+    def clear_margin(first, second, _cfg, _station, _model, visible=None):
+        return 7.5, True
+
+    class Unreachable:
+        active = True
+
+        @staticmethod
+        def check(position, axis, roll_deg):
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=False)
+
+    monkeypatch.setattr(path_module, "_segment_margin", clear_margin)
+    previous = PathPoint(position=np.array([0.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                         role=ROLE_COVERAGE, source="greedy", stroke_id=0)
+    entry = PathPoint(position=np.array([400.0, 0.0, PLATE_TOP_MM + 300.0]),
+                      axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                      role=ROLE_COVERAGE, source="greedy", stroke_id=1)
+    plan = PathPlan(points=[])
+    route = path_module._connector(previous, entry, cfg, plan, station=None, model=None,
+                                   strict=False, kin=Unreachable())
+    assert route == []                                  # no corner, straight there
+    # the failed L2 attempt is still booked, so the report shows both what was tried and
+    # what was finally written
+    assert plan.connector_levels == {LEVEL_TWO_CORNERS: 1, LEVEL_STRAIGHT: 1}
+    assert any("goes straight" in line and "7.5 mm" in line
+               for line in plan.violations)
+
+
+def test_a_straight_fallback_that_hits_the_part_is_refused_under_the_hard_gate(
+        monkeypatch, cfg):
+    """Two poses 800 mm apart on a curved surface are joined by a line through it.
+
+    The direct move exists because both ends are legal, but "a move a programmer would
+    write by hand" means one that MISSES the part. On the 2026-10-29 station the fallback
+    was the only thing between a 97.4% plan and a transit 28 mm inside the blank: a
+    coverage hole the report can name is worth more than a transit ROBOGUIDE rejects.
+    """
+    import scanplan.path as path_module
+
+    def buried(first, second, _cfg, _station, _model, visible=None):
+        return -28.2, True
+
+    class Unreachable:
+        active = True
+
+        @staticmethod
+        def check(position, axis, roll_deg):
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=False)
+
+    monkeypatch.setattr(path_module, "_segment_margin", buried)
+    previous = PathPoint(position=np.array([0.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                         role=ROLE_COVERAGE, source="greedy", stroke_id=0)
+    entry = PathPoint(position=np.array([400.0, 0.0, PLATE_TOP_MM + 300.0]),
+                      axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                      role=ROLE_COVERAGE, source="greedy", stroke_id=1)
+    plan = PathPlan(points=[])
+    assert path_module._connector(previous, entry, cfg, plan, station=None, model=None,
+                                  strict=True, kin=Unreachable()) is None
+    assert any("is refused" in line and "28.2 mm inside" in line
+               for line in plan.violations)
+    # the evidence of what was tried is still booked, so the report can explain the drop
+    assert plan.connector_levels == {LEVEL_TWO_CORNERS: 1, LEVEL_STRAIGHT: 1}
+
+    # the same line with clearance is still delivered: thin is a judgement call, buried is
+    # not, and the legacy profile (no hard gate) keeps the old lenient behaviour
+    monkeypatch.setattr(path_module, "_segment_margin",
+                        lambda *a, **k: (7.5, True))
+    assert path_module._connector(previous, entry, cfg, PathPlan(points=[]), station=None,
+                                  model=None, strict=True, kin=Unreachable()) == []
+    monkeypatch.setattr(path_module, "_segment_margin", buried)
+    assert path_module._connector(previous, entry, cfg, PathPlan(points=[]), station=None,
+                                  model=None, strict=False, kin=Unreachable()) == []
+
+
 def test_the_transition_poses_are_only_the_moves_between_sweeps(bench, cfg):
     model = ScannerModel(cfg.scanner)
     strokes = [horizontal_stroke(-150.0, 150.0, y=0.0),
@@ -413,8 +581,14 @@ def test_exporting_a_stroke_plan_refuses_to_re_sort(tmp_path):
                             speed="100 mm/sec", termination="CNT0", order=False)
     assert contract["ordering"]["method"] == "as delivered by the planner"
     text = (tmp_path / "kept" / "SCAN_A.LS").read_text(encoding="ascii")
-    assert text.count("L P[") == len(points)
-    assert "CNT0" in text and "FINE" not in text
+    # The head scans while it travels, so the move that goes down a stroke is interpolated
+    # (L) with CNT0 so it does not stop at every sample. The move INTO a stroke scans
+    # nothing - the head arrives at its first pose and only then starts sweeping - so it is
+    # written as a joint move, which is also the only honest way to turn the wrist.
+    moves = re.findall(r"^\s*\d+:([LJ]) P\[(\d+)\]", text, re.MULTILINE)
+    assert moves == [("J", "1"), ("L", "2"), ("J", "3"), ("L", "4")]
+    assert "L P[2] 100 mm/sec CNT0" in text
+    assert "J P[1] 50% FINE" in text
     assert contract["program"]["termination"] == "CNT0"
     assert contract["program"]["strokes"] == [0, 1]
 

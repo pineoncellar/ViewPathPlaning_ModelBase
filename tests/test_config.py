@@ -67,7 +67,10 @@ def test_a_typo_in_a_key_name_is_rejected(tmp_path):
 
 def test_the_acceptance_threshold_is_a_configurable_nullable_setting(tmp_path):
     cfg = load_config()
-    assert cfg.target.coverage_target_pct == 99.0
+    # 97 is the shipped bar: it is the highest target the MIXED deliverable (sweeps plus
+    # poses) reaches on the site station - 97.75% in 28 corners, the shape of the program
+    # that ran on the cell. A 99% bar buys 1.3 more points for 43 extra corners and no sweep.
+    assert cfg.target.coverage_target_pct == 97.0
     assert cfg.target.delivery_mode == "path"
     # null is the switch back to "run until nothing new is covered", so it must survive
     # the loader rather than being coerced
@@ -94,6 +97,10 @@ def test_the_point_count_knobs_are_validated(tmp_path):
         ("stroke", "connector_level", 3, "connector_level"),
         ("stroke", "transition_corners_estimate", -1.0, "transition_corners_estimate"),
         ("stroke", "order_axis_weight_mm_per_deg", -1.0, "order_axis_weight"),
+        # a CONFIG family is three letters; anything else is a typo that would silently
+        # open the gate to every family
+        ("robot", "allowed_configs", ["NUT"], "allowed_configs"),
+        ("robot", "allowed_configs", ["X U T"], "allowed_configs"),
     ):
         bad = tmp_path / "bad.json"
         bad.write_text(json.dumps({section: {key: value}}), encoding="utf-8")
@@ -116,6 +123,11 @@ def test_the_shipped_profiles_are_all_loadable():
     assert legacy.target.coverage_target_pct is None
     assert legacy.stroke.connector_level == 2
     assert legacy.stroke.order_axis_weight_mm_per_deg == 0.0
+    # Sweeps are what "stroke mode" means: the shipped profile delivers them even when the
+    # pose-only reference scores better on corners, and the historical profile keeps the
+    # behaviour it was measured with (poses when they rank better).
+    assert load_config().stroke.require_sweeps is True
+    assert legacy.stroke.require_sweeps is False
 
 
 def test_a_runtime_override_is_validated_like_a_file():
@@ -124,7 +136,7 @@ def test_a_runtime_override_is_validated_like_a_file():
     cfg = load_config()
     tightened = override(cfg, target={"coverage_target_pct": 97.5})
     assert tightened.target.coverage_target_pct == pytest.approx(97.5)
-    assert cfg.target.coverage_target_pct == 99.0          # the original is untouched
+    assert cfg.target.coverage_target_pct == 97.0          # the original is untouched
     with pytest.raises(ValueError, match="coverage_target_pct"):
         override(cfg, target={"coverage_target_pct": 0.0})
 
@@ -209,21 +221,41 @@ def test_a_budget_below_two_points_is_refused(tmp_path, budget, match):
 # -- the robot block ----------------------------------------------------------------------
 
 
-def test_the_robot_block_is_off_by_default_and_fully_typed():
+def test_the_robot_block_is_on_by_default_and_fully_typed():
+    """A program whose points the arm cannot hold is not a plan, so the gate ships ON."""
     cfg = load_config()
-    assert cfg.robot.enabled is False
+    assert cfg.robot.enabled is True
     assert cfg.robot.soft_limits_deg[4] == (-125.0, 125.0)
     # nested tuples, not lists: the limit table is used as pairs by the kinematics
     assert isinstance(cfg.robot.soft_limits_deg[0], tuple)
     assert len(cfg.robot.mechanical_limits_deg) == 6
+    # ROBOGUIDE's own limit table for this machine (exported 2026-10-29), not the datasheet:
+    # J2 reaches +76 and J3 stops at -120.71, and the planner may only command what the
+    # controller page allows.
+    assert cfg.robot.mechanical_limits_deg == (
+        (-185.0, 185.0), (-60.0, 76.0), (-120.71, 180.0),
+        (-360.0, 360.0), (-125.0, 125.0), (-360.0, 360.0))
+    assert cfg.robot.soft_limits_deg == cfg.robot.mechanical_limits_deg
+    # ... and the planner reserves `joint_margin_deg` at each end of that envelope
+    assert cfg.robot.limits_usage_frac == pytest.approx(1.0)
+    assert cfg.robot.joint_margin_deg == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("share", [0.0, -0.5, 1.5])
+def test_a_limit_usage_share_outside_the_range_is_refused(tmp_path, share):
+    path = tmp_path / "robot.json"
+    path.write_text(json.dumps({"robot": {"enabled": True,
+                                           "limits_usage_frac": share}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="limits_usage_frac"):
+        load_config(path)
 
 
 def test_a_soft_limit_wider_than_the_arm_is_refused(tmp_path):
     path = tmp_path / "robot.json"
     path.write_text(json.dumps({"robot": {
         "enabled": True,
-        "soft_limits_deg": [[-200, 200], [-60, 136], [-301, 301],
-                            [-720, 720], [-125, 125], [-360, 360]]}}), encoding="utf-8")
+        "soft_limits_deg": [[-200, 200], [-90, 46], [-122, 190],
+                            [-360, 360], [-125, 125], [-360, 360]]}}), encoding="utf-8")
     with pytest.raises(ValueError, match="wider than the mechanical"):
         load_config(path)
 

@@ -33,6 +33,7 @@
     "tilts_deg": [0.0, 30.0, -30.0],
     "rolls_deg": [0.0, 90.0],
     "aim_grid_mm": 100.0,
+    "tilt_azimuths": 4,
     "max_candidates": 4000,
 
     "_comment_fov": [
@@ -79,7 +80,17 @@
       "delivered points; lean = hand over the poses alone, exactly like v1, promising",
       "nothing about the motion between them. Same coverage either way."
     ],
-    "coverage_target_pct": 99.0,
+    "_comment_acceptance_sweeps": [
+      "97.0 (2026-10-29). Measured on the site station with the CONFIG family bounded to the",
+      "one the cell has run (`N U T`), the three deliverables are",
+      "  99% target: 99.02% in 71 corners / 11.9 m - poses only, not one sweep",
+      "  97% target: 97.75% in 28 corners / 9.6 m - SEVEN sweeps plus poses for the pockets",
+      "  90% target: 91.13% in 14 corners / 5.7 m - five sweeps, no poses",
+      "The middle one is the shape of COV90.LS, the program that ran on the cell. The last",
+      "1.3 points of coverage cost 43 extra corners and turn the program back into a sequence",
+      "of stops. It stays a site number: raise it if a future pool can sweep more."
+    ],
+    "coverage_target_pct": 97.0,
     "delivery_mode": "path",
 
     "_comment_surface_bias": [
@@ -143,11 +154,23 @@
     "  connector_level=1         spread the rotation over the flight, dropping one corner",
     "  connector_level=0         also allow a straight move between two identical poses",
     "                            (WAIT FOR ROBOGUIDE before turning this on)",
+    "One route is not controlled by connector_level: the common safe plane. It is used when",
+    "the two sweeps look in different directions, and again as the last resort when BOTH",
+    "local routes fail and the only alternative would be to drop the sweep - a pocket wall",
+    "beats any lift, because the lift that clears it puts the waiting corner out of the",
+    "arm's reach. On station 20261028_145331 that last resort is the difference between",
+    "47.5% and 95.4% coverage, so it is not a knob to switch off for a tidier corner count.",
     "  order_axis_weight_mm_per_deg  60 deg of pose change costs the same as 120 mm of",
     "                            detour. Distance alone makes a large re-orientation look",
     "                            free, because it is only a short move.",
     "max_prune_rounds 32: the measured run reported '28 -> 28', i.e. pruning was stopped by",
-    "the round limit and not by the target. Pruning is pure counting, no rays."
+    "the round limit and not by the target. Pruning is pure counting, no rays.",
+    "require_sweeps=true keeps the SWEEP deliverable even when the pose-only reference scores",
+    "better on corners and travel. On 2026-10-28 the mixed plan (sweeps + poses) reaches",
+    "95.88% in 19 corners while the pose plan reaches 99.02% in 69 - without this flag the",
+    "planner hands the workshop a program that stops 35 times and never sweeps, which is not",
+    "what a scanning cell is bought for. The pose plan still takes over when the sweeps",
+    "cannot reach coverage_target_pct, so the switch can never cost the target."
   ],
   "stroke": {
     "enabled": true,
@@ -173,7 +196,8 @@
     "parallel_weight": 1.0,
     "repair_budget_share": 0.2,
     "pool_mode": "full",
-    "side_scan_tilt_deg": 45.0
+    "side_scan_tilt_deg": 45.0,
+    "require_sweeps": true
   },
 
   "_comment_motion": [
@@ -192,15 +216,21 @@
   "seed": 7,
 
   "_comment_robot": [
-    "Arm, limits and tool for the J5 over-travel work (docs 2026-10-22-j5-overtravel-kinematics-gate-design).",
-    "DISABLED BY DEFAULT: enabled=false leaves every existing result untouched. Before turning it",
-    "on, two site facts still have to be read off the controller (the design's G1/G3):",
-    "  G1 the real soft limits - the values below are INFERRED from captured data, where three",
-    "     joints sat exactly on J2=-60 / J5=-125 / J6=360, which no joystick produces; the",
-    "     2026-10-23 bank adds two poses sitting 0.68 deg inside the J5 floor, i.e. the SRVO-115",
-    "     pose, which corroborates -125 but says nothing about the other axes;",
-    "  G3 whether ROBOGUIDE is configured with the databook limits (+-250 on J5) instead of the",
-    "     controller's (+-125). If it is, every simulation verdict about reachability is void.",
+    "Arm, limits and tool for the joint-limit gate (docs 2026-10-22-j5-overtravel-kinematics-gate-design).",
+    "ON BY DEFAULT: a delivered program whose points the arm cannot hold is not a plan, so the",
+    "gate runs on every plan. Set enabled=false only to reproduce a pre-2026-10-27 result.",
+    "The limits below are the FANUC datasheet for the R-2000iC/125L floor standard version",
+    "(reach 2655): J1 +-185, J2 -90..+46, J3 -122..+190, J4 +-360, J5 +-125, J6 +-360. They are",
+    "written as the MACHINE's envelope, never as the planning envelope.",
+    "model is a report label only - the kinematics comes from the fitted geometry below, so it is",
+    "left at the measured arm's name; the LIMITS are the ones the site supplied.",
+    "limits_usage_frac = 1.0: the whole datasheet envelope may be used, and the reserve is a",
+    "fixed joint_margin_deg (5, and 5-10 is the range the site accepts) at each end of every",
+    "axis. A percentage was tried first and dropped - 90 % of the range is 18.5 deg on J1 and",
+    "6.8 on J2, a different reserve per axis for no reason the machine supports.",
+    "Remaining site gap (G3): whether ROBOGUIDE is configured with the databook limits or with a",
+    "narrower controller soft limit. If it is narrower, write that into soft_limits_deg as well -",
+    "the planner takes the intersection, so the narrower set wins without editing the datasheet.",
     "G2 (the CONFIG letters) was settled on 2026-10-23 for T/F - see tool_ypr_deg below and",
     "docs/robot-calibration.md; the turn digits are still emitted as a hint.",
     "",
@@ -210,10 +240,15 @@
     "the same five numbers and moves only the tool. This controller reports J3 as the ABSOLUTE",
     "forearm pitch, not relative to J2 - hence j3_sign/j3_zero_deg rather than a DH chain.",
     "wrist_identified=false forbids emitting absolute joint values; the gate may then only rank",
-    "branches against each other."
+    "branches against each other.",
+    "config_wrist_letter pins the third letter of every CONFIG string: \"auto\" follows the",
+    "measured rule (T for J5 < 0), \"T\"/\"F\" pin it. This cell needs \"T\": its ROBOGUIDE",
+    "refuses an 'N U F, 0, 0, 0' block at import with ASBN-023 Configuration error and throws",
+    "away the whole program. The two wrist branches are the same TCP pose, so pinning costs",
+    "nothing geometrically - it only makes the file load."
   ],
   "robot": {
-    "enabled": false,
+    "enabled": true,
     "model": "FANUC R-2000iC/125L",
 
     "base_offset_mm": 312.0,
@@ -243,12 +278,22 @@
     "tool_ypr_deg": [179.279, -45.934, 172.758],
 
     "_comment_limits": [
-      "Two sets, on purpose. The planner uses the INTERSECTION and the report says which set",
-      "it used. soft = what the controller actually enforces (inferred, see G1);",
-      "mechanical = the datasheet envelope. Never widen soft to pass an acceptance check."
+      "The authority is now ROBOGUIDE's own limit table for THIS machine (R-2000iC/125L,",
+      "exported 2026-10-29), not the datasheet: J1 +-185, J2 -60..+76, J3 -120.71..+180,",
+      "J4 +-360, J5 +-125, J6 +-360. Both lists carry it: mechanical is the arm's envelope and",
+      "soft is what the controller enforces, and on this cell they are the same table - the",
+      "J2 floor of -60 and the J2 ceiling of 76 both come from the controller page.",
+      "limits_usage_frac = 1.0: the whole envelope may be used, and the reserve is a fixed",
+      "joint_margin_deg (5, and 5-10 is the range the site accepts) at each end of every axis.",
+      "A percentage was tried first and dropped - 90 % of the range is 18.5 deg on J1 and 6.8",
+      "on J2, a different reserve per axis for no reason the machine supports.",
+      "Note J2 +76 (not the datasheet's +46) and J3 -120.71: the fitted kinematics can reach",
+      "poses the old table refused, and the planner may only command what this table allows.",
+      "Never widen these to pass an acceptance check."
     ],
-    "mechanical_limits_deg": [[-185, 185], [-136, 136], [-301, 301], [-720, 720], [-250, 250], [-720, 720]],
-    "soft_limits_deg":       [[-185, 185], [ -60, 136], [-301, 301], [-720, 720], [-125, 125], [-360, 360]],
+    "mechanical_limits_deg": [[-185, 185], [-60, 76], [-120.71, 180], [-360, 360], [-125, 125], [-360, 360]],
+    "soft_limits_deg":       [[-185, 185], [-60, 76], [-120.71, 180], [-360, 360], [-125, 125], [-360, 360]],
+    "limits_usage_frac": 1.0,
 
     "_comment_step": [
       "max_step_deg is REPORTED, not enforced: the worst joint step between two delivered",
@@ -260,6 +305,18 @@
     "joint_margin_deg": 5.0,
     "j5_min_abs_deg": 8.0,
     "max_step_deg": 40.0,
-    "wrist_identified": true
+    "wrist_identified": true,
+    "config_wrist_letter": "T",
+
+    "_comment_configs": [
+      "allowed_configs is a correctness boundary, not a preference. The closed form's",
+      "front/back family (F ...) numbers J2 around -40 deg for a posture the controller",
+      "reports as J2 = 143 deg, so an F D T point passed our envelope check and then stopped",
+      "the program with MOTN-017 (G:1, A:2,3) on 2026-10-28. Until that mapping is measured",
+      "against the pendant, only the family the cell has actually run is accepted: COV90.LS,",
+      "the program that imported and executed, is N U T at every point. Empty list = accept",
+      "whatever the solver finds (the old behaviour)."
+    ],
+    "allowed_configs": ["N U T"]
   }
 }

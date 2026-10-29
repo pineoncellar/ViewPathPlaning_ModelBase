@@ -45,33 +45,49 @@ def aim_indices(points, grid_mm: float) -> np.ndarray:
 
 
 def ladder(point, normal, params: ScannerParams) -> list[ScannerPose]:
-    """The poses aimed at one surface point: every distance, tilt and roll.
+    """The poses aimed at one surface point: every distance, tilt, azimuth and roll.
 
     Every tilt gets every roll, including zero tilt. The roll does NOT change the optical
     axis, but the field of view is a rectangle (600 x 500 mm at the standoff), so a quarter
     turn about that axis covers a different set of samples - and zero tilt is the pose with
     the best incidence, i.e. exactly the one a selection prefers. Design 4.2 lists two
     rolls for this reason.
+
+    `tilt_azimuths` sweeps the tilt around the surface normal: a tilt only about one tangent
+    (+30 deg) and its opposite (-30 deg) describe a single plane, so a sample can only be
+    approached from two of the (infinitely many) directions around it. Measured on the
+    2026-10-28 delivery, 91 % of the uncovered samples had a feasible pose somewhere in a
+    four-azimuth fan - the arm simply could not hold the poses the one-plane ladder offered.
+    One azimuth reproduces the old behaviour exactly.
+
+    The sweep spans 180 degrees and emits BOTH tilt signs about each azimuth: the signed
+    pair then names the two opposite axes for that azimuth, so `azimuths` rotations cover the
+    full circle twice over - no direction is missed and none is emitted twice. The head-on
+    pose does not depend on the azimuth at all, so it is emitted once.
     """
     point = np.asarray(point, dtype=float).reshape(3)
     normal = np.asarray(normal, dtype=float).reshape(3)
     normal = normal / np.linalg.norm(normal)
     first_tangent, second_tangent = tangents(normal)
     inward = -normal
+    azimuths = max(1, int(params.tilt_azimuths))
 
     poses: list[ScannerPose] = []
     for distance in params.distances_mm:
         position = point + normal * distance
-        for tilt_deg in params.tilts_deg:
-            if tilt_deg == 0.0:
-                axis = inward
-            elif tilt_deg > 0.0:
-                axis = tilt_axis(inward, first_tangent, tilt_deg)
-            else:
-                axis = tilt_axis(inward, second_tangent, -tilt_deg)
-            for roll_deg in params.rolls_deg:
-                poses.append(ScannerPose(position=position.copy(), axis=axis.copy(),
-                                         roll_deg=float(roll_deg)))
+        for index in range(azimuths):
+            turn = np.pi * index / azimuths
+            tangent = np.cos(turn) * first_tangent + np.sin(turn) * second_tangent
+            for tilt_deg in params.tilts_deg:
+                if tilt_deg == 0.0:
+                    if index > 0:
+                        continue
+                    axis = inward
+                else:
+                    axis = tilt_axis(inward, tangent, float(tilt_deg))
+                for roll_deg in params.rolls_deg:
+                    poses.append(ScannerPose(position=position.copy(), axis=axis.copy(),
+                                             roll_deg=float(roll_deg)))
     return poses
 
 
@@ -88,11 +104,52 @@ def dedupe(poses) -> list[ScannerPose]:
     return unique
 
 
+def _cap(groups: list[list[ScannerPose]], limit: int) -> list[ScannerPose]:
+    """Cut the pool to `limit` poses WITHOUT starving any aim point.
+
+    A uniform random cut is what the pool used to do, and it is the wrong shape of cut: the
+    cap is far below the natural pool (thousands of aims x dozens of poses), so a random
+    sample leaves whole regions of the part with no candidate at all - and a region with no
+    candidate can never be covered, however good the selection is. Taking one pose per aim
+    in turn keeps every aim point represented, then spends the rest on the aims that still
+    have poses left.
+
+    Deterministic by construction: the old random cut made two runs of the same seed agree
+    only by luck of iteration order, and a plan that cannot be re-created is a plan that
+    cannot be reviewed.
+    """
+    total = sum(len(group) for group in groups)
+    if limit <= 0 or total <= limit:
+        return [pose for group in groups for pose in group]
+    picked: list[ScannerPose] = []
+    cursor = [0] * len(groups)
+    while len(picked) < limit:
+        moved = False
+        for index, group in enumerate(groups):
+            if len(picked) >= limit:
+                break
+            if cursor[index] < len(group):
+                picked.append(group[cursor[index]])
+                cursor[index] += 1
+                moved = True
+        if not moved:
+            break
+    return picked
+
+
 def generate(points, normals, params: ScannerParams, *, seed: int,
              aim_grid_mm: float | None = None, max_candidates: int | None = None,
+             keep: Callable[[ScannerPose], bool] | None = None,
              progress: Callable[[int, int], None] | None = None,
              log: Callable[[str], None] | None = None) -> list[ScannerPose]:
-    """Build the candidate pool: a ladder on every aim cell of the target."""
+    """Build the candidate pool: a ladder on every aim cell of the target.
+
+    `keep` is the joint gate, applied HERE, before the cap. Order matters: the cap is far
+    below the natural pool, so filtering afterwards would spend the budget on poses the arm
+    can never hold. On the 2026-10-28 delivery 786 of 4000 candidates were rejected by the
+    gate after the fact - i.e. a fifth of the ray budget was spent describing poses that
+    could not be delivered.
+    """
     say = log or (lambda _message: None)
     points = np.asarray(points, dtype=float).reshape(-1, 3)
     normals = np.asarray(normals, dtype=float).reshape(-1, 3)
@@ -103,34 +160,40 @@ def generate(points, normals, params: ScannerParams, *, seed: int,
 
     grid = float(params.aim_grid_mm if aim_grid_mm is None else aim_grid_mm)
     aims = aim_indices(points, grid)
-    pool: list[ScannerPose] = []
+    groups: list[list[ScannerPose]] = []
     for done, index in enumerate(aims):
-        pool.extend(ladder(points[index], normals[index], params))
+        ladder_poses = dedupe(ladder(points[index], normals[index], params))
+        if keep is not None:
+            ladder_poses = [pose for pose in ladder_poses if keep(pose)]
+        groups.append(ladder_poses)
         if progress is not None:
             progress(done + 1, len(aims))
-    pool = dedupe(pool)
 
     limit = int(params.max_candidates if max_candidates is None else max_candidates)
     if limit <= 0:
         raise ValueError("max_candidates must be positive")
-    if len(pool) > limit:
-        chosen = np.random.default_rng(seed).choice(len(pool), limit, replace=False)
-        pool = [pool[int(i)] for i in np.sort(chosen)]
-    say(f"  {len(aims)} aim points on a {grid:g} mm grid -> {len(pool)} candidates")
+    pool = _cap(groups, limit)
+    say(f"  {len(aims)} aim points on a {grid:g} mm grid x "
+        f"{max(1, int(params.tilt_azimuths))} azimuth(s) -> {len(pool)} candidates")
     return pool
 
 
 def refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
            max_candidates: int | None = None,
+           keep: Callable[[ScannerPose], bool] | None = None,
            progress: Callable[[int, int], None] | None = None,
            log: Callable[[str], None] | None = None) -> list[ScannerPose]:
     """Aim a new ladder at what is still uncovered, on a finer grid than the face.
 
     The leak region is small by definition, and the measured viewpoint count is limited
     by candidate generation rather than by the selection stage, so this is where a
-    better answer comes from. The refinement pool still honours the same cap as the
-    first pass - a safety net rather than a limit, since a leak on a 25 mm aim grid
-    stays well below it - and the `seed` is what keeps a capped refinement reproducible.
+    better answer comes from. The refinement pool honours the same cap as the first pass
+    and the same rules: `keep` (the joint gate) filters BEFORE the cap, and the cap takes
+    one pose per aim in turn so a crowded corner cannot starve the rest of the leak.
+
+    `seed` is accepted for call-site symmetry and no longer changes the answer: the cap is
+    a deterministic round-robin, so two runs of the same inputs agree by construction
+    rather than by luck of iteration order.
     """
     say = log or (lambda _message: None)
     leak_points = np.asarray(leak_points, dtype=float).reshape(-1, 3)
@@ -141,16 +204,16 @@ def refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
         raise ValueError("leak points and normals must be the same length")
 
     aims = aim_indices(leak_points, params.refine_aim_grid_mm)
-    pool: list[ScannerPose] = []
+    groups: list[list[ScannerPose]] = []
     for done, index in enumerate(aims):
-        pool.extend(ladder(leak_points[index], leak_normals[index], params))
+        ladder_poses = dedupe(ladder(leak_points[index], leak_normals[index], params))
+        if keep is not None:
+            ladder_poses = [pose for pose in ladder_poses if keep(pose)]
+        groups.append(ladder_poses)
         if progress is not None:
             progress(done + 1, len(aims))
-    pool = dedupe(pool)
     limit = int(params.max_candidates if max_candidates is None else max_candidates)
-    if len(pool) > limit:
-        chosen = np.random.default_rng(seed).choice(len(pool), limit, replace=False)
-        pool = [pool[int(i)] for i in np.sort(chosen)]
+    pool = _cap(groups, limit)
     say(f"  refinement: {len(aims)} leak aim points on a "
         f"{params.refine_aim_grid_mm:g} mm grid -> {len(pool)} candidates")
     return pool

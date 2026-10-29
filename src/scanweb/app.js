@@ -588,6 +588,114 @@ function handleCanvasClick(clientX, clientY) {
 
 function round(value) { return Math.round(value * 1000) / 1000; }
 
+/* ---------- remembered field coordinates ---------- */
+
+// 现场坐标很少每次都重新量，所以把上一次填进定位点表格的 X/Y/Z 记在浏览器本地，
+// 下次打开页面时直接回填。它只是输入便利：表格仍然要配合本次点选的定位点使用，
+// 回填后照常重算配准，清空按钮可以丢弃这份记录。
+const DATUM_MEMORY_KEY = "scanplan.datum.measured.v1";
+
+function datumMemoryStorage() {
+  try {
+    return window.localStorage || null;
+  } catch (_) {
+    // 浏览器禁用存储时表格照常可用，只是不再记忆
+    return null;
+  }
+}
+
+function readDatumMemory() {
+  const storage = datumMemoryStorage();
+  if (!storage) return null;
+  let parsed = null;
+  try {
+    const raw = storage.getItem(DATUM_MEMORY_KEY);
+    parsed = raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+  const rows = parsed && Array.isArray(parsed.rows) ? parsed.rows : [];
+  const values = Array.from({ length: 4 }, (_, index) => {
+    const row = Array.isArray(rows[index]) ? rows[index] : [];
+    return [0, 1, 2].map((axis) => {
+      const value = row[axis];
+      return value === null || value === undefined ? "" : String(value);
+    });
+  });
+  if (!values.some((row) => row.some((value) => value !== ""))) return null;
+  return { rows: values, savedAt: parsed && typeof parsed.savedAt === "string" ? parsed.savedAt : "" };
+}
+
+let datumMemoryTimer = 0;
+
+function saveDatumMemory() {
+  window.clearTimeout(datumMemoryTimer);
+  const storage = datumMemoryStorage();
+  if (!storage) return;
+  const rows = state.measured.map((row) => row.map((value) => (value === null || value === undefined) ? "" : String(value)));
+  try {
+    if (rows.every((row) => row.every((value) => value === ""))) {
+      storage.removeItem(DATUM_MEMORY_KEY);
+      return;
+    }
+    storage.setItem(DATUM_MEMORY_KEY, JSON.stringify({
+      rows,
+      savedAt: new Date().toISOString()
+    }));
+  } catch (_) {
+    // 配额已满或处于隐私模式：记忆只是便利，失败不影响规划
+  }
+}
+
+function scheduleDatumMemorySave() {
+  window.clearTimeout(datumMemoryTimer);
+  datumMemoryTimer = window.setTimeout(saveDatumMemory, 300);
+}
+
+function renderDatumMemoryNote(memory) {
+  const note = $("datumMemoryNote");
+  if (!note) return;
+  note.hidden = !memory;
+  const text = $("datumMemoryText");
+  if (!memory || !text) return;
+  const when = new Date(memory.savedAt);
+  const stamp = memory.savedAt && !Number.isNaN(when.getTime())
+    ? when.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+    : "";
+  text.textContent = "已载入上次填写的现场坐标" + (stamp ? "（" + stamp + "）" : "")
+    + "，请核对是否与本次点选的定位点一致。";
+}
+
+// 回填上一次的现场坐标；没有记录时保持空表。
+function restoreDatumMemory() {
+  const memory = readDatumMemory();
+  state.measured = memory
+    ? memory.rows.map((row) => row.slice())
+    : Array.from({ length: 4 }, () => ["", "", ""]);
+  renderDatumMemoryNote(memory);
+  return Boolean(memory);
+}
+
+function clearDatumMemory() {
+  window.clearTimeout(datumMemoryTimer);
+  const storage = datumMemoryStorage();
+  try {
+    if (storage) storage.removeItem(DATUM_MEMORY_KEY);
+  } catch (_) {
+    // 存储不可用时只清空表格
+  }
+  renderDatumMemoryNote(null);
+  state.measured = Array.from({ length: 4 }, () => ["", "", ""]);
+  state.registration = null;
+  registrationRequest += 1;
+  window.clearTimeout(registrationTimer);
+  renderDatumRows();
+  if (state.result) renderRelocatePanel(state.result);
+  updateSolveAvailability();
+  setRegistrationStatus("已清空上次填写的现场坐标，请重新输入本次实测值。");
+  toast("已清空现场坐标");
+}
+
 /* ---------- UI: models and datum rows ---------- */
 
 function parseStl(buffer) {
@@ -739,6 +847,7 @@ function renderDatumRows() {
         mirrorDatumInput("relocateRows", index, axis, input.value);
         state.registration = null;
         updateSolveAvailability();
+        scheduleDatumMemorySave();
         scheduleRegistrationCheck();
       });
       cell.append(input);
@@ -1410,6 +1519,8 @@ function syncSetupFromResult(result) {
     measured.forEach((point, index) => {
       state.measured[index] = point.map((value) => String(round(Number(value))));
     });
+    // 表格现在显示的是这次运行用到的坐标，不再是上次手填的那份
+    renderDatumMemoryNote(null);
   }
   state.registration = {
     measured_frame: result.measured_frame,
@@ -1485,6 +1596,7 @@ function renderRelocatePanel(result) {
         mirrorDatumInput("datumRows", index, axis, input.value);
         state.registration = null;
         updateSolveAvailability();
+        scheduleDatumMemorySave();
         scheduleRegistrationCheck();
       });
       cell.append(input);
@@ -1703,6 +1815,7 @@ function bindEvents() {
   });
   $("clearPoints").addEventListener("click", resetPicks);
   $("undoPoint").addEventListener("click", undoPoint);
+  $("clearDatumMemory").addEventListener("click", clearDatumMemory);
   $("fitView").addEventListener("click", fitView);
   $("lookAlongAxis").addEventListener("click", lookAlongAxis);
   $("showFixture").addEventListener("change", requestRender);
@@ -1980,7 +2093,8 @@ function resetWorkspace() {
   state.models = {};
   state.picked = [];
   state.pointCount = 3;
-  state.measured = Array.from({ length: 4 }, () => ["", "", ""]);
+  // 新项目同样沿用上一次填写的现场坐标，省掉重复录入
+  restoreDatumMemory();
   state.autoFace = false;
   state.registration = null;
   state.result = null;
@@ -2088,6 +2202,7 @@ async function applyServerDefaults() {
 function init() {
   initRenderer();
   bindEvents();
+  restoreDatumMemory();
   renderDatumRows();
   updateAxisBadge("尚未导入零件");
   updateSolveAvailability();

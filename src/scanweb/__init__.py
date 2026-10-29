@@ -44,7 +44,6 @@ from scanplan.report import (
 from scanplan.roboguide.adapt import export as export_ls
 from scanplan.roboguide.wpr import normalise_prog_name
 from scanplan.scene import StationDescription, load_station
-from scanplan.sheet_split import split_sheet
 from scanview import load_target_samples, render_run, save_target_samples
 
 from .cad_import import mesh_from_bytes, to_stl_bytes
@@ -547,17 +546,17 @@ def solve_job(data: dict, progress=None) -> dict:
         station = load_station(description, cloud_seed=config.seed)
         announce("segmentation", 0.10, "station loaded")
         axis_in_measured = registration.rotation @ face_axis_vehicle
-        split = split_sheet(
-            station.part,
-            band_deg=config.target.band_deg,
-            knn=config.target.knn,
-            seed=config.seed,
-            through_axis=axis_in_measured,
-        )
-        announce("segmentation", 0.12, "blank split")
-        result = plan(station, config, face="upper", split=split,
+        # The blank split is NOT built here. Handing `plan()` a precomputed one looked
+        # harmless - same mesh, same parameters - but the split seeds the sign of the local
+        # sheet normal from a single through-thickness axis, so a different axis reassigns
+        # whole regions between "upper" and "lower". On station 20261028_193014 the exact
+        # measured axis gave 53.8% coverage while the axis `plan()` derives itself gave
+        # 99.0% on the SAME station file: the run was planning a face made of the wrong
+        # regions, and the delivery stage then dropped eight strokes it could not reach.
+        # One source of truth for the split, so the page and the CLI cannot disagree.
+        result = plan(station, config, face="upper",
                       progress=lambda stage, fraction, detail="": announce(
-                          stage, 0.12 + 0.78 * fraction, detail))
+                          stage, 0.10 + 0.80 * fraction, detail))
         announce("report", 0.92, "planning finished")
         result.report["installation_registration"] = {
             "measured_frame": registration.frame_label,
@@ -577,6 +576,7 @@ def solve_job(data: dict, progress=None) -> dict:
             prog_name=prog_name,
             uframe=output_uframe,
             utool=int(data.get("utool", 1)),
+            robot=config.robot,
             **options,
         )
         announce("export", 0.98, "program exported")

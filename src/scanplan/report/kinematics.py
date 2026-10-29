@@ -39,15 +39,33 @@ def kinematics_block(config: PlannerConfig, viewpoints, path, kinematics=None) -
         "enabled": bool(getattr(kinematics, "active", False)),
         "model": config.robot.model,
         "limits_source": (robot.limits_source if robot is not None else None),
+        "limits_usage_frac": config.robot.limits_usage_frac,
+        "datasheet_limits_deg": [list(pair) for pair in config.robot.mechanical_limits_deg],
+        "usable_limits_deg": ([list(pair) for pair in robot.limits]
+                             if robot is not None else None),
+        "deliverable_limits_deg": (
+            [[low + config.robot.joint_margin_deg, high - config.robot.joint_margin_deg]
+             for low, high in robot.limits] if robot is not None else None),
         "wrist_identified": bool(config.robot.wrist_identified),
+        "allowed_configs": list(config.robot.allowed_configs),
         "joint_margin_deg": config.robot.joint_margin_deg,
         "j5_min_abs_deg": config.robot.j5_min_abs_deg,
         "max_step_deg_limit": config.robot.max_step_deg,
+        "limits_note": (
+            "usable_limits_deg is the datasheet envelope intersected with the controller's "
+            "set after shrinking it to limits_usage_frac; deliverable_limits_deg is that "
+            "envelope with joint_margin_deg reserved at each end, which is what every "
+            "accepted pose satisfies"),
         "j5_histogram_deg": histogram,
         "branch_histogram": dict(getattr(assignment, "histogram", {})),
         "min_margin_deg": getattr(assignment, "min_margin_deg", None),
         "max_step_deg": getattr(assignment, "max_step_deg", None),
         "max_step_at": getattr(assignment, "max_step_at", None),
+        "max_j6_step_deg": getattr(assignment, "max_j6_step_deg", None),
+        "j6_note": (
+            "a sweep is written as one L move between two points of the same constant pose, "
+            "so J6 does not turn while the head scans; max_j6_step_deg is the largest J6 turn "
+            "asked of a J (repositioning) move"),
         "points_without_solution": len(getattr(assignment, "failed", [])),
         "steps_over_limit": len(getattr(assignment, "broken", [])),
         "cache": (kinematics.summary() if kinematics is not None else None),

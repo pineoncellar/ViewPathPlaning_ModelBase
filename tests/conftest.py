@@ -378,10 +378,21 @@ def split_flat_plate(flat_plate):
 
 @pytest.fixture(scope="session")
 def cfg():
-    """The shipped configuration with the scanner's placeholder values."""
+    """The shipped configuration, with the joint gate switched OFF.
+
+    Not a convenience: every fixture in this file is synthetic geometry sitting at the
+    robot's own origin - inside the shoulder envelope - so the shipped gate (on by default
+    since 2026-10-27) rejects every pose and a coverage or stroke test would pass by
+    measuring an empty plan. Kinematics has its own fixtures that build the gate
+    explicitly (`test_kinematics.py`, `test_kinematic_gate.py`), and `test_config.py` pins
+    the shipped default; this fixture is for everything else.
+    """
+    from dataclasses import replace
+
     from scanplan.config import load_config
 
-    return load_config()
+    config = load_config()
+    return replace(config, robot=replace(config.robot, enabled=False))
 
 
 @pytest.fixture(scope="session")

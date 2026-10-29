@@ -1181,6 +1181,11 @@ footer b { color: #8fb4d2; }
     .legend .other { background: #9aa8b2; } .legend .fixture { background: #7d8c98; }
     .legend .base { background: #5b6872; } .legend .path { background: #10b8dd; }
     .canvas-note { display: flex; justify-content: space-between; gap: 10px; margin-top: 7px; color: #7d8ea0; font-size: 10px; }
+    .datum-memory { display: flex; align-items: center; gap: 9px; margin-top: 9px; padding: 7px 10px; border: 1px solid #d9e9f4; border-radius: 5px; background: #f4fafd; color: #3b6e96; font-size: 10px; line-height: 1.6; }
+    .datum-memory[hidden] { display: none; }
+    .datum-memory .datum-memory-icon { font-size: 12px; line-height: 1; }
+    .datum-memory #datumMemoryText { flex: 1; min-width: 0; }
+    .datum-memory .secondary-button { height: 26px; padding: 0 9px; font-size: 9px; flex: none; }
     .datum-table { width: 100%; margin-top: 10px; border-collapse: collapse; }
     .datum-table th { padding: 6px 7px; border-bottom: 1px solid #e8edf2; color: #7d8ea0; font-size: 9px; font-weight: 600; text-align: left; }
     .datum-table td { padding: 5px 6px; border-bottom: 1px solid #f0f3f6; font-size: 11px; }

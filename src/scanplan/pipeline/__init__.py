@@ -164,6 +164,22 @@ def _pose_tie(coverage: CoverageResult, kin) -> list[float] | None:
     return values
 
 
+def _joint_keep(kin):
+    """The joint gate as a predicate for candidate generation, or None when it is off.
+
+    Passed into `generate`/`refine` so the pool is filtered BEFORE it is capped: the cap is
+    far below the natural pool, so filtering afterwards spends the ray budget on poses the
+    arm can never hold (786 of 4000 on the 2026-10-28 delivery).
+    """
+    if kin is None or not kin.active:
+        return None
+
+    def keep(pose) -> bool:
+        return bool(kin.check(pose.position, pose.axis, pose.roll_deg).ok)
+
+    return keep
+
+
 def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: str,
                tracker: Tracker | None, checks: dict, started: float,
                log: Callable[[str], None] | None,
@@ -184,17 +200,23 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
         obstacles = station.obstacles()
         gate = lambda positions: visible_mask(tracker, positions, obstacles)  # noqa: E731
 
-    # The joint-limit gate. Off by default (`robot.enabled=false`), and when off every call
-    # below is a no-op, which is what keeps the pre-2026-10-22 result reproducible.
+    # The joint-limit gate. ON in the shipped configuration, because a program whose points
+    # the arm cannot hold is not a delivery - and the .LS export refuses such a point rather
+    # than writing it. `robot.enabled=false` makes every call below a no-op, which is how a
+    # pre-2026-10-27 result can still be reproduced.
     kin = KinematicGate(cfg.robot)
     if kin.active:
         say(f"kinematic gate on: {cfg.robot.model}, limits {kin.robot.limits_source}")
+    else:
+        say("WARNING: the joint gate is off - the delivered points are NOT checked against "
+            "the arm's limits, and the .LS export will refuse to verify them")
 
     cand_rep = base.band("candidates", 0.10, 0.22)
     say(f"generating candidates for the {face} face")
     cand_rep(0.0, "aiming the candidate ladder")
     poses = generate(target.samples.points, target.samples.normals, cfg.scanner,
-                     seed=cfg.seed, log=log, progress=cand_rep.tick("aims"))
+                     seed=cfg.seed, log=log, progress=cand_rep.tick("aims"),
+                     keep=_joint_keep(kin))
     cand_rep(1.0, f"{len(poses)} candidates")
 
     occ_rep = base.band("occlusion", 0.22, 0.60)

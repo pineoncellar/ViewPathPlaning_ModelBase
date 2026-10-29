@@ -91,7 +91,8 @@ uv run python scripts/fit_robot_pose_bank.py path/to/bank.json
 
 - `forearm_mm ≤ forearm_offset_mm`（腕心在偏置方向后端，不在前臂轴线上）
 - `soft_limits_deg` 超出 `mechanical_limits_deg`
-- `j5_min_abs_deg` 不小于 J5 可用带宽的一半
+- `limits_usage_frac` 不在 `(0, 1]`（它是"每轴以量程中心为准能用到多少"）
+- `j5_min_abs_deg` 不小于 J5 可用带宽的一半（按 `limits_usage_frac` 收缩后的带宽算）
 - 任一 `j*_sign` 不是 ±1
 
 ## CONFIG 字母怎么推
@@ -105,14 +106,32 @@ uv run python scripts/fit_robot_pose_bank.py path/to/bank.json
 | 第 1 字母 `N`/`F` | 与解析解的**肩**分支一致 | 7/8 一致。唯一不一致的那一组，其自带说明（"J5 为正"）也与它自己的数据矛盾，判为该行标注有误 |
 | 第 2 字母 `U`/`D` | 与**肘**分支一致（`U`↔`U`） | 8/8，但全为 `U`，`D` 仍未验证 |
 | 第 3 字母 `T`/`F` | **`T` ↔ J5 < 0** | 8/8：J5 从 −9° 到 −124° 全部标 `T`。原实现是 `T` ↔ J5 ≥ 0，8 组全错，已按此改正 |
-| 圈数 `0,0,0` | 推不出来 | 实测与 `floor(J6/360)` 不对应。用 `--joint-blocks` 写关节指令绕开这一项 |
+| 圈数 `0,0,0` | 在本机可用范围内恒为 `0` | 实测与 `floor(J6/360)` 不对应；2026-10-27 已改成"只有在轴自身行程（J1 ±185、J4/J6 ±360）之外才计圈"，见下 |
 
 `T` / `F` 不是装饰：走笛卡尔点位时，它告诉控制器取哪个腕分支。标错的后果是同一个位姿转 180°——这正是 `--joint-blocks` 存在的理由。
 
 ## 这批数据给不出的东西
 
-- **软限位**：只有两组贴着 J5 = −124.321° 采集，反证了 `soft_limits_deg[4] = [-125, 125]` 这个下限是真的（`SRVO-115 (G:1, A:5)` 就发生在那一带），可 J1/J2/J3 的上限一个都没测到。
-- **肘部 `D` 分支**与**圈数**：没有样本。
+- **软限位**：只有两组贴着 J5 = −124.321° 采集，反证了 `soft_limits_deg[4] = [-125, 125]` 这个下限是真的（`SRVO-115 (G:1, A:5)` 就发生在那一带），可 J1/J2/J3 的上限一个都没测到。现在 `mechanical_limits_deg` 用 R-2000iC/125L 数据表值（J1 ±185、J2 −90..+46、J3 −122..+190、J4 ±360、J5 ±125、J6 ±360），`soft_limits_deg` 暂时与之一致；真实软限位如果更窄，写进 `soft_limits_deg` 即可，规划器取交集。
+- **肘部 `D` 分支**：没有样本。
+
+### 圈数位为什么恒为 0（2026-10-27 修正）
+
+旧实现用 `floor(J/360)` 算三个圈数位，任何**负**关节都会写出 `-1`。于是 `T1.LS` 里出现了
+`CONFIG : 'N U F, -1, -1, -1'`，ROBOGUIDE 在导入时就停在那一列：
+
+```
+ASBN-002 Error occurred during load
+ASBN-008 file 'T1'
+ASBN-009 on line 61, column 47   Configuration error
+ASBN-023
+```
+
+注意这是**加载期**的语法/取值校验，不是可达性：*整份程序*都进不去，哪怕每个关节都合法。
+现在的规则是 `turn_digits()`：值在轴自身行程内就是 `0`（本机永远如此），只有在行程外才计圈；
+`roboguide.ls.check_config()` 会拒绝任何负数圈位的 CONFIG，不再等到 ROBOGUIDE 报错。
+导出端还会用 `joints_deg` **重新推导**每个点的 CONFIG（`adapt.joint_audit`），所以旧
+`viewpoints.json` 里的错误字符串会被自动修正，不必重规划。
 - **工具装偏**：拟合只能说出"UTOOL 1 是这个位姿"，说不出"`+Z` 是不是光轴"。这一条必须去示教器核对，见下。
 
 ## 换完必须做的一件事：在示教器上核对 UTOOL
@@ -145,7 +164,8 @@ uv run scanplan plan --station input/station_fixed.json \
 - `points_without_solution` 应为 0；
 - `min_margin_deg` 应 ≥ `robot.joint_margin_deg`；
 - `j5_histogram_deg` 不该全挤在 `0-20`（挤在那儿说明腕解被翻过去了，而残差照样很小）；
-- `limits_source` 应是 `soft (intersected with mechanical)`。
+- `limits_source` 应是 `soft (intersected with mechanical), 5 deg reserved at each end`（或 `mechanical, ...`，看两套限位是否一致）；`usable_limits_deg` 是限位本身（如 J2 `[-60, 46]`、J5 `±125`），`deliverable_limits_deg` 是再减去 `joint_margin_deg` 后的范围，也就是交付点必须满足的那一个。
+
 
 ## 本次结果（2026-10-23）
 

@@ -50,7 +50,7 @@ def test_the_page_defaults_come_from_the_shipped_configuration():
     config = scanweb._public_config()
     assert config["delivery_mode"] == "stroke"
     assert config["surface_bias"] == pytest.approx(0.5)
-    assert config["robot_enabled"] is False
+    assert config["robot_enabled"] is True
     assert config["motion"] in ("J", "L")
     assert set(config["parameter_sources"]) == {
         "stroke.min_gain_mm2_per_step", "stroke.min_stroke_mm", "stroke.seed_dirs",
@@ -323,6 +323,21 @@ def test_the_page_offers_re_localisation_after_a_plan():
     assert "/api/relocate" in script
     assert "syncSetupFromResult" in script
     assert "不重新规划" in page
+
+
+def test_the_page_remembers_the_last_field_coordinates():
+    root = Path(scanweb.__file__).parent
+    page = (root / "index.html").read_text(encoding="utf-8")
+    script = (root / "app.js").read_text(encoding="utf-8")
+
+    # 现场坐标记在浏览器本地，下次打开页面回填，且可以一键丢弃
+    assert 'id="datumMemoryNote"' in page
+    assert 'id="clearDatumMemory"' in page
+    assert "localStorage" in script
+    assert "scanplan.datum.measured" in script
+    assert "restoreDatumMemory" in script
+    assert "saveDatumMemory" in script
+    assert "scheduleDatumMemorySave" in script
 
 
 def test_vehicle_frame_base_inverts_the_installation_transform(tmp_path):
