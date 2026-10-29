@@ -3,6 +3,18 @@
 from __future__ import annotations
 
 
+def _layers_line(report: dict) -> str:
+    """One line for the three coverage levels, and an explicit refusal when one is unknown."""
+    layers = report["coverage_layers"]
+    pool = layers["geometric_pool_pct"]
+    delivered = layers["delivered_pct"]
+    execution = layers["execution_verified_pct"]
+    verdict = (f"execution {execution:.2f}%" if execution is not None
+               else "execution UNVERIFIED")
+    return (f"coverage layers        pool {pool:.2f}% -> delivered {delivered:.2f}% "
+            f"-> {verdict}")
+
+
 def summary_lines(report: dict) -> list[str]:
     """The console summary, ending with the caveat a reader must not miss."""
     reasons = ", ".join(f"{key} {value}" for key, value in sorted(
@@ -24,6 +36,7 @@ def summary_lines(report: dict) -> list[str]:
            if report.get("viewpoints_transition") else "") + ")",
         f"uncovered              {report['uncovered_points']} samples "
         f"{report['uncovered_area_mm2'] / 1e6:.4f} m2  [{reasons}]",
+        *([_layers_line(report)] if report.get("coverage_layers") else []),
         f"max incidence          {report['placeholders']['max_incidence_deg']:.0f} deg "
         "(PLACEHOLDER)",
     ]
@@ -63,6 +76,12 @@ def summary_lines(report: dict) -> list[str]:
             f"worst step {kinematics.get('max_step_deg')} deg "
             f"(limit {kinematics.get('max_step_deg_limit')}), "
             f"branches {kinematics.get('branch_histogram')}")
+        program = report.get("program", {})
+        levels = program.get("connector_levels") or {}
+        if levels:
+            lines.append(f"connector              {levels}"
+                         + (f", refused {kinematics['connector_failures']}"
+                            if kinematics.get("connector_failures") else ""))
     budget = report.get("budget", {})
     if budget.get("max_points") is not None:
         lines.append(f"budget                 {budget.get('verdict')} at "

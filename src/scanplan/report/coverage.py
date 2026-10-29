@@ -132,3 +132,64 @@ def angle_diversity_block(coverage: CoverageResult, chosen, path) -> dict:
         "mean_looks": round(float(looks[covered].mean()), 2) if covered.any() else 0.0,
         "note": "reported only; more looks is not a requirement",
     }
+
+
+def coverage_layers_block(*, config: PlannerConfig, coverage: CoverageResult,
+                          selection: Selection, path) -> dict:
+    """The same question - how much of the part is covered - asked three times.
+
+    They are three different numbers and the difference between them is the point:
+
+    * `geometric_pool_pct` - what the candidate pool could reach with no arm at all. The
+      ceiling; nothing downstream can beat it.
+    * `delivered_pct` - what the program that was actually written sweeps.
+    * `execution_verified_pct` - the same figure, but only when every delivered point has a
+      verified joint state and every sweep was walked along its own line. Otherwise `null`,
+      with the reason, because "unverified" is not "passed" and a single number would hide
+      which of the two it is.
+
+    Keeping three numbers is what makes a low figure diagnosable: a big pool-to-delivered gap
+    is a selection or connector problem, a delivered-to-execution gap is the arm.
+    """
+    pool = round(float(coverage.pool_reach_pct), 3)
+    delivered = round(float(selection.coverage_pct), 3)
+    planned = bool(getattr(path, "joint_planned", False)) if path is not None else False
+    branches = getattr(path, "branches", None) if path is not None else None
+    unsolved = len(getattr(branches, "failed", []) or [])
+    if path is None:
+        verified, execution, why = False, None, (
+            "the deliverable is single poses with no path, so there is no connector and no "
+            "sweep to verify; this run makes no claim about the arm")
+    elif not config.robot.enabled:
+        verified, execution, why = False, None, (
+            "robot.enabled is false, so nothing about the arm was checked. The figure is "
+            "geometric reachability: a pose can be here and still be one the arm cannot hold")
+    elif not planned:
+        verified, execution, why = False, None, (
+            "the joint state was assigned after the path was built, so the connector was never "
+            "checked against it")
+    elif unsolved:
+        verified, execution, why = False, None, (
+            f"{unsolved} delivered point(s) have no joint solution, so the delivered figure "
+            "counts area the program cannot sweep")
+    else:
+        verified, execution, why = True, delivered, (
+            "every delivered point carries a verified joint state, and every sweep was walked "
+            "along its own line on the branch it starts on")
+    return {
+        "geometric_pool_pct": pool,
+        "delivered_pct": delivered,
+        "execution_verified_pct": execution,
+        "execution_verified": verified,
+        "execution_note": why,
+        "gaps_pct": {
+            "pool_to_delivered": round(pool - delivered, 3),
+            "delivered_to_execution": (None if execution is None
+                                       else round(delivered - execution, 3)),
+        },
+        "note": ("read the gaps, not the headline: a wide pool-to-delivered gap is a selection "
+                 "or connector problem, and a delivered-to-execution gap is the arm. The "
+                 "stroke-level sweep figure in `stroke_plan` is a fourth number and is not "
+                 "comparable to these, because it measures swept footprint rather than the "
+                 "sample set"),
+    }

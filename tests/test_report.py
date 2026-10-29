@@ -12,6 +12,7 @@ viewpoint records carry exactly the field names the export contract expects.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ from scanplan.coverage import attribute_uncovered, evaluate
 from scanplan.report import (
     build_report,
     cluster_points,
+    coverage_layers_block,
     summary_lines,
     viewpoints_from_selection,
     write_report,
@@ -174,6 +176,104 @@ def test_the_connector_route_mix_is_reported_only_for_a_real_path(planned):
     # no stroke stage here, so there is no path and no routes to count
     assert "connector_levels" not in report["program"]
     assert report["program"]["ordering"].startswith("planner order of single poses")
+
+
+def test_the_three_coverage_levels_are_reported_separately(planned):
+    """One number cannot say whether the gap is the selection, the connector or the arm."""
+    layers = planned["report"]["coverage_layers"]
+    assert layers["geometric_pool_pct"] >= layers["delivered_pct"]
+    assert layers["gaps_pct"]["pool_to_delivered"] >= 0.0
+    # this fixture delivers single poses with no path, so the third level is UNKNOWN - and
+    # that is what it must say, not a copy of the second
+    assert layers["execution_verified"] is False
+    assert layers["execution_verified_pct"] is None
+    assert "no claim about the arm" in layers["execution_note"]
+
+
+def test_with_a_path_but_no_arm_the_third_level_points_at_the_switch(planned):
+    from scanplan.path import BranchAssignment, PathPlan
+
+    path = PathPlan(points=[], joint_planned=False, branches=BranchAssignment())
+    block = coverage_layers_block(config=planned["config"], coverage=planned["coverage"],
+                                  selection=planned["selection"], path=path)
+    assert block["execution_verified"] is False
+    assert "robot.enabled is false" in block["execution_note"]
+
+
+def test_the_console_says_unverified_rather_than_repeating_the_headline(planned):
+    text = "\n".join(summary_lines(planned["report"]))
+    assert "coverage layers" in text
+    assert "execution UNVERIFIED" in text
+
+
+def test_a_joint_planned_path_turns_the_third_level_into_a_number(planned):
+    """With the arm checked, all three levels exist and the last equals the delivered one."""
+    from scanplan.path import BranchAssignment, PathPlan
+
+    config = replace(planned["config"],
+                     robot=replace(planned["config"].robot, enabled=True))
+    path = PathPlan(points=[], joint_planned=True, branches=BranchAssignment())
+    block = coverage_layers_block(config=config, coverage=planned["coverage"],
+                                  selection=planned["selection"], path=path)
+    assert block["execution_verified"] is True
+    assert block["execution_verified_pct"] == block["delivered_pct"]
+    assert block["gaps_pct"]["delivered_to_execution"] == 0.0
+
+
+def test_a_point_the_arm_cannot_hold_invalidates_the_third_level(planned):
+    """A delivered point with no solution means the delivered figure counts unreachable area."""
+    from scanplan.path import BranchAssignment, PathPlan
+
+    config = replace(planned["config"], robot=replace(planned["config"].robot, enabled=True))
+    path = PathPlan(points=[], joint_planned=True,
+                    branches=BranchAssignment(failed=[3]))
+    block = coverage_layers_block(config=config, coverage=planned["coverage"],
+                                  selection=planned["selection"], path=path)
+    assert block["execution_verified"] is False
+    assert "no joint solution" in block["execution_note"]
+
+
+def test_the_program_cost_separates_the_convertible_half_from_the_rest(cfg):
+    """Only the linear half converts to seconds; the joint half stays in degrees.
+
+    Converting degrees to seconds needs a joint speed, and none has been measured on this cell.
+    Reporting only the convertible half would hide the cost of the repositions, so the degrees
+    are reported as degrees and the note says why.
+    """
+    from types import SimpleNamespace
+
+    from scanplan.path import BranchAssignment, PathPlan, PathPoint
+    from scanplan.report.program import program_block
+
+    down = np.array([0.0, 0.0, -1.0])
+
+    def corner(x, motion):
+        return PathPoint(position=np.array([x, 0.0, 0.0]), axis=down, roll_deg=0.0,
+                         role="coverage", source="greedy", stroke_id=0, motion=motion)
+
+    first = SimpleNamespace(joints_deg=(0.0, 0.0, 0.0, 0.0, -60.0, 0.0))
+    second = SimpleNamespace(joints_deg=(0.0, 0.0, 0.0, 0.0, -60.0, 90.0))
+    path = PathPlan(points=[corner(0.0, "J"), corner(100.0, "L"), corner(300.0, "J")],
+                    branches=BranchAssignment(solutions=[first, first, second]))
+    cost = program_block(cfg, [], path)["cost"]
+    assert cost["linear_segments"] == 1 and cost["linear_mm"] == 100.0
+    assert cost["linear_seconds_at_floor_speed"] == pytest.approx(
+        100.0 / cfg.motion.speed_mm_s, abs=0.1)
+    assert cost["joint_segments"] == 1
+    assert cost["joint_move_deg_total"] == pytest.approx(90.0)
+    assert cost["joint_move_deg_worst"] == pytest.approx(90.0)
+    assert "seconds" in cost["note"]
+
+
+def test_the_failure_attribution_keeps_the_three_layers_apart(planned):
+    """Sample losses, item drops and refused primitives are different facts."""
+    block = planned["report"]["failure_attribution"]
+    assert block["sample_reasons"] == planned["report"]["uncovered_by_reason"]
+    assert block["item_drop_reasons"] == {}
+    assert block["connector_primitive_refusals"] == {}
+    assert set(block["layers_note"]) == {"sample_reasons", "item_drop_reasons",
+                                        "connector_primitive_refusals"}
+    assert block["joint_gate_enabled"] is False
 
 
 def test_the_report_says_which_deliverable_it_is(planned):

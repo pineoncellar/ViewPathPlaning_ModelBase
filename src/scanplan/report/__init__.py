@@ -45,7 +45,12 @@ from ..viewpoints import (  # noqa: F401  (re-exported for the exporters)
     viewpoints_from_path,
     viewpoints_from_selection,
 )
-from .coverage import angle_diversity_block, cluster_points, coverage_block
+from .coverage import (
+    angle_diversity_block,
+    cluster_points,
+    coverage_block,
+    coverage_layers_block,
+)
 from .definition import (
     PLACEHOLDERS_NOTE,
     TRACKER_CAVEAT,
@@ -55,7 +60,12 @@ from .definition import (
     provenance,
     scope_note,
 )
-from .kinematics import budget_block, kinematics_block, surface_profile_block
+from .kinematics import (
+    budget_block,
+    failure_attribution_block,
+    kinematics_block,
+    surface_profile_block,
+)
 from .program import program_block
 from .strokes import stroke_block, write_strokes_json
 from .summary import summary_lines, summary_text
@@ -66,6 +76,8 @@ __all__ = [
     "Viewpoint",
     "build_report",
     "cluster_points",
+    "coverage_layers_block",
+    "failure_attribution_block",
     "summary_lines",
     "summary_text",
     "viewpoints_from_path",
@@ -89,14 +101,23 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
                  runtime: dict | None = None, log=None) -> dict:
     """The report that has to accompany any viewpoint set (spec 7.2)."""
     say = log or (lambda _message: None)
+    coverage_stats = coverage_block(config=config, model=model, station=station,
+                                    target=target, coverage=coverage, selection=selection,
+                                    say=say)
     report = {
         **definition_block(config=config, target=target, split=split, coverage=coverage),
         "viewpoints": len(viewpoints),
         "viewpoints_greedy": sum(1 for vp in viewpoints if vp.source == "greedy"),
         "viewpoints_repair": sum(1 for vp in viewpoints if vp.source == "repair"),
         "viewpoints_transition": sum(1 for vp in viewpoints if vp.role != "coverage"),
-        **coverage_block(config=config, model=model, station=station, target=target,
-                         coverage=coverage, selection=selection, say=say),
+        **coverage_stats,
+        # The same question at three levels, and what was lost at each. Reported separately
+        # because one number cannot say whether the gap is the selection, the connector or
+        # the arm.
+        "coverage_layers": coverage_layers_block(config=config, coverage=coverage,
+                                                 selection=selection, path=path),
+        "failure_attribution": failure_attribution_block(
+            config, path, coverage_stats["uncovered_by_reason"]),
         "program": program_block(config, viewpoints, path),
         "stroke_plan": stroke_block(strokes, path, swept_coverage_pct,
                                     pose_only_coverage_pct),

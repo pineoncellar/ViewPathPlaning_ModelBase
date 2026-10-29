@@ -39,8 +39,12 @@ def kinematics_block(config: PlannerConfig, viewpoints, path, kinematics=None) -
         "enabled": bool(getattr(kinematics, "active", False)),
         "model": config.robot.model,
         "limits_source": (robot.limits_source if robot is not None else None),
+        "usable_limits_deg": ([list(pair) for pair in robot.usable]
+                              if robot is not None else None),
         "wrist_identified": bool(config.robot.wrist_identified),
         "joint_margin_deg": config.robot.joint_margin_deg,
+        "joint_span_fraction": config.robot.joint_span_fraction,
+        "wrist_flip_policy": config.robot.wrist_flip_policy,
         "j5_min_abs_deg": config.robot.j5_min_abs_deg,
         "max_step_deg_limit": config.robot.max_step_deg,
         "j5_histogram_deg": histogram,
@@ -50,12 +54,20 @@ def kinematics_block(config: PlannerConfig, viewpoints, path, kinematics=None) -
         "max_step_at": getattr(assignment, "max_step_at", None),
         "points_without_solution": len(getattr(assignment, "failed", [])),
         "steps_over_limit": len(getattr(assignment, "broken", [])),
+        # Whether the joint state was decided while the path was built, and what the
+        # connector had to give up on. Both exist because "the plan got worse" needs a
+        # cause, and the old single sentence covered four of them.
+        "joint_planned": bool(getattr(path, "joint_planned", False)) if path else False,
+        "joint_connector": bool(config.stroke.joint_connector),
+        "connector_failures": dict(sorted(getattr(path, "connector_failures", {}).items()))
+        if path is not None else {},
         "cache": (kinematics.summary() if kinematics is not None else None),
         "config_note": (
             "the CONFIG letters are derived from the chosen joint solution. The T/F letter was "
-            "verified on the 2026-10-23 bank of eight poses (T for negative J5, 8 of 8); the "
-            "elbow letter saw only U samples and the turn digits match nothing the pendant "
-            "showed, so both stay hints"),
+            "verified on the 2026-10-23 bank of eight poses (T for negative J5, 8 of 8), and "
+            "the turn digits now follow the pendant's convention (a reading inside [-180, 180) "
+            "is turn 0, which reproduces the bank's 0, 0, 0); the elbow letter saw only U "
+            "samples, so it stays a hint"),
     }
     if not config.robot.wrist_identified:
         block["joint_values_withheld"] = (
@@ -84,6 +96,41 @@ def budget_block(config: PlannerConfig, path) -> dict:
         "note": ("verdict is one of target_bound (reached the coverage target first), "
                  "budget_bound (ran into max_points first) or exhausted (the pool had "
                  "nothing more to offer); a fourth answer does not exist"),
+    }
+
+
+def failure_attribution_block(config: PlannerConfig, path, uncovered_by_reason) -> dict:
+    """Why things were lost, in three separate tables because they are three separate layers.
+
+    The old report had one sentence - "no route into it keeps clearance and rate" - covering
+    clearance, turn rate, joint reach and "nothing else left". That sentence cannot be acted
+    on: fixing it might mean the fixture, the connector, or the limit policy. These counters
+    can.
+
+    * `sample_reasons` is about SAMPLES: why a piece of the part is not covered. Geometric.
+    * `item_drop_reasons` is about ITEMS: why a whole sweep or pose left the program.
+    * `connector_primitive_refusals` is about ATTEMPTS: how often each connector primitive was
+      tried and refused. A refusal is not a loss unless the item was then dropped - the joint
+      move is refused on almost every transition that ends up using the retract fallback.
+    """
+    sample = dict(uncovered_by_reason or {})
+    drops = dict(getattr(path, "drop_reasons", {}) or {})
+    refusals = dict(getattr(path, "connector_failures", {}) or {})
+    return {
+        "sample_reasons": sample,
+        "item_drop_reasons": drops,
+        "connector_primitive_refusals": refusals,
+        "layers_note": {
+            "sample_reasons": "why a SAMPLE is uncovered; geometric, and the only one of the "
+                              "three that moves the coverage figure",
+            "item_drop_reasons": "why an ITEM (a sweep or a pose) left the program",
+            "connector_primitive_refusals": "how often each connector primitive was tried and "
+                                            "refused; a refusal is not a loss unless the item "
+                                            "was then dropped",
+        },
+        "joint_gate_enabled": bool(config.robot.enabled),
+        "note": ("with the joint gate off, `item_drop_reasons` only ever says the hard gate "
+                 "found no connector - there is no arm to refuse anything"),
     }
 
 
