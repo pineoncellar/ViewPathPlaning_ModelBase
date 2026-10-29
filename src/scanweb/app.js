@@ -882,6 +882,7 @@ function payload(includeMeshes) {
     delivery_mode: $("scanMode").value,
     fast: $("fastMode").value === "fast",
     fast_no_occlusion: $("fastMode").value === "fast" && $("fastNoOcclusion").checked,
+    robot_gate: $("robotGate").checked,
     run_name: runName || undefined,
     run_id: /^[A-Za-z0-9_-]{1,64}$/.test(runName) ? runName : undefined
   };
@@ -1326,6 +1327,9 @@ function renderResult(result) {
         + "（数字只描述路径形状，不能当验收依据）"
       : "精确" + (result.sample_grid_mm
         ? " · " + Number(result.sample_grid_mm).toFixed(0) + " mm 采样" : "")],
+    ["关节筛选", result.robot_enabled
+      ? "已打开（每点带 CONFIG 与关节解）"
+      : "未打开（只做几何规划，关节限位未判）"],
     ["扫描面外法向（整车）", "[" + result.scan_face_axis_vehicle.map((value) => Number(value).toFixed(3)).join(", ") + "]"],
     ["目标面面积", (Number(result.target_face_mm2) / 1e6).toFixed(4) + " m²"],
     ["配准 RMS / 最大误差", result.registration_rms_error_mm.toFixed(3) + " / " + result.registration_max_error_mm.toFixed(3) + " mm"],
@@ -1433,6 +1437,7 @@ function syncSetupFromResult(result) {
   $("fastMode").value = wasFast ? "fast" : "accurate";
   $("fastNoOcclusion").checked = wasFast && !result.fast.occlusion_modelled;
   $("fastNoOcclusion").disabled = !wasFast;
+  $("robotGate").checked = Boolean(result.robot_enabled);
   if (Number.isFinite(Number(result.uframe))) {
     $("measureFrame").value = String(Number(result.uframe));
   }
@@ -2116,6 +2121,7 @@ function currentSetup() {
     delivery_mode: $("scanMode").value,
     fast: $("fastMode").value,
     fast_no_occlusion: $("fastNoOcclusion").checked,
+    robot_gate: $("robotGate").checked,
     model_names: {
       part: state.models.part ? state.models.part.sourceName : "",
       support: state.models.support ? state.models.support.sourceName : "",
@@ -2243,6 +2249,7 @@ async function loadSelectedSetup() {
     $("fastMode").value = saved.fast === "fast" ? "fast" : "accurate";
     $("fastNoOcclusion").disabled = $("fastMode").value !== "fast";
     $("fastNoOcclusion").checked = $("fastMode").value === "fast" && Boolean(saved.fast_no_occlusion);
+    $("robotGate").checked = Boolean(saved.robot_gate);
 
     updateAxisBadge("方案：" + (saved.scan_face_axis ? AXIS_LABELS[saved.scan_face_axis] : "未记录"));
     renderDatumRows();

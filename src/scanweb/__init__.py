@@ -432,6 +432,12 @@ def _delivery_config(data: dict):
         raise ValueError("delivery mode must be 'stroke' or 'pose'")
     if mode == "pose":
         config = override(config, stroke={"enabled": False})
+    if data.get("robot_gate"):
+        # The joint gate ships off so a run without it reproduces the pre-2026-10-22 result
+        # bit for bit. Turning it on for one job is a page decision, and it sets the same
+        # `enabled` flag the command line uses - a second switch would let the page claim a
+        # screening it did not run.
+        config = override(config, robot={"enabled": True})
     if data.get("fast"):
         grid = data.get("fast_grid_mm")
         config = fast_preset(
@@ -714,6 +720,9 @@ def solve_job(data: dict, progress=None) -> dict:
         # The report's own `fast_mode` block, passed through rather than re-derived: the
         # page must not be able to describe a faster run than the one that happened.
         "fast": result.report.get("fast_mode", {"enabled": False}),
+        # Whether the joint gate ran, so the page can restore its checkbox from a result
+        # instead of guessing.
+        "robot_enabled": bool(config.robot.enabled),
         "sample_grid_mm": float(config.target.sample_grid_mm),
         "scan_face_axis_vehicle": face_axis_vehicle.tolist(),
         "scan_face_axis_measured_frame": scan_axis_target.tolist(),
@@ -806,6 +815,16 @@ def _viewpoint_from_record(record: dict) -> Viewpoint:
 
 
 def _moved_viewpoints(records, delta: np.ndarray) -> list[Viewpoint]:
+    """The planned path rigidly moved into the corrected frame.
+
+    The joint angles are DROPPED, and that is the whole point of this function being more than
+    a coordinate change: a rigid move of the delivered path means the arm is no longer where
+    the plan solved it. Carrying the old `joints_deg` through would put joint blocks in the
+    program that describe the OLD installation - points that import cleanly and then miss by
+    the size of the registration correction. Dropping them leaves the recorded motion, so a
+    transition point becomes a Cartesian point reached by `J`, which is exactly as much as can
+    honestly be claimed about a path that was transformed instead of re-planned.
+    """
     moved: list[Viewpoint] = []
     for record in records:
         viewpoint = _viewpoint_from_record(record)
@@ -813,6 +832,8 @@ def _moved_viewpoints(records, delta: np.ndarray) -> list[Viewpoint]:
             viewpoint,
             position=np.asarray(_moved_point(delta, viewpoint.position), dtype=float),
             axis=np.asarray(_moved_axis(delta, viewpoint.axis), dtype=float),
+            joints_deg=None, config=None, j5_margin_deg=None,
+            representation=("cart" if viewpoint.representation else None),
         ))
     return moved
 
@@ -1613,6 +1634,7 @@ def _clean_setup(body: dict) -> dict:
         "delivery_mode": mode,
         "fast": speed,
         "fast_no_occlusion": bool(body.get("fast_no_occlusion")),
+        "robot_gate": bool(body.get("robot_gate")),
         "model_names": model_names,
     }
 

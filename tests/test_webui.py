@@ -219,6 +219,28 @@ def test_fast_combines_with_the_pose_only_delivery_mode():
     assert both.fast.enabled is True
 
 
+def test_the_page_offers_the_joint_gate_next_to_the_speed():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="robotGate"' in page
+    assert "按机器人关节限位筛选位姿" in page
+    # the hint has to say what changes, because the gate can remove coverage
+    assert "kinematics" in page
+
+
+def test_the_joint_gate_reaches_the_planner_through_the_shipped_flag():
+    """One flag, not a page-only copy: the run turns on `robot.enabled` itself."""
+    from scanweb import _delivery_config
+
+    assert _delivery_config({}).robot.enabled is False, "off unless asked for"
+    on = _delivery_config({"robot_gate": True})
+    assert on.robot.enabled is True
+    # the envelope is the configuration's, untouched by the switch
+    off = _delivery_config({})
+    assert on.robot.soft_limits_deg == off.robot.soft_limits_deg
+    assert on.robot.mechanical_limits_deg == off.robot.mechanical_limits_deg
+
+
 def test_no_occlusion_is_only_honoured_inside_a_fast_run():
     from scanweb import _delivery_config
 
@@ -700,6 +722,7 @@ def a_setup(point: float = 1.0, *, name: str = "PART01") -> dict:
             "delivery_mode": "pose",
             "fast": "fast",
             "fast_no_occlusion": True,
+            "robot_gate": True,
         },
     }
 
@@ -724,6 +747,7 @@ def test_a_saved_setup_returns_the_meshes_and_the_picks(tmp_path, monkeypatch):
     assert restored["setup"]["delivery_mode"] == "pose"
     assert restored["setup"]["fast"] == "fast"
     assert restored["setup"]["fast_no_occlusion"] is True
+    assert restored["setup"]["robot_gate"] is True
     # The names the operator picked, so a restore shows the same files, not `part.stl`.
     assert restored["setup"]["model_names"] == {"part": "零件v2.stl", "support": "夹具.stl"}
     # The bytes are what the picks were made against, so they must come back identical.
