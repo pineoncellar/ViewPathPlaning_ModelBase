@@ -29,7 +29,7 @@ moves, and the sweep the coverage figure was computed for never happens. See
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -57,10 +57,16 @@ ROLE_REORIENT = "reorient"
 
 # The connector routes, cheapest first. Reported per transition so "the connector got
 # cheaper" is a measurement rather than a claim.
+LEVEL_JOINT = "J-direct"
 LEVEL_STRAIGHT = "L0-straight"
 LEVEL_ONE_CORNER = "L1-retract"
 LEVEL_TWO_CORNERS = "L2-retract-through"
 LEVEL_SAFE_PLANE = "L3-safe-plane"
+
+# A joint move crosses the wrist singularity when it takes J5 through zero, and the arm
+# whips round there. The DP will do it rather than lose a sweep, but it should lose ties
+# long before it does that.
+_J5_FLIP_PENALTY_DEG = 180.0
 
 # Two successive sweeps whose optical axes differ by more than this belong to different
 # scan directions, and the transfer between them has to leave through the common plane
@@ -88,6 +94,12 @@ class PathPoint:
     source: str
     stroke_id: int | None = None
     coverage_index: int | None = None
+    # How the TCP arrives here, and how the P[n] block is written. None means "whatever the
+    # program default is", which is what keeps a gate-off run byte-for-byte the old file.
+    # A joint-representation point takes the controller's choice of solution away, and that
+    # is the only way a planned branch survives to the machine.
+    motion: str | None = None
+    representation: str | None = None
 
 
 @dataclass
@@ -118,6 +130,19 @@ class PathPlan:
     # The branch assignment (`path.assign_branches`) that produced the per-point CONFIG
     # strings, kept here so the viewpoint records and the report read one source.
     branches: object | None = None
+    # True when the joint state of every delivered point was decided HERE, by the sequencing
+    # pass, rather than by a post-hoc `assign_branches` over the finished point list. The
+    # difference matters: a point list already containing retract corners cannot be re-branched
+    # without invalidating the reason those corners were inserted.
+    joint_planned: bool = False
+    # Transitions the joint move could not take, by reason, so "the connector got worse" has
+    # a cause instead of a sentence that covers four of them.
+    connector_failures: dict[str, int] = field(default_factory=dict)
+    # Items that never made it into the program, by reason. Kept apart from `dropped` (which
+    # says WHICH) so the report can say WHY without re-parsing a sentence: "the arm cannot hold
+    # that pose" and "there is no legal way to get there" are different problems with different
+    # fixes, and the old single violation line could not tell them apart.
+    drop_reasons: dict[str, int] = field(default_factory=dict)
     # (lambda, delivered points, coverage) for every budget trial, so "four times the
     # points bought this much" is a number in the report rather than an impression.
     budget_history: list[tuple[float, int, float]] = field(default_factory=list)
@@ -380,6 +405,162 @@ def _relocate(order, starts, ends, anchor, max_passes: int, gaps=None,
     return best
 
 
+def _program_targets(order, strokes: Sequence[Stroke], coverage_index, sources):
+    """The poses the program must visit, in program order, with the item each belongs to.
+
+    A zero-length stroke is a pose and yields ONE target; a real sweep yields two. That
+    identity is what keeps the reported coverage and the delivered sweep the same number, and
+    it has to be settled BEFORE the joint search, because a pose and a sweep differ in what
+    the arm is asked to do between their ends (nothing, versus a straight line).
+    """
+    items = []
+    for index, flip in order:
+        stroke = strokes[index]
+        start = np.asarray(stroke.end if flip else stroke.start, dtype=float)
+        end = np.asarray(stroke.start if flip else stroke.end, dtype=float)
+        row = None if coverage_index is None else coverage_index(index)
+        source = "greedy" if sources is None else str(sources(index))
+        axis = np.asarray(stroke.axis, dtype=float)
+        entry = PathPoint(position=start, axis=axis, roll_deg=float(stroke.roll_deg),
+                          role=ROLE_COVERAGE, source=source, stroke_id=int(index),
+                          coverage_index=row)
+        leave = None
+        if float(np.linalg.norm(end - start)) > _ZERO_MM:
+            leave = PathPoint(position=end, axis=axis, roll_deg=float(stroke.roll_deg),
+                              role=ROLE_COVERAGE, source=source, stroke_id=int(index),
+                              coverage_index=row)
+        items.append((int(index), entry, leave))
+    return items
+
+
+@dataclass
+class _ItemJoints:
+    """One item's joint state: the solution it is entered with, left with, or why neither."""
+
+    start: object | None = None
+    exit_deg: np.ndarray | None = None
+    exit_margin_deg: float | None = None
+    reason: str = ""
+
+
+def _item_options(entry: PathPoint, leave: PathPoint | None, kin, cfg: PlannerConfig
+                  ) -> tuple[list[tuple], str]:
+    """Every (start solution, exit joints, worst margin) triple this item can be delivered with.
+
+    The sweep is verified here and not later, and that is the point of the whole pass. For a
+    joint move, "both ends inside the limits" is enough; for a scan it is not, because the
+    scan is flown as a straight Cartesian line and the arm's branch has to carry it all the
+    way. `Robot.follow` is what walks that line holding the branch it started on - the check
+    whose absence let `X10290` be written, imported and then die at J2 in the middle of
+    P[12]->P[13].
+
+    An item with no triple at all cannot be delivered at any branch, and the caller drops it
+    rather than filling in something plausible.
+    """
+    found = kin.solutions(entry.position, entry.axis, entry.roll_deg)
+    if not found:
+        return [], "no_ik_solution"
+    if leave is None:
+        return [(item, np.asarray(item.joints_deg, dtype=float),
+                 float(item.min_margin_deg)) for item in found], ""
+    options = []
+    reason = ""
+    for item in found:
+        verdict = kin.follow(item.joints_deg, leave.position, leave.axis, leave.roll_deg,
+                             step_mm=float(cfg.stroke.check_step_mm))
+        if verdict.ok:
+            options.append((item, np.asarray(verdict.joints_deg, dtype=float),
+                            float(verdict.min_margin_deg)))
+        elif not reason:
+            reason = f"stroke_{verdict.reason}"
+    return options, ("" if options else reason or "stroke_unknown")
+
+
+def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_ItemJoints]:
+    """Pick one joint state per item, as a SEQUENCE rather than item by item.
+
+    Choosing the roomiest solution at every point is the mistake this exists to prevent:
+    each point can be fine alone while the pair is not, because what connects them is a joint
+    move whose cost is the joint travel. So this is the same small dynamic programme
+    `assign_branches` runs over delivered points, moved one level up - over ITEMS, so that a
+    sweep's exit joints are derived from its start solution instead of being chosen
+    separately and then found to be inconsistent.
+
+    A wrist flip (J5 changing sign) is allowed but priced at `_J5_FLIP_PENALTY_DEG`, because
+    the alternative may be losing the sweep and the controller does perform the move.
+    """
+    states = [_ItemJoints() for _ in items]
+    options: list[list[tuple]] = []
+    for position, (_index, entry, leave) in enumerate(items):
+        found, reason = _item_options(entry, leave, kin, cfg)
+        options.append(found)
+        if not found:
+            states[position].reason = reason
+    keep = [position for position, found in enumerate(options) if found]
+    if not keep:
+        return states
+    total: list[list[float]] = [[0.0] * len(options[keep[0]])]
+    parent: list[list[int]] = [[0] * len(options[keep[0]])]
+    for depth in range(1, len(keep)):
+        previous = options[keep[depth - 1]]
+        row_total: list[float] = []
+        row_parent: list[int] = []
+        for solution, _exit, _margin in options[keep[depth]]:
+            best_cost, best_source = float("inf"), 0
+            for source, (_prev_solution, prev_exit, _prev_margin) in enumerate(previous):
+                cost = total[depth - 1][source] + _joint_step_deg(prev_exit,
+                                                                  solution.joints_deg)
+                if float(np.asarray(prev_exit)[4]) * float(solution.joints_deg[4]) < 0.0:
+                    cost += _J5_FLIP_PENALTY_DEG
+                if cost < best_cost:
+                    best_cost, best_source = cost, source
+            row_total.append(best_cost)
+            row_parent.append(best_source)
+        total.append(row_total)
+        parent.append(row_parent)
+    pick = int(np.argmin(total[-1]))
+    for depth in range(len(keep) - 1, -1, -1):
+        position = keep[depth]
+        solution, exit_deg, exit_margin = options[position][pick]
+        states[position].start = solution
+        states[position].exit_deg = exit_deg
+        states[position].exit_margin_deg = exit_margin
+        if depth:
+            pick = parent[depth][pick]
+    return states
+
+
+def _branch_record(points: Sequence[PathPoint], solutions: Sequence,
+                   limit_deg: float) -> BranchAssignment:
+    """The per-point branch record the report and the exporters read.
+
+    Built from what was actually delivered rather than recomputed: a second search over the
+    finished point list could choose a different branch for a corner, and then the CONFIG
+    string would describe a move nobody verified.
+
+    `broken` counts the steps over `limit_deg`, which is REPORTED and not enforced. Leaving the
+    count at zero would make the report state "worst step 171.3, limit 40, over-limit steps 0",
+    and a block that contradicts itself is worse than no block.
+    """
+    steps = [_joint_step_deg(solutions[index - 1].joints_deg, solutions[index].joints_deg)
+             if solutions[index - 1] is not None and solutions[index] is not None else 0.0
+             for index in range(1, len(points))]
+    histogram: dict[str, int] = {}
+    for item in solutions:
+        if item is not None:
+            key = item.config.split(",")[0].strip()
+            histogram[key] = histogram.get(key, 0) + 1
+    margins = [float(item.min_margin_deg) for item in solutions if item is not None]
+    return BranchAssignment(
+        solutions=list(solutions),
+        failed=[index for index, item in enumerate(solutions) if item is None],
+        broken=[index + 1 for index, step in enumerate(steps) if step > limit_deg],
+        max_step_deg=float(max(steps)) if steps else 0.0,
+        max_step_at=(int(np.argmax(steps)) + 1 if steps else None),
+        min_margin_deg=(float(min(margins)) if margins else None),
+        histogram=histogram)
+
+
 def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Station,
                model: ScannerModel, coverage_index=None, sources=None,
                start_near=None,
@@ -398,6 +579,18 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
     both of its identical ends - is how the reported coverage and the program came apart in
     the first place.
 
+    Three passes, in this order, because each one constrains the next:
+
+    * the poses the program must visit, in program order (no geometry invented yet);
+    * the joint state of every one of them, chosen as a sequence, with every sweep verified
+      along its own straight line;
+    * the move between them, cheapest primitive first, verified hop by hop.
+
+    Doing joints in the middle is what makes the connector checkable. The old order - build
+    the corners first, solve the joints afterwards - cannot check a segment, because by then
+    the corners are fixed and the joint state that would have to carry the arm through them
+    is a property of a point list that was already committed to.
+
     `strict` decides what an unconnectable item means. With it on (the configured
     `stroke.hard_gate`), no legal route means the item is removed and listed in
     `plan.dropped`, so the caller can re-run the selection without it; the alternative is
@@ -413,42 +606,96 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
                           axis_weight=float(cfg.stroke.order_axis_weight_mm_per_deg))
     normal, plane = _safe_plane(strokes, cfg)
     points: list[PathPoint] = []
+    solutions: list = []
     plan = PathPlan(points=points, ordering=(
         "nearest neighbour + single-stroke relocation over stroke endpoints, priced by "
         "travel plus pose change"))
     plan.coverage_strokes = sum(1 for stroke in strokes if stroke.length_mm > _ZERO_MM)
 
+    # 状态：定序位姿，不带任何连接几何
+    targets = _program_targets(order, strokes, coverage_index, sources)
+    joints = None
+    if kin is not None and kin.active:
+        joints = _sequence_joints(targets, kin, cfg, plan)
+        plan.joint_planned = True
+
     previous: PathPoint | None = None
-    for index, flip in order:
-        stroke = strokes[index]
-        start = np.asarray(stroke.end if flip else stroke.start, dtype=float)
-        end = np.asarray(stroke.start if flip else stroke.end, dtype=float)
-        row = None if coverage_index is None else coverage_index(index)
-        source = "greedy" if sources is None else str(sources(index))
-        axis = np.asarray(stroke.axis, dtype=float)
-        entry = PathPoint(position=start, axis=axis, roll_deg=float(stroke.roll_deg),
-                          role=ROLE_COVERAGE, source=source, stroke_id=int(index),
-                          coverage_index=row)
+    previous_joints = None
+    for position, (index, entry, leave) in enumerate(targets):
+        state = None if joints is None else joints[position]
+        if state is not None and state.start is None:
+            plan.dropped.append(index)
+            _note_drop(plan, state.reason or "no_joint_solution")
+            plan.violations.append(
+                f"stroke {index} dropped: {state.reason or 'no joint solution'}")
+            continue
+        start_joints = None if state is None else state.start.joints_deg
+        entry = PathPoint(
+            position=entry.position, axis=entry.axis, roll_deg=entry.roll_deg,
+            role=entry.role, source=entry.source, stroke_id=entry.stroke_id,
+            coverage_index=entry.coverage_index,
+            motion=("J" if state is not None else None),
+            representation=("joint" if state is not None else None))
         if previous is not None:
             routed = _connector(previous, entry, cfg, plan, station, model,
                                 visible=visible, strict=hard, normal=normal, plane=plane,
-                                kin=kin)
+                                kin=kin, start_joints=previous_joints,
+                                end_joints=start_joints)
             if routed is None:
-                plan.dropped.append(int(index))
+                plan.dropped.append(index)
+                _note_drop(plan, "connector_no_route")
                 plan.violations.append(
-                    f"stroke {index} dropped: no route into it keeps clearance and rate "
-                    f"({rotation_text(previous, entry)})")
+                    f"stroke {index} dropped: no legal connector "
+                    f"({rotation_text(previous, entry)}, reasons "
+                    f"{dict(plan.connector_failures)})")
                 continue
-            points.extend(routed)
+            for corner, corner_solution in zip(routed.points,
+                                               routed.solutions or [None] * len(
+                                                   routed.points), strict=True):
+                points.append(PathPoint(
+                    position=corner.position, axis=corner.axis,
+                    roll_deg=corner.roll_deg, role=corner.role, source=corner.source,
+                    stroke_id=corner.stroke_id,
+                    motion=("J" if corner_solution is not None else None),
+                    representation=("joint" if corner_solution is not None else None)))
+                solutions.append(corner_solution)
         points.append(entry)
+        solutions.append(None if state is None else state.start)
         # A zero-length stroke IS a pose: appending its "end" as well would deliver two
         # identical corners, which the point count and the .LS program would both carry.
-        if float(np.linalg.norm(end - start)) > _ZERO_MM:
-            points.append(PathPoint(position=end, axis=axis,
-                                    roll_deg=float(stroke.roll_deg),
-                                    role=ROLE_COVERAGE, source=source,
-                                    stroke_id=int(index), coverage_index=row))
+        if leave is not None:
+            points.append(PathPoint(
+                position=leave.position, axis=leave.axis, roll_deg=leave.roll_deg,
+                role=leave.role, source=leave.source, stroke_id=leave.stroke_id,
+                coverage_index=leave.coverage_index,
+                motion=("L" if state is not None else None),
+                representation=("cart" if state is not None else None)))
+            solutions.append(None if state is None else _exit_solution(state, kin.robot))
         previous = points[-1]
+        previous_joints = None if state is None else state.exit_deg
+
+    if plan.joint_planned:
+        _unwrap_readings(solutions, kin.robot)
+        plan.branches = _branch_record(points, solutions, float(cfg.robot.max_step_deg))
+        plan.max_step_deg = plan.branches.max_step_deg
+        if plan.branches.broken:
+            plan.violations.append(
+                f"{len(plan.branches.broken)} joint step(s) exceed max_step_deg "
+                f"({plan.max_step_deg:.1f} > {cfg.robot.max_step_deg:g} deg); these are "
+                "reported, not refused - import the program and watch those moves")
+        positive = sum(1 for item in solutions
+                       if item is not None and float(item.joints_deg[4]) > 0.0)
+        if positive:
+            # The file asks for one wrist branch and it can only ask for `N U T`. A plan on the
+            # other one is not a plan the controller will fly, and the failure is silent until
+            # the first L: MOTN-063, position configuration mismatch. Refusing to write it
+            # quietly is the whole reason `robot.wrist_flip_policy` defaults to T.
+            plan.violations.append(
+                f"{positive} of {len(points)} delivered point(s) sit on the J5-positive wrist "
+                "branch. The program writes Cartesian points with the constant CONFIG "
+                "'N U T', and an L move cannot change the wrist branch, so those points will "
+                "stop with MOTN-063 (and the letter F is refused at load with ASBN-023). Set "
+                "robot.wrist_flip_policy to 'T'.")
 
     plan.path_length_mm = _travel(points)
     say(f"  path: {len(strokes)} items ({plan.coverage_strokes} strokes) -> "
@@ -457,6 +704,82 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
         f"{plan.interrupts_b} re-orientations"
         + (f", {len(plan.dropped)} dropped by the hard gate" if plan.dropped else ""))
     return plan
+
+
+def _exit_solution(state: _ItemJoints, robot):
+    """The far end of a sweep, as the walk left it.
+
+    Not a `Solution`: nothing was solved at this pose, the walk derived it. The shoulder and
+    elbow letters are carried over because the CONFIG string has to be re-derivable after the
+    sequence is unwrapped to the nearest readings - the letters never change, only the turn
+    digits.
+    """
+    if state.exit_deg is None or state.start is None:
+        return None
+    exit_deg = np.asarray(state.exit_deg, dtype=float)
+    start = state.start
+    margin = (float(state.exit_margin_deg) if state.exit_margin_deg is not None
+              else float(start.min_margin_deg))
+    return _BranchOnly(
+        joints_deg=exit_deg, shoulder=str(start.shoulder), elbow=str(start.elbow),
+        config=robot.config_string(exit_deg, start.shoulder, start.elbow),
+        j5_margin_deg=float(start.j5_margin_deg),
+        min_margin_deg=min(margin, float(start.min_margin_deg)))
+
+
+@dataclass(frozen=True)
+class _BranchOnly:
+    """A sweep's far end: the joints the verified walk arrived at, and its CONFIG hint."""
+
+    joints_deg: np.ndarray
+    shoulder: str
+    elbow: str
+    config: str
+    j5_margin_deg: float
+    min_margin_deg: float
+
+
+def _nearest_readings(values, previous, robot) -> np.ndarray:
+    """Every axis moved to the equivalent reading closest to `previous`, if still usable.
+
+    `Robot._place` picks the roomiest reading for a pose on its own, and two neighbouring poses
+    can come back with readings almost a full turn apart. Measured on the delivered 59-point
+    plan before this pass existed: 18 of 58 segments had a literal J6 change over 180 degrees,
+    the worst 352.6 degrees for a 17 degree change of the pose. A joint move interpolates the
+    NUMBER it is given, not the shortest angle, so that reading buys a wrist spinning almost
+    all the way round for nothing.
+    """
+    moved = np.asarray(values, dtype=float).copy()
+    for axis in range(6):
+        options = robot.wraps(axis, float(moved[axis]))
+        if options:
+            moved[axis] = min(options, key=lambda value: abs(value - float(previous[axis])))
+    # the alternative readings stay inside the controller limits by construction, but not
+    # necessarily inside the do-not-ride-the-limit band, so the policy gets the last word
+    return moved if robot.feasible(moved) else np.asarray(values, dtype=float)
+
+
+def _unwrap_readings(solutions: list, robot) -> None:
+    """Rewrite the delivered joint readings so no axis travels the long way round.
+
+    In place, over the finished sequence: each point takes the equivalent reading nearest the
+    one before it. The physical pose is untouched - only the number the controller is told
+    changes - so nothing that was verified has to be verified again.
+    """
+    previous = None
+    for index, item in enumerate(solutions):
+        if item is None:
+            continue
+        values = np.asarray(item.joints_deg, dtype=float)
+        if previous is not None:
+            moved = _nearest_readings(values, previous, robot)
+            if float(np.abs(moved - values).max()) > 1e-9:
+                solutions[index] = replace(
+                    item, joints_deg=tuple(float(value) for value in moved),
+                    config=robot.config_string(moved, item.shoulder, item.elbow))
+        previous = np.asarray(solutions[index].joints_deg, dtype=float)
+
+
 
 
 def rotation_text(previous: PathPoint, entry: PathPoint) -> str:
@@ -524,92 +847,247 @@ def _segment_margin(first: PathPoint, second: PathPoint, cfg: PlannerConfig,
     count = max(1, int(np.ceil(length / cfg.stroke.check_step_mm)))
     fractions = np.linspace(0.0, 1.0, count + 1)[:, None]
     positions = start[None, :] * (1.0 - fractions) + end[None, :] * fractions
-    margin = float(station.clearance_mm(positions).min() - model.body_limit_mm)
-    seen = True if visible is None else bool(np.all(visible(positions)))
+    return _positions_margin(positions, station, model, visible=visible)
+
+
+def _positions_margin(positions, station: Station, model: ScannerModel, *, visible=None
+                      ) -> tuple[float, bool]:
+    """Smallest body clearance over a set of TCP positions, and whether the tracker held.
+
+    Separate from `_segment_margin` because a joint move does not sweep a straight line: the
+    positions have to come from forward kinematics along the joint path, and then the same
+    clearance test applies. An empty set is "nothing to check" and not a pass - callers that
+    could not walk the path must say so themselves rather than read infinity as clearance.
+    """
+    if len(positions) == 0:
+        return float("inf"), True
+    stacked = np.asarray(positions, dtype=float)
+    margin = float(station.clearance_mm(stacked).min() - model.body_limit_mm)
+    seen = True if visible is None else bool(np.all(visible(stacked)))
     return margin, seen
+
+
+@dataclass
+class Route:
+    """What the connector decided: the corners it inserts, the route it took, and joints.
+
+    `solutions` is one feasible joint solution per inserted corner, in the same order, or
+    empty when the kinematic gate is off. It is carried here rather than recomputed at export
+    time because the corner that was verified is the corner that must be written - solving it
+    again later can land on another branch and quietly deliver a different move.
+    """
+
+    points: list[PathPoint] = field(default_factory=list)
+    level: str = ""
+    solutions: list = field(default_factory=list)
+
+
+def _note_failure(plan: PathPlan, reason: str) -> None:
+    """Count why a connector had to give up on one primitive, by name.
+
+    The old code collapsed "clearance", "rate", "joint" and "nothing else left" into one
+    sentence, which made "why did this sweep get dropped" unanswerable. Four counters cost
+    nothing and answer it.
+    """
+    if not reason:
+        return
+    plan.connector_failures[reason] = plan.connector_failures.get(reason, 0) + 1
+
+
+def _note_drop(plan: PathPlan, reason: str) -> None:
+    """Count why an item never reached the program, by name."""
+    key = reason or "unknown"
+    plan.drop_reasons[key] = plan.drop_reasons.get(key, 0) + 1
+
+
+def _joint_step_deg(first, second) -> float:
+    """Largest single-axis change between two joint sets, circularly.
+
+    Circular because the controller takes the shortest path per axis: +179 and -181 are two
+    degrees apart, not 360, and a straight subtraction would report a crossing that is not
+    there.
+    """
+    delta = (np.asarray(second, dtype=float) - np.asarray(first, dtype=float))
+    return float(np.max(np.abs((delta + 180.0) % 360.0 - 180.0)))
+
+
+def _joint_move(first, second, cfg: PlannerConfig, station: Station, model: ScannerModel,
+                *, visible=None, kin=None) -> tuple[bool, float, str]:
+    """Whether a single joint move from `first` to `second` is deliverable.
+
+    This is the primary connector primitive and the reason the plan got simpler. A joint move
+    interpolates every axis linearly, so the joint-space path is a straight segment inside a
+    box whose two ends are known to be legal - the limits cannot be crossed in the middle. It
+    needs no intermediate point, so it needs no retract corner, so it needs no CONFIG, so the
+    seven unsolvable points that the retract corners contributed simply do not exist.
+
+    Three things are still checked:
+    `j5_crossover` - J5 changing sign means the wrist goes through the singularity, where the
+      arm whips round; allowed by the controller, not something to do without a reason.
+    `collision` - the TCP does NOT travel a straight line when the joints do, so the swept
+      path has to be sampled through forward kinematics.
+    `tracker_blocked` - a transition still has to look like one, because the measurement must
+      not be interrupted by the arm covering the tracker.
+    """
+    from_deg = np.asarray(first, dtype=float).reshape(6)
+    to_deg = np.asarray(second, dtype=float).reshape(6)
+    if float(from_deg[4]) * float(to_deg[4]) < 0.0:
+        return False, float("inf"), "j5_crossover"
+    positions = kin.sweep_points(from_deg, to_deg,
+                                 step_deg=float(cfg.stroke.joint_step_deg))
+    if positions is None:
+        return False, float("inf"), "unverified"
+    margin, seen = _positions_margin(positions, station, model, visible=visible)
+    if margin <= 0.0:
+        return False, margin, "collision"
+    if not seen:
+        return False, margin, "tracker_blocked"
+    return True, margin, ""
+
+
+def _chain_route(first_joints, corners, entry_joints, cfg: PlannerConfig, station: Station,
+                 model: ScannerModel, *, visible=None, kin=None):
+    """Walk a fallback route hop by hop, or give up.
+
+    Greedy on purpose: this is the route the joint move already refused, so spending a
+    dynamic programme on it would cost more than the sweep it saves. What is not greedy is
+    the verification - every hop is checked, including the last one into the entry, because
+    the whole reason a segment check exists is a move that looked fine at both ends.
+
+    Returns (solutions, ok). `solutions` is what the exporter must write, so the joints that
+    were verified are the joints that get delivered.
+    """
+    if kin is None or not kin.active:
+        return [None] * len(corners), True
+    if first_joints is None:
+        return [], False
+    held = np.asarray(first_joints, dtype=float).reshape(6)
+    chosen: list = []
+    for corner in corners:
+        options = kin.solutions(corner.position, corner.axis, corner.roll_deg)
+        if not options:
+            return [], False
+        ordered = sorted(options, key=lambda item: _joint_step_deg(held, item.joints_deg))
+        landed = None
+        for item in ordered:
+            ok, _margin, _reason = _joint_move(held, item.joints_deg, cfg, station, model,
+                                               visible=visible, kin=kin)
+            if ok:
+                landed = item
+                break
+        if landed is None:
+            return [], False
+        chosen.append(landed)
+        held = np.asarray(landed.joints_deg, dtype=float).reshape(6)
+    if entry_joints is not None:
+        ok, _margin, _reason = _joint_move(held, entry_joints, cfg, station, model,
+                                           visible=visible, kin=kin)
+        if not ok:
+            return [], False
+    return chosen, True
 
 
 def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: PathPlan,
                station: Station, model: ScannerModel, *,
-               visible=None, strict: bool = False, normal=None, plane=None, kin=None
-               ) -> list[PathPoint] | None:
-    """The points that take the head from `previous` to `entry` without cutting a corner.
+               visible=None, strict: bool = False, normal=None, plane=None, kin=None,
+               start_joints=None, end_joints=None) -> Route | None:
+    """The corners that take the head from `previous` to `entry`, and which route won.
 
     Routes, cheapest first, and `stroke.connector_level` says how far down the planner may
     go:
 
+    * **J-direct** - one joint move, no corner at all. The primary route whenever the joint
+      state of both ends is known, which is whenever the kinematic gate is on. See
+      `_joint_move` for why this cannot fail in the middle.
     * **L3** - leave through the common safe plane and come back in on the other side. Used
       only when the two sweeps look in different directions, because that is the case the
-      per-axis retract gets wrong.
+      per-axis retract gets wrong. Now a fallback: it exists for the transitions where the
+      joint move collides.
     * **L0** - straight there, no corner at all. Only for two identical poses, and only
       when that line keeps its clearance. Off by default: the "body" in this model is a
       sphere, which does not rotate with the head, so the model cannot see the part of a
       real handset that swings round behind the reference point.
-    * **L1** - retract along -axis, then fly to the next entry point, spreading the
-      re-orientation over the flight instead of over a short dive. This is safer than the
-      two-corner route, not more dangerous: L2 puts the whole turn on the segment closest
-      to the part.
+    * **L1** - retract along -axis, then fly to the next entry point.
     * **L2** - retract, traverse to a point behind the next entry, dive in. Two corners.
 
-    Both of the retracting routes have to agree with the clearance check, because a fixed
-    lift assumes the space behind the head is empty and on this cell it is not: behind the
-    upper face is the base, behind the lower face is the floor side of the fixture. So the
-    lift is raised until the moves are clear AND the rotation is spread over enough travel
-    to stay inside the rate limit.
+    The retracting routes have to agree with the clearance check, because a fixed lift
+    assumes the space behind the head is empty and on this cell it is not: behind the upper
+    face is the base, behind the lower face is the floor side of the fixture. So the lift is
+    raised until the moves are clear AND the rotation is spread over enough travel to stay
+    inside the rate limit.
 
-    Returns None when no route qualifies and `strict` is set - that is the hard gate, and
-    the caller turns it into "this item is not delivered" rather than a line in a report.
+    Returns None when no route qualifies and `strict` is set - that is the hard gate, and the
+    caller turns it into "this item is not delivered" rather than a line in a report.
     """
     same = _same_pose(previous, entry)
     rotation = _rotation_deg(previous, entry)
     limit = int(cfg.stroke.connector_level)
 
+    # 状态：先试关节直连，它既不需要中间点，也不存在中段超限
+    if (bool(cfg.stroke.joint_connector) and kin is not None and kin.active
+            and start_joints is not None and end_joints is not None):
+        ok, margin, reason = _joint_move(start_joints, end_joints, cfg, station, model,
+                                         visible=visible, kin=kin)
+        if ok:
+            _record(plan, same, margin, rotation, 0.0, LEVEL_JOINT, entry, cfg)
+            return Route([], LEVEL_JOINT)
+        _note_failure(plan, reason)
+
     if normal is not None and _crosses_direction(previous, entry):
         found = _cross_group(previous, entry, cfg, station, model, rotation,
                              normal=normal, plane=plane, visible=visible)
         if found is not None and _route_allowed(found[0], kin):
-            route, margin = found
-            _record(plan, same, margin, rotation, 0.0, LEVEL_SAFE_PLANE, entry, cfg)
-            return route
+            corners, margin = found
+            solutions, ok = _chain_route(start_joints, corners, end_joints, cfg, station,
+                                         model, visible=visible, kin=kin)
+            if ok:
+                _record(plan, same, margin, rotation, 0.0, LEVEL_SAFE_PLANE, entry, cfg)
+                return Route(corners, LEVEL_SAFE_PLANE, solutions)
+        _note_failure(plan, "safe_plane")
 
     if limit <= 0 and same:
         margin, seen = _segment_margin(previous, entry, cfg, station, model,
                                        visible=visible)
         if margin > 0.0 and seen:
             _record(plan, same, margin, rotation, 0.0, LEVEL_STRAIGHT, entry, cfg)
-            return []
+            return Route([], LEVEL_STRAIGHT)
 
     if limit <= 1:
         found = _one_corner(previous, entry, cfg, station, model, rotation,
                             visible=visible, kin=kin)
         if found is not None and _route_allowed(found[0], kin):
-            points, margin = found
-            _record(plan, same, margin, rotation, 0.0, LEVEL_ONE_CORNER, entry, cfg)
-            return points
+            corners, margin = found
+            solutions, ok = _chain_route(start_joints, corners, end_joints, cfg, station,
+                                         model, visible=visible, kin=kin)
+            if ok:
+                _record(plan, same, margin, rotation, 0.0, LEVEL_ONE_CORNER, entry, cfg)
+                return Route(corners, LEVEL_ONE_CORNER, solutions)
+        _note_failure(plan, "retract")
 
-    points, margin, rate = _two_corners(previous, entry, cfg, station, model, rotation,
-                                        same, visible=visible, kin=kin)
+    corners, margin, rate = _two_corners(previous, entry, cfg, station, model, rotation,
+                                         same, visible=visible, kin=kin)
+    solutions, chain_ok = _chain_route(start_joints, corners, end_joints, cfg, station,
+                                       model, visible=visible, kin=kin)
     # The hard gate refuses on CLEARANCE and on joint feasibility. It does not refuse on
     # `rate`: how much rotation one millimetre of flight can absorb is a modelling
-    # assumption whose constant (`max_rot_deg_per_mm`) has never been calibrated on this
-    # cell, and turning an unmeasured heuristic into a dropped sweep makes the plan look
+    # assumption whose constant (`max_rot_deg_per_mm`) was only ever bounded from below on
+    # this cell, and turning an unmeasured heuristic into a dropped sweep makes the plan look
     # legal by making it worse. Rate failures are still recorded as violations and counted
     # in the report, so they stay visible rather than accepted.
-    legal = margin > 0.0 and _route_allowed(points, kin)
+    legal = margin > 0.0 and _route_allowed(corners, kin) and chain_ok
     _record(plan, same, margin, rotation, rate, LEVEL_TWO_CORNERS, entry, cfg)
     if strict and not legal:
+        _note_failure(plan, "retract_through" if margin > 0.0 else "collision")
         return None
-    return points
+    return Route(corners, LEVEL_TWO_CORNERS, solutions)
 
 
 def _route_allowed(points, kin) -> bool:
     """Whether the arm can hold every transition corner a route would insert.
 
-    Only the corners are tested, not the segments between them: a `J` move between two
-    reachable poses is not a pose problem, and pretending to check an interpolated joint
-    path that this library does not model would be worse than saying so. What this catches
-    is the real failure - a retract point behind the head that is inside the robot's own
-    base, where no branch exists.
+    Only that a solution EXISTS at each corner: this is the lift search's own filter, and
+    asking it for a branch would be meaningless because a joint move may legitimately switch
+    one. The hop-by-hop check, including the move into the entry, is `_chain_route`.
     """
     if kin is None or not kin.active:
         return True
@@ -617,6 +1095,7 @@ def _route_allowed(points, kin) -> bool:
         if not kin.check(point.position, point.axis, point.roll_deg).ok:
             return False
     return True
+
 
 
 def _crosses_direction(previous: PathPoint, entry: PathPoint) -> bool:
