@@ -861,6 +861,35 @@ function updateWorkflow() {
 
 /* ---------- registration and planning ---------- */
 
+// 覆盖率目标：勾了「不设上限」或留空都表示 null，也就是选到没有新增覆盖为止。
+// 非法输入原样回传（服务端还会再验一次），这样配准预览不会因为一个填错的数字整片变红；
+// 真正发规划请求前由 requireCoverageTarget() 当场拦下来。
+function coverageTargetInput() {
+  if ($("coverageTargetNone").checked) return null;
+  const raw = $("coverageTarget").value.trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : raw;
+}
+
+function requireCoverageTarget() {
+  const value = coverageTargetInput();
+  if (value === null) return null;
+  if (typeof value !== "number" || value <= 0 || value > 100) {
+    throw new Error("覆盖率目标必须是 0~100 之间的百分数，或勾选「不设上限」");
+  }
+  return value;
+}
+
+function showCoverageTarget(value) {
+  const unlimited = value === null || value === undefined;
+  $("coverageTargetNone").checked = unlimited;
+  $("coverageTarget").disabled = unlimited;
+  if (unlimited) return;
+  const numeric = Number(value);
+  $("coverageTarget").value = Number.isFinite(numeric) ? String(numeric) : String(value);
+}
+
 function payload(includeMeshes) {
   if (state.picked.length !== state.pointCount) {
     throw new Error("请在 3D 模型上依次选取 " + state.pointCount + " 个定位点");
@@ -882,7 +911,7 @@ function payload(includeMeshes) {
     delivery_mode: $("scanMode").value,
     fast: $("fastMode").value === "fast",
     fast_no_occlusion: $("fastMode").value === "fast" && $("fastNoOcclusion").checked,
-    robot_gate: $("robotGate").checked,
+    coverage_target_pct: coverageTargetInput(),
     run_name: runName || undefined,
     run_id: /^[A-Za-z0-9_-]{1,64}$/.test(runName) ? runName : undefined
   };
@@ -1212,6 +1241,8 @@ async function solve() {
   if (state.solving) return;
   try {
     payload(false);
+    // 覆盖率目标在发请求前就验一遍：填错了不该等到传完模型才失败
+    requireCoverageTarget();
   } catch (error) {
     $("formFeedback").textContent = error.message;
     toast(error.message);
@@ -1327,9 +1358,10 @@ function renderResult(result) {
         + "（数字只描述路径形状，不能当验收依据）"
       : "精确" + (result.sample_grid_mm
         ? " · " + Number(result.sample_grid_mm).toFixed(0) + " mm 采样" : "")],
-    ["关节筛选", result.robot_enabled
-      ? "已打开（每点带 CONFIG 与关节解）"
-      : "未打开（只做几何规划，关节限位未判）"],
+    ["覆盖率目标", result.coverage_target_pct === null || result.coverage_target_pct === undefined
+      ? "不设上限（一直选到没有新增覆盖为止）"
+      : Number(result.coverage_target_pct).toFixed(1) + " %"],
+    ["关节筛选", "始终开启 · 每点带 CONFIG 与关节解"],
     ["扫描面外法向（整车）", "[" + result.scan_face_axis_vehicle.map((value) => Number(value).toFixed(3)).join(", ") + "]"],
     ["目标面面积", (Number(result.target_face_mm2) / 1e6).toFixed(4) + " m²"],
     ["配准 RMS / 最大误差", result.registration_rms_error_mm.toFixed(3) + " / " + result.registration_max_error_mm.toFixed(3) + " mm"],
@@ -1437,7 +1469,9 @@ function syncSetupFromResult(result) {
   $("fastMode").value = wasFast ? "fast" : "accurate";
   $("fastNoOcclusion").checked = wasFast && !result.fast.occlusion_modelled;
   $("fastNoOcclusion").disabled = !wasFast;
-  $("robotGate").checked = Boolean(result.robot_enabled);
+  if (result.coverage_target_pct !== undefined) {
+    showCoverageTarget(result.coverage_target_pct);
+  }
   if (Number.isFinite(Number(result.uframe))) {
     $("measureFrame").value = String(Number(result.uframe));
   }
@@ -1698,6 +1732,9 @@ function bindEvents() {
     const fast = $("fastMode").value === "fast";
     $("fastNoOcclusion").disabled = !fast;
     if (!fast) $("fastNoOcclusion").checked = false;
+  });
+  $("coverageTargetNone").addEventListener("change", () => {
+    $("coverageTarget").disabled = $("coverageTargetNone").checked;
   });
   $("measureFrame").addEventListener("change", () => {
     state.registration = null;
@@ -2121,7 +2158,7 @@ function currentSetup() {
     delivery_mode: $("scanMode").value,
     fast: $("fastMode").value,
     fast_no_occlusion: $("fastNoOcclusion").checked,
-    robot_gate: $("robotGate").checked,
+    coverage_target_pct: coverageTargetInput(),
     model_names: {
       part: state.models.part ? state.models.part.sourceName : "",
       support: state.models.support ? state.models.support.sourceName : "",
@@ -2249,7 +2286,9 @@ async function loadSelectedSetup() {
     $("fastMode").value = saved.fast === "fast" ? "fast" : "accurate";
     $("fastNoOcclusion").disabled = $("fastMode").value !== "fast";
     $("fastNoOcclusion").checked = $("fastMode").value === "fast" && Boolean(saved.fast_no_occlusion);
-    $("robotGate").checked = Boolean(saved.robot_gate);
+    if (saved.coverage_target_pct !== undefined) {
+      showCoverageTarget(saved.coverage_target_pct);
+    }
 
     updateAxisBadge("方案：" + (saved.scan_face_axis ? AXIS_LABELS[saved.scan_face_axis] : "未记录"));
     renderDatumRows();
@@ -2305,6 +2344,11 @@ async function applyServerDefaults() {  try {
     const fast = document.querySelector('#fastMode option[value="fast"]');
     if (fast && config.fast_grid_mm) {
       fast.textContent = "快速 · " + Number(config.fast_grid_mm).toFixed(0) + " mm 采样（约 2 分钟）";
+    }
+    // The acceptance target is a site knob, so the control starts on the configuration's
+    // value; `null` means the selection runs until nothing new is covered.
+    if (config.coverage_target_pct !== undefined) {
+      showCoverageTarget(config.coverage_target_pct);
     }
   } catch (_error) {
     /* keep the built-in default */

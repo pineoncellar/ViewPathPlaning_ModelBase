@@ -50,7 +50,8 @@ def test_the_page_defaults_come_from_the_shipped_configuration():
     config = scanweb._public_config()
     assert config["delivery_mode"] == "stroke"
     assert config["surface_bias"] == pytest.approx(0.5)
-    assert config["robot_enabled"] is False
+    assert config["coverage_target_pct"] == pytest.approx(90.0)
+    assert "robot_enabled" not in config, "the joint gate stopped being a page choice"
     assert config["motion"] in ("J", "L")
     # The page labels the speed choice with these, so they must describe the same run.
     assert config["sample_grid_mm"] > 0
@@ -219,26 +220,54 @@ def test_fast_combines_with_the_pose_only_delivery_mode():
     assert both.fast.enabled is True
 
 
-def test_the_page_offers_the_joint_gate_next_to_the_speed():
+def test_the_page_no_longer_offers_a_joint_gate_switch():
     page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
 
-    assert 'id="robotGate"' in page
-    assert "按机器人关节限位筛选位姿" in page
+    assert 'id="robotGate"' not in page
+    # the explanation stays on screen, because what the gate does still has to be visible
+    assert "关节限位筛选" in page and "始终开启" in page
     # the hint has to say what changes, because the gate can remove coverage
     assert "kinematics" in page
 
 
-def test_the_joint_gate_reaches_the_planner_through_the_shipped_flag():
-    """One flag, not a page-only copy: the run turns on `robot.enabled` itself."""
+def test_the_page_offers_a_coverage_target_with_an_unlimited_option():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="coverageTarget"' in page
+    assert 'id="coverageTargetNone"' in page
+    assert "不设上限" in page
+    # the hint has to say that the target also stops the refinement, which is the whole
+    # reason the leftover areas look the way they do
+    assert "二次瞄准" in page
+
+
+def test_the_coverage_target_reaches_the_planner_and_can_be_switched_off():
     from scanweb import _delivery_config
 
-    assert _delivery_config({}).robot.enabled is False, "off unless asked for"
-    on = _delivery_config({"robot_gate": True})
-    assert on.robot.enabled is True
-    # the envelope is the configuration's, untouched by the switch
-    off = _delivery_config({})
-    assert on.robot.soft_limits_deg == off.robot.soft_limits_deg
-    assert on.robot.mechanical_limits_deg == off.robot.mechanical_limits_deg
+    shipped = _delivery_config({})
+    assert shipped.target.coverage_target_pct == pytest.approx(90.0), "the shipped value"
+    assert _delivery_config({"coverage_target_pct": 100}).target.coverage_target_pct == 100.0
+    assert _delivery_config(
+        {"coverage_target_pct": "97.5"}).target.coverage_target_pct == pytest.approx(97.5)
+    # null and the empty form field both mean "run until nothing new is covered"
+    assert _delivery_config({"coverage_target_pct": None}).target.coverage_target_pct is None
+    assert _delivery_config({"coverage_target_pct": ""}).target.coverage_target_pct is None
+    for bad in (0, -1, 101, "abc"):
+        with pytest.raises(ValueError, match="覆盖率目标"):
+            _delivery_config({"coverage_target_pct": bad})
+
+
+def test_the_joint_gate_is_always_on_and_cannot_be_switched_off_from_the_page():
+    """The gate is forced on: a plan the arm cannot hold has no use on site."""
+    from scanweb import _delivery_config
+
+    on = _delivery_config({})
+    assert on.robot.enabled is True, "on even though the configuration ships it off"
+    # a leftover key from an old saved setup must not be able to switch it back off
+    assert _delivery_config({"robot_gate": False}).robot.enabled is True
+    # the envelope is the configuration's, untouched by the page
+    assert on.robot.soft_limits_deg == _delivery_config({}).robot.soft_limits_deg
+    assert on.robot.mechanical_limits_deg == _delivery_config({}).robot.mechanical_limits_deg
 
 
 def test_no_occlusion_is_only_honoured_inside_a_fast_run():
@@ -722,7 +751,7 @@ def a_setup(point: float = 1.0, *, name: str = "PART01") -> dict:
             "delivery_mode": "pose",
             "fast": "fast",
             "fast_no_occlusion": True,
-            "robot_gate": True,
+            "coverage_target_pct": 97.5,
         },
     }
 
@@ -747,7 +776,8 @@ def test_a_saved_setup_returns_the_meshes_and_the_picks(tmp_path, monkeypatch):
     assert restored["setup"]["delivery_mode"] == "pose"
     assert restored["setup"]["fast"] == "fast"
     assert restored["setup"]["fast_no_occlusion"] is True
-    assert restored["setup"]["robot_gate"] is True
+    assert restored["setup"]["coverage_target_pct"] == pytest.approx(97.5)
+    assert "robot_gate" not in restored["setup"], "the switch is gone, not just defaulted"
     # The names the operator picked, so a restore shows the same files, not `part.stl`.
     assert restored["setup"]["model_names"] == {"part": "零件v2.stl", "support": "夹具.stl"}
     # The bytes are what the picks were made against, so they must come back identical.

@@ -392,6 +392,9 @@ def _public_config() -> dict:
     Only settings a page control can express, and the mode in the page's own vocabulary
     (`stroke` / `pose`) rather than the config's (`path` / `lean`). Everything here is a
     default: the page can still ask for something else, and the run reports what it used.
+
+    There is no `robot_enabled` here on purpose: the joint gate is not a page choice, so a
+    key that describes it would only invite a switch that no longer exists.
     """
     config = load_config()
     return {
@@ -400,7 +403,6 @@ def _public_config() -> dict:
         "surface_bias": float(config.target.surface_bias),
         "max_points": config.target.max_points,
         "pool_mode": config.stroke.pool_mode,
-        "robot_enabled": bool(config.robot.enabled),
         "motion": config.motion.type,
         "termination": config.motion.termination,
         "speed_mm_s": float(config.motion.speed_mm_s),
@@ -414,12 +416,46 @@ def _public_config() -> dict:
     }
 
 
+# 覆盖率目标：页面没传这个键就沿用配置（`_KEEP`），显式 null / 空串表示不设上限。
+_KEEP = object()
+
+
+def _coverage_target(raw):
+    """One page value for `target.coverage_target_pct`, refused here rather than clamped.
+
+    `None` and the empty string both mean "no target": the selection then runs until no
+    candidate adds coverage, and only then do the refinement rounds aimed at what is still
+    uncovered run at all. The range check mirrors `config.validate`, so the operator hears
+    it in the page instead of reading a traceback in the server log.
+    """
+    if raw is _KEEP:
+        return _KEEP
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("覆盖率目标必须填百分数，或留空 / 勾选「不设上限」") from error
+    if not 0.0 < value <= 100.0:
+        raise ValueError("覆盖率目标必须大于 0 且不超过 100，或留空 / 勾选「不设上限」")
+    return value
+
+
 def _delivery_config(data: dict):
     """The configuration for one job: the shipped file plus the page's delivery mode.
 
     The two modes differ in the PLANNING unit, not only in the export: "pose" is the v1
     deliverable of isolated stops, so it switches the stroke stage off. Re-sorting the
     export order would not make a stroke plan pose-only.
+
+    The joint gate is forced on. It used to be a checkbox, and unchecking it produced a
+    plan that promises coverage the arm cannot hold - a deliverable with no use on site,
+    so the switch is gone rather than defaulted. `enabled` is the same flag the command
+    line uses, so the page cannot claim a screening it did not run.
+
+    The coverage target IS a page setting because it is a site decision: at the target the
+    selection stops AND the refinement rounds aimed at what is still uncovered are skipped,
+    which is exactly what leaves the sloped areas behind.
 
     Fast mode is applied LAST and by the same `fast_preset` the command line uses, so the
     page and `scanplan plan --fast` cannot drift apart. `single_face=False` because this
@@ -432,12 +468,10 @@ def _delivery_config(data: dict):
         raise ValueError("delivery mode must be 'stroke' or 'pose'")
     if mode == "pose":
         config = override(config, stroke={"enabled": False})
-    if data.get("robot_gate"):
-        # The joint gate ships off so a run without it reproduces the pre-2026-10-22 result
-        # bit for bit. Turning it on for one job is a page decision, and it sets the same
-        # `enabled` flag the command line uses - a second switch would let the page claim a
-        # screening it did not run.
-        config = override(config, robot={"enabled": True})
+    config = override(config, robot={"enabled": True})
+    target = _coverage_target(data.get("coverage_target_pct", _KEEP))
+    if target is not _KEEP:
+        config = override(config, target={"coverage_target_pct": target})
     if data.get("fast"):
         grid = data.get("fast_grid_mm")
         config = fast_preset(
@@ -720,9 +754,12 @@ def solve_job(data: dict, progress=None) -> dict:
         # The report's own `fast_mode` block, passed through rather than re-derived: the
         # page must not be able to describe a faster run than the one that happened.
         "fast": result.report.get("fast_mode", {"enabled": False}),
-        # Whether the joint gate ran, so the page can restore its checkbox from a result
-        # instead of guessing.
+        # The gate is always on now; the result carries the fact instead of the page
+        # assuming it, because the stored report is what gets read a week later.
         "robot_enabled": bool(config.robot.enabled),
+        # The target this run actually used, so the page shows the number it ran with
+        # rather than whatever the field happens to hold afterwards.
+        "coverage_target_pct": config.target.coverage_target_pct,
         "sample_grid_mm": float(config.target.sample_grid_mm),
         "scan_face_axis_vehicle": face_axis_vehicle.tolist(),
         "scan_face_axis_measured_frame": scan_axis_target.tolist(),
@@ -1634,7 +1671,7 @@ def _clean_setup(body: dict) -> dict:
         "delivery_mode": mode,
         "fast": speed,
         "fast_no_occlusion": bool(body.get("fast_no_occlusion")),
-        "robot_gate": bool(body.get("robot_gate")),
+        "coverage_target_pct": _coverage_target(body.get("coverage_target_pct")),
         "model_names": model_names,
     }
 

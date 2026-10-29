@@ -114,8 +114,15 @@
             <label class="check-row"><input id="fastNoOcclusion" type="checkbox" disabled>快速模式下跳过遮挡测试（更快，但可能"隔着零件"覆盖到采样点）</label>
             <p class="inline-hint">快速模式只把采样网格放粗一档（3 mm → 10 mm），不关扫描带、不改关节检查步长——J5 超程正是发生在扫描带的直线扫掠段上。它换来的是"几分钟一条完整路径"，用于反复迭代关节解算；<b>覆盖率数字只描述路径形状，不能当验收依据</b>。报告里会有 <code>fast_mode</code> 块和 <code>FAST MODE</code> 摘要行。</p>
 
-            <label class="check-row"><input id="robotGate" type="checkbox">按机器人关节限位筛选位姿（剔除臂托不住的位姿，程序里每点带 CONFIG 与关节解）</label>
-            <p class="inline-hint">打开后每个候选位姿都要先过逆解：各轴离限位至少 5°，J5 必须落在 ±125 内且远离 0（腕奇异），否则该位姿不进选择、扫描带在半路越界就停止生长。报告里会多出 <code>kinematics</code> 块（J5 直方图、分支直方图、最坏单轴步长、无解点数）。关掉时结果与旧版逐位一致。</p>
+            <div class="form-row">
+              <div><label class="field-label" for="coverageTarget">覆盖率目标（%）</label>
+                <input class="text-input error-limit-input" id="coverageTarget" type="number" value="90" min="0.5" max="100" step="0.5">
+              </div>
+            </div>
+            <label class="check-row"><input id="coverageTargetNone" type="checkbox">不设上限（一直选到再没有新增覆盖为止）</label>
+            <p class="inline-hint">达到目标后选择阶段立即停手，<b>同时跳过针对漏扫区的二次瞄准</b>（refinement 整轮不跑）——斜坡、孔沿那类低产出区域就是这样成片剩下的。想让它们也补上，把目标抬到 99~100 或勾「不设上限」；代价是程序点数、关节重定向次数和单步关节变化一起上涨。留空或勾上等于配置里的 <code>coverage_target_pct: null</code>。结果里多一行 <code>覆盖率目标</code>。</p>
+
+            <p class="inline-hint">关节限位筛选<b>始终开启</b>：每个候选位姿都要先过逆解，各轴离限位至少 5°，J5 必须落在 ±125 内且远离 0（腕奇异），否则该位姿不进选择、扫描带在半路越界就停止生长。结果里固定有一行 <code>关节筛选：始终开启</code>，报告里有 <code>kinematics</code> 块（J5 直方图、分支直方图、最坏单轴步长、无解点数）。</p>
 
             <div class="section-label config-title"><span>现场定位点</span><small>先在 3D 模型上点选，再输入实测坐标</small></div>
             <div class="axis-row">
