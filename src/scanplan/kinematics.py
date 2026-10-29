@@ -117,10 +117,15 @@ class Robot:
 
     def __init__(self, params: RobotParams):
         self.params = params
+        # `limits` is what the CONTROLLER accepts. `usable` is what the planner allows: the
+        # same band pulled in to `joint_span_fraction` of each span about the span's centre.
+        # Two bands rather than one because they answer different questions - "is this value
+        # even legal" versus "is this value one we are willing to sit on".
         self.limits = tuple((max(low, soft_low), min(high, soft_high))
                             for (low, high), (soft_low, soft_high)
                             in zip(params.mechanical_limits_deg, params.soft_limits_deg,
                                    strict=True))
+        self.usable = tuple(self._usable_band(low, high) for low, high in self.limits)
         self.tool_vector = np.asarray(params.tool_xyz_mm, dtype=float).reshape(3)
         self.tool_rotation = _ypr_rotation(params.tool_ypr_deg)
         # Effective forearm: the offset turns the forearm into a slightly longer link that
@@ -130,6 +135,18 @@ class Robot:
         self.forearm_tilt_rad = float(np.arctan2(params.forearm_offset_mm,
                                                  params.forearm_mm))
         self.limits_source = self._limits_source()
+
+    def _usable_band(self, low: float, high: float) -> tuple[float, float]:
+        """`[low, high]` shrunk to `joint_span_fraction`, about its centre, not about zero.
+
+        About the centre because the spans are not symmetric (J2 is [-60, 76], J3 is
+        [-120.71, 180]) and "90 percent of the span" has to mean 90 percent of the room that
+        actually exists on each side, not 90 percent of the larger number.
+        """
+        fraction = float(self.params.joint_span_fraction)
+        centre = 0.5 * (low + high)
+        half = 0.5 * (high - low) * fraction
+        return (centre - half, centre + half)
 
     def _limits_source(self) -> str:
         """Which envelope is in force, in words a report can print."""
@@ -217,15 +234,20 @@ class Robot:
                 if low - _WRAP_TOL_DEG <= value <= high + _WRAP_TOL_DEG]
 
     def margins(self, joints) -> np.ndarray:
-        """Degrees from each axis to its nearest limit, taking the roomiest reading.
+        """Degrees from each axis to the nearest edge of the USABLE band.
 
-        A reading outside the limits yields -inf, not a negative distance: "0.1 deg past
-        the limit" and "0.1 deg inside" must not compare as neighbours.
+        The band, not the controller limit: a reading three degrees from a limit is legal
+        and still not one the machine holds (J5 = -122 alarmed against a documented -125), so
+        the number a report prints has to be the room left before the danger line, not before
+        the cliff edge.
+
+        A reading outside every equivalent is -inf, not a negative distance: "0.1 deg past
+        the band" and "0.1 deg inside" must not compare as neighbours.
         """
         values = np.asarray(joints, dtype=float).reshape(6)
         out = np.full(6, -np.inf)
         for axis in range(6):
-            low, high = self.limits[axis]
+            low, high = self.usable[axis]
             best = -np.inf
             for candidate in self.wraps(axis, float(values[axis])):
                 best = max(best, min(candidate - low, high - candidate))
@@ -235,12 +257,12 @@ class Robot:
     def j5_margin(self, joints) -> float:
         """Room left on J5 inside the usable band, in degrees; negative means unusable.
 
-        The band is not `[-limit, +limit]`: `|J5| -> 0` is the wrist singularity, so the
-        centre of the mechanical range is the worst place to be. With +-125 limits the
-        optimum sits near |J5| = 64, not 0, and this is the number that says so.
+        The band is not `[0, +limit]`: `|J5| -> 0` is the wrist singularity, so the centre of
+        the range is the worst place to be. With the usable band at +-112.5 the optimum sits
+        near |J5| = 60, not 0, and this is the number that says so.
         """
         value = float(np.asarray(joints, dtype=float).reshape(6)[4])
-        low, high = self.limits[4]
+        low, high = self.usable[4]
         margin = float(self.params.joint_margin_deg)
         reachable = (high if value >= 0.0 else -low) - margin
         return float(min(abs(value) - self.params.j5_min_abs_deg, reachable - abs(value)))
@@ -253,20 +275,32 @@ class Robot:
     # -- inverse -------------------------------------------------------------
 
     def solutions(self, position, rotation, *, verify: bool = True) -> list[Solution]:
-        """Every joint solution for a TCP pose, best J5 margin first.
+        """Every USABLE joint solution for a TCP pose, best J5 margin first.
 
         At most eight: two shoulder sides times two elbow configurations times two wrist
-        flips. `wrist_flip` changes only the SIGN of J5, which is why changing the T letter
-        in a CONFIG string never fixes an over-travel - the magnitude is set by the arm.
+        flips. `wrist_flip` changes the SIGN of J5, which is why changing the T letter in a
+        CONFIG string never fixes an over-travel - the magnitude is set by the arm.
+
+        One restriction is applied, and it is a site fact rather than a preference:
+        `wrist_flip_policy`. The delivered `.LS` writes Cartesian points with the constant
+        CONFIG `N U T`, the controller resolves those under that hint, and `T` is the
+        negative-J5 branch - so a solution on the `F` branch is not a solution the machine
+        will take. Measured both ways on 2026-10-29: a program that planned `F` stopped at
+        its first `L` with `MOTN-063 configuration mismatch`, and the same program with `F`
+        written as a per-point CONFIG was refused at load with `ASBN-023`. Set the policy to
+        `any` to see all eight again, which is what the solver-structure tests do.
         """
         point = np.asarray(position, dtype=float).reshape(3)
         target = np.asarray(rotation, dtype=float).reshape(3, 3)
         flange = target @ self.tool_rotation.T
         wrist = point - target @ self.tool_vector
+        wanted = str(self.params.wrist_flip_policy)
         found: list[Solution] = []
         for shoulder, elbow, arm in self._arm_solutions(wrist):
             a1x, a2, b = arm["a1x"], arm["a2"], arm["b"]
             for flip, wrist_angles, singular in self._wrist_solutions(a1x, b, flange):
+                if wanted != "any" and flip != wanted:
+                    continue
                 joints = self._controller_angles(a1x, a2, b, *wrist_angles)
                 placed = self._place(joints)
                 if placed is None:
@@ -301,14 +335,19 @@ class Robot:
         )
 
     def _place(self, joints) -> tuple[float, ...] | None:
-        """Snap each axis to the roomiest equivalent reading, or None if none fits."""
+        """Snap each axis to the roomiest equivalent reading, or None if none fits.
+
+        Legality is judged against the controller's band, preference against the usable one.
+        That difference matters: a J6 reading of 330 is legal but sits 6 deg under the limit,
+        while its equivalent -30 has the whole band in front of it, so -30 wins.
+        """
         values = np.asarray(joints, dtype=float).reshape(6)
         placed = []
         for axis in range(6):
             candidates = self.wraps(axis, float(values[axis]))
             if not candidates:
                 return None
-            low, high = self.limits[axis]
+            low, high = self.usable[axis]
             placed.append(max(candidates, key=lambda v: min(v - low, high - v)))
         return tuple(float(value) for value in placed)
 
@@ -390,15 +429,196 @@ class Robot:
         pendant, so the previous rule (`T` for positive J5) got every one of them wrong.
         A wrong letter is not cosmetic - it tells the controller to take the other wrist
         branch, which is the same pose turned 180 degrees.
+
+        The turn digits count whole revolutions OUTSIDE the base reading, which lives in
+        [-180, 180): `-63.699` is turn 0, not turn -1. `floor(J / 360)` said -1 and matched
+        none of the eight measured poses; this convention reproduces their `0, 0, 0` and the
+        pendant's own display. A turn digit that is one too low is the same 360 deg error the
+        letter can make, so it is worth getting right even though it is still a hint.
         """
         values = np.asarray(joints, dtype=float).reshape(6)
-        turns = [int(np.floor(values[index] / 360.0 + 1e-9)) for index in (0, 3, 5)]
+        turns = [int(np.floor((values[index] + 180.0) / 360.0 + 1e-9))
+                 for index in (0, 3, 5)]
         flip = "T" if values[4] < 0.0 else "F"
         return f"{shoulder} {elbow} {flip}, {turns[0]}, {turns[1]}, {turns[2]}"
 
     def reproduces(self, joints, position, rotation) -> bool:
         """Public forward-check, for callers that solved without verifying every root."""
         return self._reproduces(joints, position, rotation)
+
+    # -- segments ------------------------------------------------------------
+
+    def branch_of(self, joints) -> tuple[str, str, str] | None:
+        """The (shoulder, elbow, wrist-flip) letters of a joint set that is already held.
+
+        Derived by solving the arm's own forward pose and matching the answer back to
+        `joints`, because the letters come out of `_arm_solutions`, not out of the joint
+        values: "N" versus "F" is decided by the sign of the reach, and the reach is not
+        recoverable from J1..J6 without going through the geometry again.
+        """
+        point, frame = self.forward(joints)
+        values = np.asarray(joints, dtype=float).reshape(6)
+        best = None
+        for item in self.solutions(point, frame, verify=False):
+            gap = max(abs((float(a) - float(b) + 180.0) % 360.0 - 180.0)
+                      for a, b in zip(item.joints_deg, values, strict=True))
+            if best is None or gap < best[0]:
+                best = (gap, item)
+        if best is None or best[0] > 1.0:
+            return None
+        item = best[1]
+        return (item.shoulder, item.elbow, item.wrist_flip)
+
+    def follow(self, joints_start, target_position, target_rotation, *,
+               step_mm: float = 10.0) -> MotionVerdict:
+        """Walk a straight Cartesian move from a held joint state to a target pose.
+
+        This is the check the gate was missing. `feasible` and `solutions` answer "is there
+        ANY solution at this pose"; the controller asks a different question - "can the arm
+        carry on along the branch it is already on" - and the difference is where the alarms
+        came from: `X10290`'s last segment has both endpoints solvable and still dies at
+        J2 = -69.85 about 385 mm along the 800 mm line, because the branch it started on has
+        no reachable solution past that point.
+
+        The branch is held, not re-chosen. Picking the roomiest solution at every sample
+        would make every segment pass and would predict a motion no controller performs.
+        """
+        if step_mm <= 0.0:
+            raise ValueError("step_mm must be positive")
+        start = np.asarray(joints_start, dtype=float).reshape(6)
+        target = np.asarray(target_position, dtype=float).reshape(3)
+        target_frame = np.asarray(target_rotation, dtype=float).reshape(3, 3)
+        start_point, start_frame = self.forward(start)
+        branch = self.branch_of(start)
+        if branch is None:
+            return MotionVerdict(False, "unknown_branch", None, 0.0, 0.0, None, -np.inf, 0)
+
+        length = float(np.linalg.norm(target - start_point))
+        steps = max(1, int(np.ceil(length / float(step_mm))))
+        worst = np.inf
+        for index in range(1, steps + 1):
+            fraction = index / steps
+            position = start_point + (target - start_point) * fraction
+            frame = _interpolate_rotation(start_frame, target_frame, fraction)
+            found = self._on_branch(position, frame, branch)
+            if found is None:
+                # No solution on this branch: the controller would alarm here whether or not
+                # the pose is reachable through some other shoulder.
+                inside = self.solutions(position, frame, verify=False)
+                reason = "unreachable" if not inside else "branch_lost"
+                return MotionVerdict(False, reason, None, fraction, length * fraction,
+                                     None, worst, index)
+            margins = self.margins(found.joints_deg)
+            axis = int(np.argmin(margins))
+            worst = float(min(worst, margins[axis]))
+            if margins[axis] < self.params.joint_margin_deg or self.j5_margin(
+                    found.joints_deg) < 0.0:
+                culprit = axis if margins[axis] < self.params.joint_margin_deg else 4
+                return MotionVerdict(False, "joint_limit", culprit, fraction,
+                                     length * fraction,
+                                     tuple(float(v) for v in found.joints_deg),
+                                     worst, index)
+        return MotionVerdict(True, "ok", None, None, None,
+                             tuple(float(v) for v in found.joints_deg), worst, steps)
+
+    def _on_branch(self, position, frame, branch) -> Solution | None:
+        """The solution at this pose that belongs to `branch`, or None.
+
+        Deliberately does not fall back to another branch: a silent branch switch is the
+        failure mode this exists to catch, and the controller raises `MOTN-063` for it.
+        """
+        chosen = None
+        for item in self.solutions(position, frame, verify=False):
+            if (item.shoulder, item.elbow, item.wrist_flip) == branch:
+                chosen = item
+                break
+        if chosen is None:
+            return None
+        if not self._reproduces(chosen.joints_deg, position, frame):
+            return None
+        return chosen
+
+    def sweep_points(self, first, second, *, step_deg: float = 5.0) -> np.ndarray:
+        """TCP positions along a joint-space straight move: start excluded, end included.
+
+        Joint limits need no sampling here, and that is a proof rather than a shortcut: each
+        axis' margin is affine in that axis' own value, so the worst margin on a straight
+        segment is attained at one of its ends, and the segment cannot leave a box whose two
+        ends are inside it. So a `J` move whose endpoints pass is a pass.
+
+        What must be sampled is CLEARANCE, because the TCP does not travel a straight line
+        when the joints do. `step_deg` is the joint resolution, which is the right unit: the
+        TCP of a wrist-heavy move can swing hundreds of millimetres per degree of J6.
+        """
+        if step_deg <= 0.0:
+            raise ValueError("step_deg must be positive")
+        start = np.asarray(first, dtype=float).reshape(6)
+        end = np.asarray(second, dtype=float).reshape(6)
+        span = float(np.max(np.abs(end - start)))
+        steps = max(1, int(np.ceil(span / float(step_deg))))
+        out = np.empty((steps, 3), dtype=float)
+        for index in range(steps):
+            fraction = (index + 1) / steps
+            out[index], _ = self.forward(start + (end - start) * fraction)
+        return out
+
+
+@dataclass(frozen=True)
+class MotionVerdict:
+    """What a segment walk decided, and where it gave up.
+
+    `limiting_axis` is 0-based, so J2 is 1 - the same index `Robot.margins` uses, because a
+    report that says "axis 2" for J2 and "index 1" elsewhere is how the wrong axis gets
+    blamed. `failure_at` is the fraction along the segment, which is the number that says
+    "endpoints are fine, the middle is not".
+    """
+
+    ok: bool
+    reason: str
+    limiting_axis: int | None
+    failure_at: float | None
+    failure_mm: float | None
+    joints_deg: tuple[float, ...] | None
+    min_margin_deg: float
+    steps: int
+
+
+def _interpolate_rotation(first, second, fraction: float) -> np.ndarray:
+    """Slerp from `first` to `second` by `fraction`, without a scipy dependency.
+
+    A straight Cartesian move turns the tool evenly, and that turn is what drags J5 along,
+    so interpolating the rotation as a matrix average would be wrong: it does not stay a
+    rotation and it does not turn evenly.
+    """
+    start = np.asarray(first, dtype=float).reshape(3, 3)
+    relative = start.T @ np.asarray(second, dtype=float).reshape(3, 3)
+    cosine = float(np.clip((float(np.trace(relative)) - 1.0) / 2.0, -1.0, 1.0))
+    angle = float(np.arccos(cosine))
+    if angle < 1e-9:
+        return start.copy()
+    if np.pi - angle < 1e-6:
+        # Half a turn: the skew part vanishes and the axis has to come from (R + I) instead.
+        axis = _largest_column(relative + np.eye(3))
+    else:
+        axis = np.array([relative[2, 1] - relative[1, 2],
+                         relative[0, 2] - relative[2, 0],
+                         relative[1, 0] - relative[0, 1]]) / (2.0 * np.sin(angle))
+    turn = angle * float(fraction)
+    return start @ _axis_angle(axis, turn)
+
+
+def _largest_column(matrix) -> np.ndarray:
+    """A unit vector along whichever column of `matrix` is longest."""
+    values = np.asarray(matrix, dtype=float).reshape(3, 3)
+    column = values[:, int(np.argmax(np.linalg.norm(values, axis=0)))]
+    return column / float(np.linalg.norm(column))
+
+
+def _axis_angle(axis, angle: float) -> np.ndarray:
+    """Rodrigues, for a unit `axis` and an `angle` in radians."""
+    x, y, z = (float(value) for value in np.asarray(axis, dtype=float).reshape(3))
+    cross = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+    return np.eye(3) + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
 
 
 @dataclass(frozen=True)
@@ -472,6 +692,33 @@ class KinematicGate:
         return {"poses_asked": int(self.queries), "distinct_poses": len(self._cache),
                 "robot": self.params.model, "limits_source":
                 (self.robot.limits_source if self.robot is not None else "gate disabled")}
+
+    def follow(self, joints_start, position, axis, roll_deg: float, *,
+               step_mm: float = 10.0) -> MotionVerdict:
+        """Whether the arm can carry `joints_start` along a straight move to this pose.
+
+        The pose arrives in the planner's own convention (position, optical axis, roll), the
+        way every other gate entry point takes it. `enabled=false` answers "fine", which is
+        right for a planning-time sieve and wrong for a delivery check: a program has to be
+        validated even when the site has turned the sieve off, so the delivery validator
+        builds its own `Robot` rather than borrowing this one.
+        """
+        if self.robot is None:
+            return MotionVerdict(True, "off", None, None, None, None, np.inf, 0)
+        from .geometry import scanner_frame
+
+        rotation = scanner_frame(np.asarray(axis, dtype=float).reshape(3), float(roll_deg))
+        return self.robot.follow(joints_start, position, rotation, step_mm=step_mm)
+
+    def sweep_points(self, first, second, *, step_deg: float = 5.0):
+        """TCP positions along a joint move, or None when the gate is off.
+
+        None means UNVERIFIED, not "clear": a caller must not treat the absence of a check
+        as a pass. That distinction is why this returns None rather than an empty array.
+        """
+        if self.robot is None:
+            return None
+        return self.robot.sweep_points(first, second, step_deg=step_deg)
 
     def solutions(self, position, axis, roll_deg: float) -> list[Solution]:
         """Every feasible solution at this pose, best J5 room first (cached).

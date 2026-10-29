@@ -71,15 +71,23 @@
       "it buys 'how much area we are willing to patch by hand'. Measured on the real part",
       "(design 2026-10-20, section 6.4), the greedy curve needs ~28 items to reach 99.0% and",
       "~100 to reach 99.7%, so the last 0.7 of a point costs four times the whole rest of",
-      "the plan. 99.0 is the default; null runs until the coverage stops growing, which is",
-      "what reproduces the validated 102/114 baselines. Override per run with",
-      "  scanplan plan ... --coverage-target 97.5     (or  --coverage-target none)",
+      "the plan. null runs until the coverage stops growing, which is what reproduces the",
+      "validated 102/114 baselines. Override per run with",
+      "  scanplan plan ... --coverage-target 87.5     (or  --coverage-target none)",
+      "",
+      "90.0 since 2026-10-29, down from 99.0. Not a relaxation of the work, a correction of",
+      "what is reachable: with the do-not-ride-the-limit policy (robot.joint_span_fraction",
+      "= 0.9) the POOL CEILING is 91.19~91.81% on this station, so 99.0 was unattainable by",
+      "geometry rather than by algorithm, and every attempt at it either rode the limits or",
+      "dropped sweeps. 90.0 asks the connector and the stroke selection to eat essentially",
+      "all of the 91.19 ceiling. See docs/tmp/upgrade-plan.md section 11.2 for the full table",
+      "of measured ceilings and the original 99.0 figures, which are kept there.",
       "",
       "delivery_mode: path = order the sweeps and check a connector between every pair of",
       "delivered points; lean = hand over the poses alone, exactly like v1, promising",
       "nothing about the motion between them. Same coverage either way."
     ],
-    "coverage_target_pct": 99.0,
+    "coverage_target_pct": 90.0,
     "delivery_mode": "path",
 
     "_comment_surface_bias": [
@@ -143,6 +151,8 @@
     "  connector_level=1         spread the rotation over the flight, dropping one corner",
     "  connector_level=0         also allow a straight move between two identical poses",
     "                            (WAIT FOR ROBOGUIDE before turning this on)",
+    "connector_level is now the FALLBACK ladder only: with joint_connector on (and the",
+    "kinematic gate on) the connector is a single J move and never reaches these routes.",
     "  order_axis_weight_mm_per_deg  60 deg of pose change costs the same as 120 mm of",
     "                            detour. Distance alone makes a large re-orientation look",
     "                            free, because it is only a short move.",
@@ -161,7 +171,7 @@
     "coverage_step_mm": 100.0,
     "check_step_mm": 10.0,
     "retract_clearance_mm": 50.0,
-    "max_rot_deg_per_mm": 0.5,
+    "max_rot_deg_per_mm": 0.669,
     "max_prune_rounds": 32,
     "cost_model": "corners",
     "transition_corners_estimate": 1.0,
@@ -173,14 +183,35 @@
     "parallel_weight": 1.0,
     "repair_budget_share": 0.2,
     "pool_mode": "full",
-    "side_scan_tilt_deg": 45.0
+    "side_scan_tilt_deg": 45.0,
+    "joint_connector": true,
+    "joint_step_deg": 5.0
   },
 
+  "_comment_joint_connector": [
+    "max_rot_deg_per_mm is 0.669 and that is a MEASURED LOWER BOUND, not a limit: segment",
+    "P[11]->P[12] of the delivered X10290.LS turned 173.8 deg over 259.8 mm = 0.669 deg/mm",
+    "and the machine flew it. It only constrains the RETRACT fallback routes now, because",
+    "the primary connector is a joint move, and a joint move does not have to spread its",
+    "rotation over travel - the axis velocities are what carry it.",
+    "",
+    "joint_connector: the connector is one J move from a sweep's end to the next sweep's",
+    "start. T_G on the real controller went P[12] -> P[11], a change of band, in one J,",
+    "both points reached, no retract corner. This is what removes the retract/reorient",
+    "corners, which in the 99% run held ALL SEVEN of the delivered points with no joint",
+    "solution while none of the 27 scanning points did.",
+    "",
+    "joint_step_deg: sample resolution for the swept-path clearance check of a joint move."
+  ],
+
   "_comment_motion": [
-    "L, not J: a joint move's TCP path is not knowable, so nothing can be said about what it",
-    "sweeps; a straight line with a constant pose is the only interpolated motion that can be",
-    "evaluated geometrically. CNT0 because that is the site's convention. speed_mm_s is set on",
-    "the floor and is NOT optimised by the planner."
+    "type is the DEFAULT motion, and it is L: a scan has to be a straight Cartesian line,",
+    "because that line is what the coverage figure was computed from. Points that are only",
+    "there to get the head somewhere carry their own per-point motion, and with the",
+    "kinematic gate on that is J to a joint-representation point - the only form in which",
+    "our choice of joint solution survives to the controller.",
+    "CNT0 because that is the site's convention. speed_mm_s is set on the floor and is NOT",
+    "optimised by the planner."
   ],
   "motion": {
     "type": "L",
@@ -244,11 +275,26 @@
 
     "_comment_limits": [
       "Two sets, on purpose. The planner uses the INTERSECTION and the report says which set",
-      "it used. soft = what the controller actually enforces (inferred, see G1);",
-      "mechanical = the datasheet envelope. Never widen soft to pass an acceptance check."
+      "it used. soft = what the controller actually enforces;",
+      "mechanical = the datasheet envelope. Never widen soft to pass an acceptance check.",
+      "",
+      "soft is READ OFF the pendant (MENU > SYSTEM > Axis Limit, 2026-10-29), not inferred:",
+      "  J1 -185.00 .. 185.00    J2 -60.00 .. 76.00    J3 -120.71 .. 180.00",
+      "  J4 -360.00 .. 360.00    J5 -125.00 .. 125.00  J6 -360.00 .. 360.00",
+      "Two of them overturned earlier guesses. J2's roof is +76, not +136. J3's floor is",
+      "-120.71, not -185, and that floor is why every F-shoulder pose the planner produced",
+      "was unreachable: those solutions sit at J3 near -175, the controller re-expressed them",
+      "as -175 + 360 = 185, found that above its +180 roof too, and alarmed MOTN-017",
+      "(G:1, A:2,3). The F branch was never available; the old limits said it was.",
+      "",
+      "joint_span_fraction = 0.9 is the do-not-ride-the-limit policy, applied about each",
+      "span's centre: J1 +-166.5, J2 [-53.2, 69.2], J3 [-105.69, 164.97], J4 +-324,",
+      "J5 +-112.5, J6 +-324. joint_margin_deg = 5 is applied inside that again. It exists",
+      "because J5 = -122 alarmed in ROBOGUIDE while -125 is the documented limit; a pose",
+      "3 deg from a limit is not one this machine holds."
     ],
     "mechanical_limits_deg": [[-185, 185], [-136, 136], [-301, 301], [-720, 720], [-250, 250], [-720, 720]],
-    "soft_limits_deg":       [[-185, 185], [ -60, 136], [-301, 301], [-720, 720], [-125, 125], [-360, 360]],
+    "soft_limits_deg":       [[-185, 185], [ -60,  76], [-120.71, 180], [-360, 360], [-125, 125], [-360, 360]],
 
     "_comment_step": [
       "max_step_deg is REPORTED, not enforced: the worst joint step between two delivered",
@@ -258,8 +304,26 @@
       "a review trigger: import the program and look at those moves."
     ],
     "joint_margin_deg": 5.0,
+    "joint_span_fraction": 0.9,
     "j5_min_abs_deg": 8.0,
     "max_step_deg": 40.0,
-    "wrist_identified": true
+    "wrist_identified": true,
+
+    "_comment_wrist_flip": [
+      "Which wrist branch a delivered solution may use: T (J5 negative), F (J5 positive) or",
+      "any. T is the site default, and it is a measurement, not a taste.",
+      "A pose has up to eight solutions; the two wrist branches differ ONLY in the sign of",
+      "J5, and the pendant calls the negative one T. Two 2026-10-29 experiments settled it:",
+      "  T_L: 3 points, P1 a joint point at J5 = +106, P2 the same pose as Cartesian with the",
+      "       constant CONFIG N U T. The controller resolved P2 to J5 = -100.294 and stopped",
+      "       at the L with MOTN-063 (position configuration mismatch) - an L move cannot",
+      "       change the wrist branch, so it refused.",
+      "  T_M: the same program with P2's CONFIG written as the per-point letters N U F.",
+      "       ROBOGUIDE refused the whole file at load: ASBN-023 Configuration error.",
+      "So the letter F is not loadable, and a plan that uses the F branch cannot be flown.",
+      "Restricting the planner to T costs very little: the two wrist branches exist as a",
+      "pair, so most poses keep one. Set this to 'any' only to inspect the solver."
+    ],
+    "wrist_flip_policy": "T"
   }
 }

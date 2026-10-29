@@ -166,6 +166,15 @@ class StrokeParams:
     * `side_scan_tilt_deg` adds a family of seeds whose optical axis is tilted off the
       surface normal by this angle, for the walls and deep pockets a head-on sweep cannot
       reach. 0 disables the family.
+    * `joint_connector` makes the connector a single joint move from one sweep's end to the
+      next sweep's start. It exists because the retract corners were the problem: in the
+      99% run, 7 of 50 delivered points had no joint solution at all and every one of them
+      was a retract or reorient corner, while none of the 27 scanning points did. A joint
+      move interpolates all six axes linearly, so two legal endpoints cannot produce an
+      illegal middle, and it needs no corner in between.
+    * `joint_step_deg` is how finely that joint move is sampled when its swept TCP path is
+      checked for clearance. Degrees rather than millimetres because the TCP of a
+      wrist-heavy move can travel hundreds of millimetres per degree of J6.
     """
 
     enabled: bool
@@ -192,6 +201,14 @@ class StrokeParams:
     repair_budget_share: float
     pool_mode: str
     side_scan_tilt_deg: float
+    # Primary connector primitive: one joint move from a sweep's end to the next sweep's
+    # start, no retract corner, no CONFIG, no middle to exceed. Off (or with the kinematic
+    # gate off) falls back to the retract routes, which is also the pre-2026-10-29 behaviour.
+    joint_connector: bool = True
+    # Joint resolution used to sample the swept TCP path of a joint move for clearance.
+    # In degrees, not millimetres, because a wrist-heavy move can swing hundreds of
+    # millimetres of TCP per degree of J6.
+    joint_step_deg: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -221,11 +238,33 @@ class RobotParams:
     pose bank was replaced - only the tool did, which is what a re-taught UTOOL looks
     like. `docs/robot-calibration.md` is the procedure.
 
-    `soft_limits_deg` is what the controller actually enforces. It is inferred, not read
-    off the machine yet (three joints sat exactly on integer values in the captured
-    samples, and the 2026-10-23 bank has two poses sitting 0.68 deg inside the J5 floor,
-    which is the SRVO-115 pose), so it is kept separate from the mechanical envelope: the
-    planner uses the intersection, and `limits_source` in the report says so.
+    `soft_limits_deg` is what the controller actually enforces, and it is NOT the datasheet
+    envelope. Since 2026-10-29 the six rows are READ OFF the pendant
+    (`MENU > SYSTEM > Axis Limit`), not inferred:
+
+    | axis | lower   | upper  |
+    |------|---------|--------|
+    | J1   | -185.00 | 185.00 |
+    | J2   |  -60.00 |  76.00 |
+    | J3   | -120.71 | 180.00 |
+    | J4   | -360.00 | 360.00 |
+    | J5   | -125.00 | 125.00 |
+    | J6   | -360.00 | 360.00 |
+
+    Two of these ended a long argument. J2's ceiling is +76, not the +136 the datasheet
+    suggested, and J3's floor is -120.71, not -185. The old -185 floor is what let the
+    planner emit `F`-shoulder solutions with J3 near -175: those poses were written to a
+    joint-representation program, the controller re-expressed J3 as -175 + 360 = 185, found
+    that above its +180 ceiling as well, and alarmed `MOTN-017 (G:1, A:2,3)`. The whole `F`
+    branch was unreachable and the model was calling it reachable.
+
+    `joint_span_fraction` is the "do not ride the limits" policy: each axis is only used
+    inside a fraction of its span, measured about the span's CENTRE. At 0.9 with the numbers
+    above the usable envelope is J1 +-166.5, J2 [-53.2, 69.2], J3 [-105.69, 164.97],
+    J4 +-324, J5 +-112.5, J6 +-324; `joint_margin_deg` is applied inside that again. The
+    reason it exists: J5 = -122 alarmed in ROBOGUIDE although -125 is the documented limit,
+    and a pose that sits three degrees from a limit is not one the machine will hold. The
+    tests are what keep this honest - see `test_kinematics.py`.
 
     `enabled=False` skips the whole gate, which is what keeps the pre-2026-10-22 result
     reproducible bit for bit.
@@ -264,6 +303,11 @@ class RobotParams:
     j5_min_abs_deg: float
     max_step_deg: float
     wrist_identified: bool
+    joint_span_fraction: float = 0.9
+    # Which wrist branch a delivered solution may use: `T` (J5 negative), `F` (J5 positive)
+    # or `any`. `T` is the site default because the program writes Cartesian points with the
+    # constant CONFIG `N U T` - see `Robot.solutions` for the two measurements behind it.
+    wrist_flip_policy: str = "T"
 
     @classmethod
     def disabled(cls) -> RobotParams:
@@ -280,10 +324,10 @@ class RobotParams:
             tool_ypr_deg=(179.279, -45.934, 172.758),
             mechanical_limits_deg=((-185.0, 185.0), (-136.0, 136.0), (-301.0, 301.0),
                                    (-720.0, 720.0), (-250.0, 250.0), (-720.0, 720.0)),
-            soft_limits_deg=((-185.0, 185.0), (-60.0, 136.0), (-301.0, 301.0),
-                             (-720.0, 720.0), (-125.0, 125.0), (-360.0, 360.0)),
+            soft_limits_deg=((-185.0, 185.0), (-60.0, 76.0), (-120.71, 180.0),
+                             (-360.0, 360.0), (-125.0, 125.0), (-360.0, 360.0)),
             joint_margin_deg=5.0, j5_min_abs_deg=8.0, max_step_deg=40.0,
-            wrist_identified=True,
+            wrist_identified=True, joint_span_fraction=0.9, wrist_flip_policy="T",
         )
 
 
@@ -646,6 +690,7 @@ def _optional_member(annotation: Any):
 MOTION_TYPES = ("J", "L")
 TERMINATIONS = ("FINE", "CNT0", "CNT100")
 POOL_MODES = ("full", "grid", "rails")
+WRIST_FLIP_POLICIES = ("T", "F", "any")
 
 
 def _validate(config: PlannerConfig) -> None:
@@ -731,6 +776,8 @@ def _validate_strokes(stroke: StrokeParams) -> None:
         raise ValueError("'max_prune_rounds' cannot be negative")
     if stroke.max_rot_deg_per_mm <= 0.0:
         raise ValueError("'max_rot_deg_per_mm' must be positive")
+    if stroke.joint_step_deg <= 0.0:
+        raise ValueError("'joint_step_deg' must be positive")
     if stroke.cost_model not in COST_MODELS:
         raise ValueError(f"'cost_model' must be one of {COST_MODELS}, "
                          f"not {stroke.cost_model!r}")
@@ -799,8 +846,16 @@ def _validate_robot(robot: RobotParams) -> None:
                     "cannot be more permissive than the arm")
     if robot.joint_margin_deg < 0.0:
         raise ValueError("'robot.joint_margin_deg' cannot be negative")
+    if not 0.0 < robot.joint_span_fraction <= 1.0:
+        raise ValueError("'robot.joint_span_fraction' must be in (0, 1]: it is the fraction "
+                         "of each axis span the planner may use, so 1.0 means 'right up to "
+                         "the limit', which is what the alarm-prone poses looked like")
     if robot.max_step_deg <= 0.0:
         raise ValueError("'robot.max_step_deg' must be positive")
+    if robot.wrist_flip_policy not in WRIST_FLIP_POLICIES:
+        raise ValueError(f"'robot.wrist_flip_policy' must be one of "
+                         f"{WRIST_FLIP_POLICIES}, not {robot.wrist_flip_policy!r}: it picks "
+                         "which wrist branch the delivered program may use")
     j5_low, j5_high = robot.soft_limits_deg[4]
     if robot.j5_min_abs_deg >= (j5_high - j5_low) / 2.0:
         raise ValueError("'robot.j5_min_abs_deg' leaves no usable J5 band inside the soft "

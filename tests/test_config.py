@@ -67,7 +67,9 @@ def test_a_typo_in_a_key_name_is_rejected(tmp_path):
 
 def test_the_acceptance_threshold_is_a_configurable_nullable_setting(tmp_path):
     cfg = load_config()
-    assert cfg.target.coverage_target_pct == 99.0
+    # 90.0 since 2026-10-29, down from 99.0: the pool ceiling with the do-not-ride-the-limit
+    # policy is 91.19% on this station, so 99.0 was unattainable by geometry.
+    assert cfg.target.coverage_target_pct == 90.0
     assert cfg.target.delivery_mode == "path"
     # null is the switch back to "run until nothing new is covered", so it must survive
     # the loader rather than being coerced
@@ -124,7 +126,7 @@ def test_a_runtime_override_is_validated_like_a_file():
     cfg = load_config()
     tightened = override(cfg, target={"coverage_target_pct": 97.5})
     assert tightened.target.coverage_target_pct == pytest.approx(97.5)
-    assert cfg.target.coverage_target_pct == 99.0          # the original is untouched
+    assert cfg.target.coverage_target_pct == 90.0          # the original is untouched
     with pytest.raises(ValueError, match="coverage_target_pct"):
         override(cfg, target={"coverage_target_pct": 0.0})
 
