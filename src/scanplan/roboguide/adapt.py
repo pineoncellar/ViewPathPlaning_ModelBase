@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 
 from scanplan.geometry import scanner_frame
-from scanplan.roboguide import ls, wpr
+from scanplan.roboguide import ls, validate, wpr
 
 _MISSING = object()
 
@@ -53,13 +53,23 @@ def _field(item, key: str, default=_MISSING):
     return value
 
 
-def viewpoints_to_points(viewpoints) -> list[dict]:
+def viewpoints_to_points(viewpoints, *, per_point_config: bool = False) -> list[dict]:
     """Turn the planner's viewpoints into the exporter's point table.
 
     The frame comes from `scanner_frame(axis, roll_deg)`: it is orthonormal with
     determinant +1 and its local +Z is the optical axis (scanner towards part),
     which is exactly the pose contract the `.LS` writer and the UTOOL use. Nothing
     else about the viewpoint survives - reachability is not this module's business.
+
+    `per_point_config` is OFF by default, and what is known about it is narrower than "it is
+    refused". A program whose points carried computed letters (`N U F, 0, 0, 0`) came back from
+    ROBOGUIDE as `ASBN-023 Configuration error` on the first P block; the same file with the
+    constant `N U T, 0, 0, 0` loads and runs. But two later programs that changed the letters
+    PER POINT (`N U T` then `F D T`) both imported cleanly, so the per-point form is not what
+    was refused - the remaining suspicion is that `N U F` itself was wrong for those poses,
+    because every pose ever read on the pendant with J5 in [-9, -124] was labelled `T`. The
+    letters here are now derived from the solved joint values rather than guessed, which is
+    exactly what the old file was not doing. Turn it on to confirm; leave it off to ship.
     """
     items = list(viewpoints)
     if not items:
@@ -84,10 +94,16 @@ def viewpoints_to_points(viewpoints) -> list[dict]:
                 "stroke_id": _field(item, "stroke_id", None),
                 "role": _field(item, "role", "coverage"),
                 # Per-point joint evidence, when the kinematic gate ran. `config` is written
-                # into the P[n] block; `joints_deg` is what a joint-representation point
-                # needs, and is None otherwise.
-                "config": _field(item, "config", None),
+                # into the P[n] block only when the caller asks for it; `joints_deg` is what
+                # a joint-representation point needs, and is None otherwise.
+                "config": (_field(item, "config", None) if per_point_config else None),
                 "joints_deg": _field(item, "joints_deg", None),
+                # Per-point motion and representation. A joint-representation point takes the
+                # controller's choice of solution away, so it is the only way a planned branch
+                # reaches the machine; it also forces a `J` instruction, which is why the two
+                # travel together.
+                "motion": _field(item, "motion", None),
+                "representation": _field(item, "representation", None),
             }
         )
     return wpr.unwrap_wpr(points)
@@ -296,7 +312,10 @@ def _contract_blocks(
             "config_note": (
                 "the CONFIG string hints which posture solution to take; if ROBOGUIDE "
                 "calls a pose unreachable, try another configuration before blaming the "
-                "pose (N/F, T, and the three turn numbers)"
+                "pose (N/F, T, and the three turn numbers). Per-point letters are off "
+                "unless asked for: a program carrying them was refused on load with "
+                "ASBN-023 'Configuration error', so only the constant string above has "
+                "been proven to import on this controller"
             ),
             "comment": _COMMENT,
         },
@@ -326,8 +345,10 @@ def export(
     utool=1,
     motion="J",
     speed="100%",
+    joint_speed="100%",
     termination="FINE",
     config="N U T, 0, 0, 0",
+    per_point_config: bool = False,
     joint_blocks: bool = False,
     order=True,
 ) -> dict:
@@ -344,7 +365,7 @@ def export(
     rather than a silent re-sort.
     """
     name = wpr.normalise_prog_name(prog_name)
-    points = viewpoints_to_points(viewpoints)
+    points = viewpoints_to_points(viewpoints, per_point_config=per_point_config)
 
     strokes = {point["stroke_id"] for point in points if point["stroke_id"] is not None}
     if strokes and order:
@@ -392,6 +413,7 @@ def export(
         utool=utool,
         motion=motion,
         speed=speed,
+        joint_speed=joint_speed,
         termination=termination,
         config=config,
         comment=_COMMENT,
@@ -424,6 +446,7 @@ def export(
     )
     contract["program"]["termination"] = str(termination).upper()
     contract["program"]["strokes"] = sorted(strokes) if strokes else []
+    contract["delivery_check"] = validate.check_points(points, default_motion=motion)
     with frame_path.open("w", encoding="utf-8") as handle:
         json.dump(contract, handle, indent=2)
 

@@ -84,22 +84,42 @@ def test_a_speed_without_a_known_unit_is_refused():
     assert ls.check_speed("100%") == "100%"
 
 
-def test_each_point_carries_its_own_config_string(tmp_path):
+def test_each_point_carries_its_own_config_string_when_asked(tmp_path):
     """One CONFIG for the whole program is how every point got pinned to one branch."""
     points = viewpoints()
     for index, point in enumerate(points):
         point["config"] = f"F D T, {index}, 0, 0"
-    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0")
+    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0",
+                 per_point_config=True)
     text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
     for index in range(len(points)):
         assert f"CONFIG : 'F D T, {index}, 0, 0'" in text
     assert "CONFIG : 'N U T, 0, 0, 0'" not in text
 
 
+def test_per_point_letters_are_off_unless_asked_for(tmp_path):
+    """They were refused on load, so the default must ignore them.
+
+    A program whose first point said `N U F, 0, 0, 0` came back from ROBOGUIDE as
+    `ASBN-023 Configuration error`, column exactly on the CONFIG field, while the same
+    file with the constant `N U T, 0, 0, 0` on every point loads and runs. Only the T/F
+    half of the letters was ever measured, so a computed letter is a guess that can make
+    the whole program unimportable - hence opt-in.
+    """
+    points = viewpoints()
+    for index, point in enumerate(points):
+        point["config"] = f"F D T, {index}, 0, 0"
+    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0")
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert text.count("CONFIG : 'N U T, 0, 0, 0'") == len(points)
+    assert "F D T," not in text
+
+
 def test_a_point_without_a_config_falls_back_to_the_program_default(tmp_path):
     points = viewpoints()
     points[0]["config"] = "F D F, 0, 0, 0"
-    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0")
+    adapt.export(points, tmp_path, prog_name=PROG, config="N U T, 0, 0, 0",
+                 per_point_config=True)
     text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
     assert "CONFIG : 'F D F, 0, 0, 0'" in text
     assert text.count("CONFIG : 'N U T, 0, 0, 0'") == len(points) - 1
@@ -117,6 +137,20 @@ def test_joint_blocks_are_written_when_asked_for(tmp_path):
     # a joint-representation point cannot be reached with an L move
     assert text.count("J P[") == len(points)
     assert "L P[" not in text
+    # and the J instruction takes a percentage, not the linear speed the L move wanted:
+    # `J P[1] 100 mm/sec FINE` is refused by the controller at import (ASBN-009)
+    assert "J P[1] 100% FINE" in text
+    assert "mm/sec" not in text
+
+
+def test_a_joint_speed_must_be_a_percentage(tmp_path):
+    """A rate in the joint branch is what the controller rejects on load, so refuse it here."""
+    points = viewpoints()
+    for point in points:
+        point["joints_deg"] = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0)
+    with pytest.raises(ValueError, match="percentage"):
+        adapt.export(points, tmp_path, prog_name=PROG, joint_blocks=True, motion="L",
+                     speed="100 mm/sec", joint_speed="100 mm/sec")
 
 
 def test_joint_blocks_are_ignored_without_joint_values(tmp_path):
@@ -124,6 +158,53 @@ def test_joint_blocks_are_ignored_without_joint_values(tmp_path):
     text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
     assert "J1=" not in text
     assert text.count("X =") == len(viewpoints())
+
+
+JOINTS = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+
+
+def test_a_mixed_program_writes_scans_as_cartesian_and_transitions_as_joints(tmp_path):
+    """The shape the connector actually produces, and the speed bug it used to hit.
+
+    A joint-representation point removes the controller's choice of solution, so it is the
+    only form in which a planned branch reaches the machine. A scan has to stay Cartesian,
+    because the sweep the coverage figure was computed from is the straight line between two
+    of them. A program of exactly this shape - joint point, then Cartesian points reached by
+    L - was imported and run on the controller.
+
+    The speed field is the other half: the site's linear speed is `100 mm/sec`, and a joint
+    point validated against it raises, for a speed that point was never going to use.
+    """
+    points = viewpoints()
+    points[0].update({"joints_deg": JOINTS, "motion": "J", "representation": "joint"})
+    points[1].update({"motion": "L", "representation": "cart"})
+    adapt.export(points, tmp_path, prog_name=PROG, order=False, motion="L",
+                 speed="100 mm/sec", termination="CNT0")
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert text.count("J1=") == 1
+    assert text.count("X =") == len(points) - 1
+    assert "J P[1] 100% FINE" in text
+    assert "L P[2] 100 mm/sec CNT0" in text
+
+
+def test_per_point_representation_beats_the_program_wide_flag(tmp_path):
+    """`joint_blocks` is a default, not an override: a stroke plan needs both kinds at once."""
+    points = viewpoints()
+    points[0].update({"joints_deg": JOINTS, "motion": "J", "representation": "joint"})
+    adapt.export(points, tmp_path, prog_name=PROG, order=False, motion="L",
+                 speed="100 mm/sec", joint_blocks=False)
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert text.count("J1=") == 1
+    assert text.count("X =") == len(points) - 1
+
+
+def test_the_point_table_carries_motion_and_representation():
+    """The exporter is the only consumer, so both keys must survive the conversion."""
+    points = viewpoints()
+    points[0].update({"joints_deg": JOINTS, "motion": "J", "representation": "joint"})
+    table = adapt.viewpoints_to_points(points)
+    assert table[0]["motion"] == "J" and table[0]["representation"] == "joint"
+    assert table[1]["motion"] is None and table[1]["representation"] is None
 
 
 def test_wpr_is_unwrapped_along_the_delivered_order():

@@ -61,6 +61,21 @@ def check_speed(speed: str, motion: str = "J") -> str:
     return text
 
 
+def check_joint_speed(speed: str) -> str:
+    """Validate the speed of a `J` instruction: a percentage and nothing else.
+
+    A joint move has no tool-path speed to give, and the controller rejects
+    `J P[1] 100 mm/sec FINE` with `ASBN-009: Undefined instruction` on load - the failure
+    happens at import, on a line the planner wrote, so it is refused here where the message
+    can name the cause.
+    """
+    text = check_speed(speed, "J")
+    if not text.endswith("%"):
+        raise ValueError(f"joint speed {speed!r} must be a percentage (e.g. '20%'): a rate "
+                         "has no meaning for a joint move, and the controller refuses it")
+    return text
+
+
 def _pos_block(index: int, kind: str, uframe: int, utool: int, config: str, payload) -> str:
     if kind == "joint":
         joints = payload
@@ -93,6 +108,7 @@ def build_ls(
     utool: int,
     motion: str = "J",
     speed: str = "100%",
+    joint_speed: str = "100%",
     termination: str = "FINE",
     config: str = "N U T, 0, 0, 0",
     comment: str = "scan viewpoints",
@@ -118,21 +134,30 @@ def build_ls(
     single CONFIG string for the whole program is exactly how every point ended up pinned to
     the same branch. `joint_blocks=True` writes `P[n]` as joint angles for points that have
     them, which removes the controller's choice altogether - the most direct fix, and the
-    one that needs the model to be right.
+    one that needs the model to be right. Those points are reached with a `J` instruction,
+    which takes `joint_speed` (a percentage) rather than the linear speed.
+
+    Per-point `representation` ("joint" or "cart") overrides `joint_blocks` one point at a
+    time, which a stroke plan needs and a whole-program flag cannot express: the scan points
+    must stay Cartesian (the sweep is a straight line between them) while the transition
+    points must be joint (their whole purpose is to pin the solution the planner verified).
+    A mixed program of that shape was imported and run on the controller.
     """
     if isinstance(stamp, str):
         stamp_text = stamp
     else:
         stamp_text = (stamp or datetime.now()).strftime("%y-%m-%d  TIME %H:%M:%S")
     speed = check_speed(speed, motion)
+    joint_speed = check_joint_speed(joint_speed)
 
     def command(index: int, point_motion: str, point_termination: str,
                 point_speed: str, is_joint: bool = False) -> str:
-        # a joint representation point can only be reached with a joint move, and
-        # FANUC takes a percentage speed for those
+        # A joint representation point can only be reached with a joint move, and a joint
+        # move takes a percentage: `J P[n] 100 mm/sec FINE` is refused by the controller at
+        # import, so the linear speed must not be carried over into the joint branch.
         if point_motion.upper() == "L" and not is_joint:
             return f"L P[{index}] {point_speed} {point_termination.upper()}"
-        return f"J P[{index}] {point_speed} FINE"
+        return f"J P[{index}] {joint_speed} FINE"
 
     mn_lines: list[str] = []
     pos_blocks: list[str] = []
@@ -151,9 +176,16 @@ def build_ls(
         point_config = pt.get("config") or config
         point_motion = str(pt.get("motion") or motion)
         point_termination = str(pt.get("termination") or termination)
-        point_speed = check_speed(str(pt.get("speed") or speed), point_motion)
+        # A `J` instruction takes a percentage and never a rate, so a program whose default
+        # speed is `100 mm/sec` must not have that speed validated against a joint move - it
+        # would be refused for a point that was never going to use it.
+        if point_motion.upper() == "J":
+            point_speed = joint_speed
+        else:
+            point_speed = check_speed(str(pt.get("speed") or speed), point_motion)
         joints = pt.get("joints_deg")
-        as_joint = bool(joint_blocks and joints is not None)
+        wanted = str(pt.get("representation") or ("joint" if joint_blocks else "cart"))
+        as_joint = bool(wanted == "joint" and joints is not None)
         if as_joint:
             pos_blocks.append(
                 _pos_block(next_index, "joint", uframe, utool, point_config, joints))

@@ -43,11 +43,20 @@ def configure(subparsers) -> None:
                           help="J is the permissive default for a reachability review; a "
                                "stroke plan ignores this and uses the configuration")
     exporter.add_argument("--speed", default="100%")
+    exporter.add_argument("--joint-speed", default="100%",
+                          help="speed for the J instructions a --joint-blocks program "
+                               "needs (a percentage; a linear rate is refused)")
     exporter.add_argument("--termination", default="FINE", choices=["FINE", "CNT0", "CNT100"],
                           help="a stroke plan ignores this and uses the configuration")
     exporter.add_argument("--config", help="configuration override (JSON); it is authoritative "
                                           "for motion, termination and speed when the "
                                           "viewpoint file is a stroke plan")
+    exporter.add_argument("--per-point-config", action="store_true",
+                          help="write each point's own CONFIG letters instead of the "
+                               "program-wide constant. OFF by default: a program carrying a "
+                               "computed letter was refused by ROBOGUIDE with ASBN-023 "
+                               "'Configuration error', so the letters are only half "
+                               "verified")
     exporter.add_argument("--joint-blocks", action="store_true",
                           help="write P[n] as joint angles where the viewpoint file has "
                                "them; the controller then has no branch to choose")
@@ -120,6 +129,8 @@ def run(args, parser: argparse.ArgumentParser) -> int:
                                      else args.uframe),
                              utool=args.utool,
                              motion=motion, speed=speed, termination=termination,
+                             joint_speed=args.joint_speed,
+                             per_point_config=bool(args.per_point_config),
                              joint_blocks=bool(args.joint_blocks),
                              order=order)
     except ValueError as error:
