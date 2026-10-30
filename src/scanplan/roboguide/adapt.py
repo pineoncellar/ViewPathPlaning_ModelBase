@@ -104,6 +104,10 @@ def viewpoints_to_points(viewpoints, *, per_point_config: bool = False) -> list[
                 # travel together.
                 "motion": _field(item, "motion", None),
                 "representation": _field(item, "representation", None),
+                # Per-point speed, for a caller that priced one move itself. `adapt.export`
+                # fills it in from `joint_speed_ladder` when it is absent, and never
+                # overwrites one that is already here.
+                "speed": _field(item, "speed", None),
             }
         )
     return wpr.unwrap_wpr(points)
@@ -220,6 +224,90 @@ def _two_opt(
 def _extents(points: list[dict]) -> dict:
     xyz = np.stack([np.asarray(pt["xyz_mm"], dtype=float).reshape(3) for pt in points])
     return {"min": xyz.min(axis=0).round(3).tolist(), "max": xyz.max(axis=0).round(3).tolist()}
+
+
+def _price_joint_moves(points: list[dict], *, motion: str, ladder, fallback: str
+                       ) -> tuple[list[dict], dict]:
+    """Give every joint move the speed its own size earns, and account for the result.
+
+    The size of a move is the largest single-axis change from the previous point, which is the
+    same measure `path._joint_step_deg` uses and the same one the report prints. Two points
+    matter and are easy to get wrong:
+
+    * the size must be measured on the JOINT readings actually written, after unwrapping, or a
+      reading of +340 next to one of -20 would be priced as a 360 degree move;
+    * the first move has no predecessor. It takes the ladder's last (slowest) bucket rather
+      than a guess, and the contract says so.
+
+    A point that already carries a speed keeps it: a caller that priced a move deliberately
+    should not have it overwritten by this helper.
+    """
+    buckets = [(limit, float(pct)) for limit, pct in ladder]
+    priced: list[dict] = []
+    counts: dict[str, int] = {}
+    degrees: dict[str, float] = {}
+    unknown = False
+    previous = None
+    for index, point in enumerate(points):
+        point = dict(point)
+        is_joint = (str(point.get("motion") or motion).upper() == "J"
+                    or str(point.get("representation") or "").lower() == "joint")
+        if is_joint and not point.get("speed"):
+            joints = point.get("joints_deg")
+            if joints is None:
+                step = None
+            elif previous is None:
+                step = None
+                unknown = True
+            else:
+                delta = np.abs(np.asarray(joints, dtype=float)
+                               - np.asarray(previous, dtype=float))
+                step = float(delta.max())
+            pct = buckets[-1][1]
+            for limit, speed in buckets:
+                if limit is None or (step is not None and step <= float(limit)):
+                    pct = speed
+                    break
+            text = f"{pct:g}%"
+            point["speed"] = text
+            counts[text] = counts.get(text, 0) + 1
+            degrees[text] = degrees.get(text, 0.0) + (0.0 if step is None else step)
+        if point.get("joints_deg") is not None:
+            previous = point["joints_deg"]
+        priced.append(point)
+    return priced, {"joint_moves": counts, "joint_move_deg_total":
+                    {key: round(value, 1) for key, value in degrees.items()},
+                    "unknown_first_move": unknown, "fallback": str(fallback),
+                    "ladder": [[limit, pct] for limit, pct in buckets]}
+
+
+def _motion_speeds(speed: str, joint_speed: str, stats: dict | None) -> dict:
+    """What speed each part of the program runs at, as a report block.
+
+    Deliberately not a duration. Converting degrees to seconds needs a joint speed in
+    degrees per second, and that has never been measured on this machine; a made-up number
+    would read as a promise.
+    """
+    if stats is None:
+        return {
+            "linear_speed": str(speed),
+            "joint_moves": {"all": f"{joint_speed}"},
+            "ladder": None,
+            "note": ("every joint move runs at one speed; set motion.joint_speed_ladder to "
+                     "price them by size"),
+        }
+    return {
+        "linear_speed": str(speed),
+        "joint_speed_fallback": stats["fallback"],
+        "ladder": stats["ladder"],
+        "joint_moves": stats["joint_moves"],
+        "joint_move_deg_total": stats["joint_move_deg_total"],
+        "unknown_first_move": stats["unknown_first_move"],
+        "note": ("joint speeds are a percentage of the controller's joint speed, chosen by "
+                 "the largest single-axis change of each move; the degrees are the sum of that "
+                 "change per bucket, not a duration. The first move has no predecessor, so it "
+                 "takes the slowest bucket - `unknown_first_move` says whether that happened"),
+    }
 
 
 def _contract_blocks(
@@ -346,6 +434,7 @@ def export(
     motion="J",
     speed="100%",
     joint_speed="100%",
+    joint_speed_ladder=None,
     termination="FINE",
     config="N U T, 0, 0, 0",
     per_point_config: bool = False,
@@ -357,6 +446,11 @@ def export(
     `place` is the optional 'x,y,z,w,p,r' pose of the CAD frame inside the
     ROBOGUIDE world; it re-expresses every point and defaults the UFRAME to 0,
     because the points then need no UFRAME taught by hand.
+
+    `joint_speed_ladder` prices each joint move by its size: an iterable of
+    `(largest single-axis change in degrees, speed percent)` ending in a `None` limit, as in
+    `motion.joint_speed_ladder`. Absent, every joint move keeps `joint_speed`, which is the
+    behaviour of every program this module wrote before 2026-10-30.
 
     `order=True` is refused for a stroke plan. Re-sorting splits each stroke into two
     unrelated moves, which silently voids the sweep the coverage figure was computed
@@ -406,6 +500,13 @@ def export(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if joint_speed_ladder is not None:
+        points, speed_stats = _price_joint_moves(points, motion=motion,
+                                                 ladder=joint_speed_ladder,
+                                                 fallback=joint_speed)
+    else:
+        speed_stats = None
+
     ls_text = ls.build_ls(
         points,
         prog_name=name,
@@ -446,6 +547,7 @@ def export(
     )
     contract["program"]["termination"] = str(termination).upper()
     contract["program"]["strokes"] = sorted(strokes) if strokes else []
+    contract["program"]["motion_speeds"] = _motion_speeds(speed, joint_speed, speed_stats)
     contract["delivery_check"] = validate.check_points(points, default_motion=motion)
     with frame_path.open("w", encoding="utf-8") as handle:
         json.dump(contract, handle, indent=2)

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import types
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import MISSING, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
@@ -217,11 +217,39 @@ class MotionParams:
 
     Speed is a floor setting, not a planning variable; it is carried here only so the
     program has one source for it instead of a flag and a config that can disagree.
+
+    `joint_speed_ladder` is the same idea for the JOINT moves, and it is a ladder rather than
+    one number because a joint move is the one place where the danger scales with the size of
+    the move: a few degrees of J6 is nothing, a hundred and eighty swings the scanner through a
+    400 mm arc about the flange. Each entry is `[biggest single-axis change in degrees, speed
+    in percent]`, read top to bottom, and the last entry's degree value MUST be `null` - that
+    is the catch-all bucket, so a move always has a speed. `[[null, 100.0]]` is the pre-2026-10-30
+    behaviour (every joint move at the controller default) and is what a config without this key
+    gets, so an old file exports the same program it always did.
+
+    The scan speed is NOT in here on purpose: a linear sweep is flown at `speed_mm_s`, and the
+    coverage figure was computed for that speed. The ladder only ever reaches `J` instructions.
     """
 
     type: str
     termination: str
     speed_mm_s: float
+    joint_speed_ladder: tuple[tuple[float | None, float], ...] = ((None, 100.0),)
+
+    def joint_speed_pct(self, step_deg: float | None) -> float:
+        """The percentage to command for a joint move whose biggest axis change is `step_deg`.
+
+        `None` means "the size is not known" - the first point of a program has no predecessor
+        to measure against - and it takes the LAST bucket, which is the slowest one by
+        construction. Guessing fast for an unmeasured move is the one direction that cannot be
+        undone once the program is on the controller.
+        """
+        if step_deg is None:
+            return float(self.joint_speed_ladder[-1][1])
+        for limit, speed in self.joint_speed_ladder:
+            if limit is None or float(step_deg) <= float(limit):
+                return float(speed)
+        return float(self.joint_speed_ladder[-1][1])
 
 
 @dataclass(frozen=True)
@@ -631,7 +659,13 @@ def _reject_unknown(data: dict[str, Any]) -> None:
 def _section(data: dict[str, Any], name: str, cls: type) -> Any:
     body = {k: v for k, v in data.get(name, {}).items() if not k.startswith("_")}
     hints = get_type_hints(cls)
-    missing = sorted(f.name for f in fields(cls) if f.name not in body)
+    # A field with a default is optional in the file. That is what lets a new key land
+    # without turning every existing config into an error, which matters here because the
+    # default is how "off" is spelled: `motion.joint_speed_ladder` absent means "one speed
+    # for every joint move", i.e. the program this repository exported before 2026-10-30.
+    missing = sorted(f.name for f in fields(cls)
+                     if f.name not in body
+                     and f.default is MISSING and f.default_factory is MISSING)
     if missing:
         raise ValueError(f"section '{name}' is missing {missing}")
     converted = {key: _coerce(hints[key], value) for key, value in body.items()}
@@ -742,6 +776,45 @@ def _validate(config: PlannerConfig) -> None:
                          f"not {config.motion.termination!r}")
     if config.motion.speed_mm_s <= 0.0:
         raise ValueError("'motion.speed_mm_s' must be positive")
+    _validate_joint_speed_ladder(config.motion.joint_speed_ladder)
+
+
+def _validate_joint_speed_ladder(ladder) -> None:
+    """The buckets must ascend and the last one must be the catch-all.
+
+    Refused rather than repaired: a ladder with two equal thresholds has an unreachable
+    bucket, and one that does not end in `null` leaves large moves with no speed at all -
+    both are typos that would otherwise show up as a program with the wrong speed on the
+    floor, which is exactly the kind of thing nobody notices until an alarm.
+    """
+    if not ladder:
+        raise ValueError("'motion.joint_speed_ladder' cannot be empty: the largest joint "
+                         "moves would have no speed")
+    last = len(ladder) - 1
+    previous = None
+    for index, entry in enumerate(ladder):
+        if len(entry) != 2:
+            raise ValueError(f"'motion.joint_speed_ladder' entry {entry!r} must be "
+                             "[degrees, percent]")
+        limit, speed = entry
+        if not 0.0 < float(speed) <= 100.0:
+            raise ValueError(f"'motion.joint_speed_ladder' speed {speed!r} must be in "
+                             "(0, 100] percent")
+        if index == last:
+            if limit is not None:
+                raise ValueError(
+                    "'motion.joint_speed_ladder' must end with a null limit: it is the "
+                    "catch-all bucket, and without it a move larger than the last threshold "
+                    "has no speed")
+            continue
+        if limit is None:
+            raise ValueError(f"'motion.joint_speed_ladder' entry {index + 1} is null but is "
+                             "not the last: everything after it would be unreachable")
+        if float(limit) <= 0.0:
+            raise ValueError("'motion.joint_speed_ladder' limits must be positive")
+        if previous is not None and float(limit) <= previous:
+            raise ValueError("'motion.joint_speed_ladder' limits must strictly increase")
+        previous = float(limit)
 
 
 def _validate_fast(config: PlannerConfig) -> None:

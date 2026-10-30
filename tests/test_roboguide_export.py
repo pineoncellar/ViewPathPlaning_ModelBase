@@ -50,6 +50,60 @@ def test_the_three_files_appear(tmp_path):
     assert contract["files"]["program"] == f"{PROG}.LS"
 
 
+def test_a_joint_move_is_written_at_the_speed_its_size_earns(tmp_path):
+    """The ladder prices each joint move by the largest single-axis change it makes.
+
+    A joint move is where danger scales with size - J6 sits ~250 mm off the flange axis - so a
+    179 degree move and an 8 degree move must not be commanded at the same speed. The ladder is
+    read top to bottom and the last entry catches everything bigger.
+    """
+    ladder = [[20.0, 50.0], [60.0, 20.0], [None, 10.0]]
+    points = [
+        {"id": 1, "position": (0.0, 0.0, 300.0), "axis": (0.0, 0.0, -1.0), "roll_deg": 0.0,
+         "joints_deg": (0.0, 0.0, 0.0, 0.0, -60.0, 0.0), "motion": "J"},
+        {"id": 2, "position": (10.0, 0.0, 300.0), "axis": (0.0, 0.0, -1.0), "roll_deg": 0.0,
+         "joints_deg": (0.0, 0.0, 0.0, 0.0, -60.0, 8.0), "motion": "J"},
+        {"id": 3, "position": (20.0, 0.0, 300.0), "axis": (0.0, 0.0, -1.0), "roll_deg": 0.0,
+         "joints_deg": (0.0, 0.0, 0.0, 0.0, -60.0, 48.0), "motion": "J"},
+        {"id": 4, "position": (30.0, 0.0, 300.0), "axis": (0.0, 0.0, -1.0), "roll_deg": 0.0,
+         "joints_deg": (0.0, 0.0, 0.0, 0.0, -60.0, 227.0), "motion": "J"},
+    ]
+    contract = adapt.export(points, tmp_path, prog_name=PROG, motion="J",
+                            joint_speed_ladder=ladder, order=False)
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    # the first move has no predecessor, so it takes the slowest bucket and the contract says so
+    assert "J P[1] 10% FINE" in text
+    assert "J P[2] 50% FINE" in text      # 8 degrees
+    assert "J P[3] 20% FINE" in text      # 40 degrees
+    assert "J P[4] 10% FINE" in text      # 179 degrees
+    speeds = contract["program"]["motion_speeds"]
+    assert speeds["joint_moves"] == {"10%": 2, "50%": 1, "20%": 1}
+    assert speeds["unknown_first_move"] is True
+
+
+def test_a_linear_sweep_keeps_its_own_speed_under_a_ladder(tmp_path):
+    """The ladder reaches `J` instructions only: a sweep's speed is what coverage was computed for."""
+    ladder = [[20.0, 5.0], [None, 2.0]]
+    points = viewpoints()
+    points[0].update({"joints_deg": JOINTS, "motion": "J", "representation": "joint"})
+    adapt.export(points, tmp_path, prog_name=PROG, motion="L", speed="100 mm/sec",
+                 joint_speed_ladder=ladder, order=False)
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert "L P[2] 100 mm/sec FINE" in text
+    assert "J P[1] 2% FINE" in text
+
+
+def test_a_point_that_brought_its_own_speed_keeps_it(tmp_path):
+    """A caller that priced one move deliberately must not have it overwritten."""
+    points = viewpoints()
+    points[0].update({"joints_deg": JOINTS, "motion": "J", "speed": "35%"})
+    adapt.export(points, tmp_path, prog_name=PROG, motion="J", joint_speed_ladder=[[20.0, 5.0],
+                                                                                 [None, 2.0]],
+                 order=False)
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert "J P[1] 35% FINE" in text
+
+
 def test_the_program_name_matches_the_file_name(tmp_path):
     adapt.export(viewpoints(), tmp_path, prog_name=PROG)
     text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")

@@ -490,18 +490,26 @@ def _export_options(config, viewpoints, data: dict) -> dict:
     unrelated moves. Its motion and termination come from the configuration for the same
     reason - a sweep flown as J/FINE is not the sweep the coverage figure was computed for.
     The pose-only deliverable keeps the permissive J move a reachability review is read with.
+
+    `joint_speed_ladder` rides along in both cases when the configuration prices joint moves
+    by size (`motion.joint_speed_ladder`). It only ever reaches `J` instructions, so the scan
+    speed is untouched either way.
     """
+    ladder = getattr(config.motion, "joint_speed_ladder", None)
+    ladder = [list(entry) for entry in ladder] if ladder and len(ladder) > 1 else None
     if any(point.stroke_id is not None for point in viewpoints):
         return {
             "motion": config.motion.type,
             "speed": f"{config.motion.speed_mm_s:g} mm/sec",
             "termination": config.motion.termination,
+            "joint_speed_ladder": ladder,
             "order": False,
         }
     return {
         "motion": str(data.get("motion", "J")),
         "speed": str(data.get("speed", "100%")),
         "termination": "FINE",
+        "joint_speed_ladder": ladder,
         "order": True,
     }
 

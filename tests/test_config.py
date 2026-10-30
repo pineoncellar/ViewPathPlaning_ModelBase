@@ -51,6 +51,52 @@ def test_a_utf8_bom_is_accepted(tmp_path):
     assert cfg.scanner.max_incidence_deg == 55.0
 
 
+def test_the_joint_speed_ladder_prices_moves_by_size():
+    """The shipped ladder is the conservative site choice, and it ends in a catch-all."""
+    cfg = load_config()
+    ladder = cfg.motion.joint_speed_ladder
+    assert ladder == ((20.0, 50.0), (60.0, 20.0), (None, 10.0))
+    assert cfg.motion.joint_speed_pct(5.0) == 50.0
+    assert cfg.motion.joint_speed_pct(20.0) == 50.0
+    assert cfg.motion.joint_speed_pct(20.5) == 20.0
+    assert cfg.motion.joint_speed_pct(60.0) == 20.0
+    assert cfg.motion.joint_speed_pct(179.0) == 10.0
+    # an unmeasured move - the first of a program - takes the slowest bucket, never a guess
+    assert cfg.motion.joint_speed_pct(None) == 10.0
+
+
+def test_a_configuration_without_a_ladder_keeps_one_speed():
+    """The old behaviour must remain the DEFAULT, so a file that never mentions the ladder
+    exports the program this repository wrote before 2026-10-30."""
+    from scanplan.config import MotionParams
+
+    plain = MotionParams(type="L", termination="CNT0", speed_mm_s=100.0)
+    assert plain.joint_speed_ladder == ((None, 100.0),)
+    assert plain.joint_speed_pct(179.0) == 100.0
+    assert plain.joint_speed_pct(None) == 100.0
+
+
+@pytest.mark.parametrize("ladder, match", [
+    ([], "cannot be empty"),
+    ([[20.0, 50.0]], "must end with a null"),
+    ([[20.0, 50.0], [60.0, 20.0]], "must end with a null"),
+    ([[None, 50.0], [None, 10.0]], "not the last"),
+    ([[20.0, 50.0], [20.0, 20.0], [None, 10.0]], "strictly increase"),
+    ([[60.0, 50.0], [20.0, 20.0], [None, 10.0]], "strictly increase"),
+    ([[0.0, 50.0], [None, 10.0]], "must be positive"),
+    ([[20.0, 0.0], [None, 10.0]], "in \\(0, 100\\]"),
+    ([[20.0, 150.0], [None, 10.0]], "in \\(0, 100\\]"),
+])
+def test_the_joint_speed_ladder_is_refused_when_it_cannot_be_read(tmp_path, ladder, match):
+    """Two equal thresholds leave a bucket unreachable; no catch-all leaves big moves unpriced."""
+    bad = tmp_path / "ladder.json"
+    bad.write_text(json.dumps({"motion": {"type": "L", "termination": "CNT0",
+                                          "speed_mm_s": 100.0,
+                                          "joint_speed_ladder": ladder}}), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        load_config(bad)
+
+
 def test_a_typo_in_a_section_name_is_rejected(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"scannner": {"max_incidence_deg": 45.0}}), encoding="utf-8")

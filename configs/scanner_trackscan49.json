@@ -211,12 +211,23 @@
     "kinematic gate on that is J to a joint-representation point - the only form in which",
     "our choice of joint solution survives to the controller.",
     "CNT0 because that is the site's convention. speed_mm_s is set on the floor and is NOT",
-    "optimised by the planner."
+    "optimised by the planner.",
+    "",
+    "joint_speed_ladder is the speed of the J instructions, by how big the move is. A joint",
+    "move is where the danger scales with size: J6 sits about 250 mm off the flange axis, so",
+    "180 degrees of it swings the scanner through a 400 mm arc, while 5 degrees moves it 22 mm.",
+    "Each entry is [largest single-axis change in degrees, speed percent], the last one null",
+    "because it is the catch-all. Measured on the 2026-10-30 program (64 points, 50 joint",
+    "moves): 20 under 20 deg, 19 between 20 and 60, 11 over 60 - and the 11 were the 7 moves",
+    "over 90 deg, the worst being 179.2. Those are the ones this ladder slows down.",
+    "A linear sweep is NOT affected: it keeps speed_mm_s, because that is the speed the",
+    "coverage figure was computed for."
   ],
   "motion": {
     "type": "L",
     "termination": "CNT0",
-    "speed_mm_s": 100.0
+    "speed_mm_s": 100.0,
+    "joint_speed_ladder": [[20.0, 50.0], [60.0, 20.0], [null, 10.0]]
   },
 
   "occlusion_tol_mm": 2.0,

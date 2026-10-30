@@ -43,9 +43,14 @@ def configure(subparsers) -> None:
                           help="J is the permissive default for a reachability review; a "
                                "stroke plan ignores this and uses the configuration")
     exporter.add_argument("--speed", default="100%")
-    exporter.add_argument("--joint-speed", default="100%",
-                          help="speed for the J instructions a --joint-blocks program "
-                               "needs (a percentage; a linear rate is refused)")
+    exporter.add_argument("--joint-speed", default=None,
+                          help="one speed for every J instruction, as a percentage. Left out, "
+                               "a stroke plan uses motion.joint_speed_ladder from the "
+                               "configuration, and a pose-only plan uses 100%")
+    exporter.add_argument("--joint-speed-ladder", default=None,
+                          help="price joint moves by size, e.g. '20:50,60:20,null:10' "
+                               "[degrees:percent]; the last entry must be 'null'. Overrides "
+                               "the configuration's ladder for this export")
     exporter.add_argument("--termination", default="FINE", choices=["FINE", "CNT0", "CNT100"],
                           help="a stroke plan ignores this and uses the configuration")
     exporter.add_argument("--config", help="configuration override (JSON); it is authoritative "
@@ -60,6 +65,33 @@ def configure(subparsers) -> None:
     exporter.add_argument("--joint-blocks", action="store_true",
                           help="write P[n] as joint angles where the viewpoint file has "
                                "them; the controller then has no branch to choose")
+
+
+def _ladder_entry_text(ladder, index: int) -> str:
+    """One bucket in words, e.g. `<= 20 deg -> 50%` and `> 60 deg -> 10%`."""
+    limit, pct = ladder[index]
+    if limit is None:
+        low = float(ladder[index - 1][0]) if index else 0.0
+        size = f"> {low:g} deg"
+    else:
+        size = f"<= {float(limit):g} deg"
+    return f"{size} -> {float(pct):g}%"
+
+
+def _parse_ladder(text: str) -> list:
+    """`"20:50,60:20,null:10"` to the ladder the exporter and the config both understand."""
+    ladder = []
+    for chunk in str(text).split(","):
+        piece = chunk.strip()
+        if not piece:
+            raise ValueError("--joint-speed-ladder has an empty entry")
+        limit_text, _, speed_text = piece.partition(":")
+        if not speed_text:
+            raise ValueError(f"--joint-speed-ladder entry {piece!r} must be degrees:percent")
+        limit = None if limit_text.strip().lower() in ("null", "none", "") \
+            else float(limit_text)
+        ladder.append((limit, float(speed_text)))
+    return ladder
 
 
 def run(args, parser: argparse.ArgumentParser) -> int:
@@ -99,21 +131,42 @@ def run(args, parser: argparse.ArgumentParser) -> int:
     stroke_plan = any(isinstance(item, dict) and item.get("stroke_id") is not None
                       for item in viewpoints)
     motion, speed, termination, order = args.motion, args.speed, args.termination, True
-    if stroke_plan:
-        # The configuration is authoritative here: a stroke plan's motion, termination and
-        # speed are one decision, and two sources for it is how a program ends up flown at
-        # a speed the coverage was not computed for.
+    joint_speed = args.joint_speed or "100%"
+    ladder = None
+    if args.joint_speed_ladder:
+        try:
+            ladder = _parse_ladder(args.joint_speed_ladder)
+        except ValueError as error:
+            parser.error(str(error))
+            return 2
+    cfg = None
+    if stroke_plan or args.config or args.joint_speed_ladder is None:
         try:
             cfg = load_config(args.config)
         except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
             parser.error(f"cannot read the configuration: {error}")
             return 2
+    if stroke_plan:
+        # The configuration is authoritative here: a stroke plan's motion, termination and
+        # speed are one decision, and two sources for it is how a program ends up flown at
+        # a speed the coverage was not computed for.
         motion = cfg.motion.type
         termination = cfg.motion.termination
         speed = f"{cfg.motion.speed_mm_s:g} mm/sec"
         order = False
         print(f"stroke plan: {motion} {speed} {termination} from the configuration, and the "
               "planner's own order is kept (re-sorting would split strokes)")
+    if ladder is None and cfg is not None and len(cfg.motion.joint_speed_ladder) > 1:
+        ladder = [list(entry) for entry in cfg.motion.joint_speed_ladder]
+    if args.joint_speed is not None:
+        # An explicit single speed wins over the ladder, and says so: silently keeping the
+        # ladder while the user asked for one number is how a program ends up slower (or
+        # faster) than the person who wrote the command line believes.
+        ladder = None
+        print(f"joint moves: {joint_speed} for every J instruction (overrides the ladder)")
+    elif ladder is not None:
+        print("joint moves: " + ", ".join(
+            _ladder_entry_text(ladder, index) for index in range(len(ladder))))
 
     place = args.place
     if registration is not None:
@@ -129,7 +182,8 @@ def run(args, parser: argparse.ArgumentParser) -> int:
                                      else args.uframe),
                              utool=args.utool,
                              motion=motion, speed=speed, termination=termination,
-                             joint_speed=args.joint_speed,
+                             joint_speed=joint_speed,
+                             joint_speed_ladder=ladder,
                              per_point_config=bool(args.per_point_config),
                              joint_blocks=bool(args.joint_blocks),
                              order=order)

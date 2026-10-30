@@ -157,7 +157,7 @@ def build_ls(
         # import, so the linear speed must not be carried over into the joint branch.
         if point_motion.upper() == "L" and not is_joint:
             return f"L P[{index}] {point_speed} {point_termination.upper()}"
-        return f"J P[{index}] {joint_speed} FINE"
+        return f"J P[{index}] {point_speed} FINE"
 
     mn_lines: list[str] = []
     pos_blocks: list[str] = []
@@ -178,9 +178,11 @@ def build_ls(
         point_termination = str(pt.get("termination") or termination)
         # A `J` instruction takes a percentage and never a rate, so a program whose default
         # speed is `100 mm/sec` must not have that speed validated against a joint move - it
-        # would be refused for a point that was never going to use it.
+        # would be refused for a point that was never going to use it. A point MAY carry its
+        # own joint speed, though: that is how `motion.joint_speed_ladder` reaches the file,
+        # one bucket per move, computed from the joint travel by `adapt.export`.
         if point_motion.upper() == "J":
-            point_speed = joint_speed
+            point_speed = check_joint_speed(str(pt.get("speed") or joint_speed))
         else:
             point_speed = check_speed(str(pt.get("speed") or speed), point_motion)
         joints = pt.get("joints_deg")
