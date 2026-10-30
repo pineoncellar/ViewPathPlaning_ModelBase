@@ -26,7 +26,7 @@
 | 输出 | 机器人位置坐标（体素单位）+ 关节构型，JSON | 扫描头笛卡尔位姿 + FANUC `.LS` + 帧契约 + 覆盖报告 |
 | 光线求交 | 纯 Python | Embree 加速（约三个数量级） |
 | 数据隔离 | — | 客户数模及派生数据永不入库，附自检脚本 |
-| 原管线 | 仓库根目录下的当前实现 | 冻结保留在 `reference/`，作为回归基线 |
+| 原管线 | 仓库根目录下的当前实现 | 曾冻结保留在 `reference/` 作回归基线；2026-10-30 已从版本库移除，仍在 git 历史里 |
 
 *This project was originally inspired by and built upon the workflow from
 **[MobMonRob/ViewPathPlaning](https://github.com/MobMonRob/ViewPathPlaning)**,

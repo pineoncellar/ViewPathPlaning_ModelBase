@@ -14,9 +14,11 @@
 | [`scripts/`](../scripts) | 仓库工具，含数据合规自检。 | 是 |
 | `input/` | **工位数模放这里。** 内容被 gitignore。 | **否** |
 | `output/` | 规划器输出。内容被 gitignore。 | **否** |
-| [`reference/`](../reference) | 冻结保留的原管线，作为回归基线。手册见 [`reference/MANUAL.md`](../reference/MANUAL.md)。 | 是 |
 | `docs/` | 公开文档：索引、架构、命令行、配置、验证与历史记录。 | 是 |
-| `samples/` | 原项目自带的公开样例网格与图片。 | 是 |
+
+原管线的 `reference/`（冻结基线）与原项目自带的 `samples/`（公开样例网格与图片）已于
+2026-10-30 从工作区与版本库移除，不再随仓库分发；需要时从 git 历史取回：
+`git checkout b5989a0 -- reference samples`。
 
 ## 工位数模
 
@@ -26,11 +28,11 @@
 
 ## 原管线与 `.LS` 写入器的关系
 
-[`reference/`](../reference) 冻结保留原管线：`PHASE_1`～`PHASE_6`、集合覆盖求解器、以及
-IGES→网格转换器。它作为回归基线保留，同时也是新规划器**移植**（而非重写）FANUC `.LS`
-写入器的来源——那个写入器已经解决了 FANUC ASCII 格式里一堆繁琐且不容出错的地方
+`reference/` 曾冻结保留原管线：`PHASE_1`～`PHASE_6`、集合覆盖求解器、以及 IGES→网格转换器，
+作为回归基线，手册是 `reference/MANUAL.md`。**2026-10-30 起它连同上游的 `samples/` 不再随
+仓库分发**，需要时按上面的 `git checkout` 取回。它同时是新规划器**移植**（而非重写）FANUC
+`.LS` 写入器的来源——那个写入器已经解决了 FANUC ASCII 格式里一堆繁琐且不容出错的地方
 （固定轴 XYZ 欧拉角、万向锁分支、`/ATTR` 自洽、无前导零的数字格式、程序名合法化）。
-手册见 [`reference/MANUAL.md`](../reference/MANUAL.md)。
 
 **本路线不使用 `PHASE_3` / `PHASE_4` / `PHASE_5`**：它们是 UR5e 逆向运动学与机器人基座
 采样、TSP 排序那一层，而本方案整层移除了（见根 README 的[「它明确不做」](../README.md#它明确不做)）。代码没动，只作参考。

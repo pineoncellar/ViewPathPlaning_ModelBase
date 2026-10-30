@@ -4,7 +4,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| [architecture.md](architecture.md) | 仓库结构与模块边界、工位数模的导入与对齐口径、原管线为何冻结保留、逆解与 TSP 为何整层移除。 |
+| [architecture.md](architecture.md) | 仓库结构与模块边界、工位数模的导入与对齐口径、原管线为何曾冻结保留（`reference/` 与 `samples/` 已于 2026-10-30 移除）、逆解与 TSP 为何整层移除。 |
 | [cli.md](cli.md) | `scanplan` 五个子命令（`plan` / `ls` / `view` / `pick-datums` / `web`）的用法与常用参数，含 `pick-datums` 配准流程与配准 JSON 格式。 |
 | [frame-contract.md](frame-contract.md) | 交付位姿的帧契约：`position` 语义、+Z 光轴、`UTOOL` 教法、两条 `UFRAME` 路径。 |
 | [target-surface.md](target-surface.md) | 目标面的拓扑定义，以及为什么所有基于朝向的分面规则在真实数模上都失效。 |
