@@ -1,7 +1,8 @@
 <!--
 @File     :   tech-stack.md
 @Desc     :   全项目技术栈说明：运行时、依赖分层、算法与数值技术、数据格式、前后端形态、外部系统接口、工程工具链与技术边界
-@Note     :   版本号以 pyproject.toml 与 uv.lock 为准；reference/ 是冻结基线，其依赖面与主包不同，混着看会误判
+@Note     :   版本号以 pyproject.toml 与 uv.lock 为准；下文提到的 reference/ 与 samples/ 已于
+             2026-10-30 从版本库移除，相关段落记录的是当时的事实
 -->
 
 # 技术栈说明
@@ -48,11 +49,12 @@
 `pyproject.toml` 把 `requires-python` 卡在 `>=3.10,<3.11`，`.python-version` 写 `3.10`，
 `uv.lock` 里是 `requires-python == 3.10.*`。原因不是主包挑食，而是**共用一个环境**：
 
-- `reference/` 是冻结的原管线，开发于 2022 年那套包（`numpy 1.23.1`、`scipy 1.8.1`、
-  `trimesh 3.12.7`、`mujoco 2.2.0`、`ortools 9.4.1874`…），这些版本只出到 cp310 的 wheel；
+- 2022 年那套包（`numpy 1.23.1`、`scipy 1.8.1`、`trimesh 3.12.7`、`mujoco 2.2.0`、
+  `ortools 9.4.1874`…）只出到 cp310 的 wheel。它们最初是为冻结的 `reference/` 选的，目录虽已
+  移除（见 [architecture.md](architecture.md)），`uv.lock` 里的这批钉子仍在；
 - `src/` 的新规划器本身在新版本 Python 上也能跑，但它跑在同一个 `.venv` 里。
 
-要解除这个约束，得先把 `reference/` 迁到新版本，而不是改一行 `requires-python`。
+要解除这个约束，得先把这套依赖整体迁到新版本，而不是改一行 `requires-python`。
 
 ### 2.2 环境命令
 
@@ -177,6 +179,7 @@ src/scanweb/             本机浏览器工位界面
 |---|---|---|
 | 可复现表面采样 | 每格一点、等面积份额，显式播种（trimesh 3.12.7 从全局 numpy 随机态抽样，不播种两次结果不同） | [geometry.py](../src/scanplan/geometry.py)、[target_surface.py](../src/scanplan/target_surface.py) |
 | 目标面分割 | 镜像配对 → 中面 PCA → 局部片法向 `n·m` 的符号传播，拓扑定面而不是朝向定面 | [sheet_split.py](../src/scanplan/sheet_split.py) |
+| 网格朝向修复 | 每个三角面沿 `+n` / `−n` 各打一条短光线：正确朝向的薄片面是"身后有镜像面、前方空"，反了就反过来；只修零件，夹具与底座不碰 | [winding.py](../src/scanplan/winding.py) |
 | 光线求交与遮挡 | Embree BVH，分块查询（`DEFAULT_CHUNK = 250_000`）压峰值内存 | [raycast.py](../src/scanplan/raycast.py) |
 | 单点位姿有效性 | 视场（随距离缩放的矩形）、量程、入射角、遮挡、本体包络、跟踪器六条判据 | [scanner_model.py](../src/scanplan/scanner_model.py) |
 | 候选生成 | 每个瞄准格点铺"距离 × 倾角 × 滚转"阶梯后去重；滚转必要是因为视场是矩形 | [candidates.py](../src/scanplan/candidates.py) |
@@ -237,7 +240,7 @@ v1 行为。
 | `viewpoints.json` | JSON | 交付位姿：位置、光轴、滚转、覆盖点数与面积、入射角、跟踪器判定；机器人门打开时另带 `config` / `branch` / `joints_deg` / `j5_margin_deg` |
 | `viewpoints.csv` | CSV | 同上，给表格工具 |
 | `exempt_points.csv` | CSV | 夹具接触而豁免的采样点 |
-| `unreachable_points.csv` | CSV | 未覆盖采样点，附逐点原因（含 `unreachable_joint_limit` / `no_line` / `not_facing`） |
+| `unreachable_points.csv` | CSV | 未覆盖采样点，附逐点原因（含 `unreachable_joint_limit` / `beyond_arm_reach` / `no_line` / `not_facing`） |
 | `coverage_report.json` | JSON | 主报告：覆盖率、漏点分类与聚团、入射角直方图、贪心曲线、参数出处、工位自检、配准，以及 `kinematics` / `budget` / `surface_profile` 三个块 |
 | `summary.txt` | 纯文本 | 报告的一屏摘要（含 joints 与 budget 行） |
 | `strokes.json` | JSON | 仅在生成路径时写：扫描带与过渡段 |

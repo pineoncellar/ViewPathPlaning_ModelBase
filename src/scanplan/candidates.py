@@ -114,6 +114,43 @@ def dedupe(poses) -> list[ScannerPose]:
     return unique
 
 
+# Rolls tried about the SAME optical axis when the joint gate refuses the pose's own roll.
+# A spin about the optical axis does not change what the scanner looks at, but it does move
+# the FLANGE: the fitted tool is 635 mm long, so the roll sweeps the wrist round a 0.6 m
+# circle and decides whether the arm can hold the pose at all. `stroke.lock_roll` pins one
+# roll to keep J6 still, which is right for the many poses where that roll is feasible - but
+# on station 20261030_105857 it was infeasible for 1.4 % of the target face, and those
+# points came back as "never aimed at" when the sight line was fine all along. 21 of 30
+# sampled leftovers were reachable at another roll about the same axis.
+_ROLL_RETRY_DEG = (45.0, 315.0, 90.0, 270.0, 135.0, 225.0, 180.0)
+
+
+def gate_with_roll_retry(poses, keep) -> list[ScannerPose]:
+    """Apply `keep` (the joint gate), re-trying a refused pose at other rolls.
+
+    Only the roll changes, so the coverage geometry of a retried pose is the same sight
+    line; what buys the pose is the wrist position, not the aim. The smallest turn that
+    works is taken first so a retried pose stays as close as possible to the roll its
+    neighbours use (a roll difference between two delivered points is a J6 turn). A pose
+    the gate accepts first time is passed through untouched, so a plan whose locked roll
+    already works is bit-for-bit the plan it was before.
+    """
+    if keep is None:
+        return list(poses)
+    kept: list[ScannerPose] = []
+    for pose in poses:
+        if keep(pose):
+            kept.append(pose)
+            continue
+        for turn in _ROLL_RETRY_DEG:
+            retried = ScannerPose(position=pose.position, axis=pose.axis,
+                                  roll_deg=(pose.roll_deg + turn) % 360.0)
+            if keep(retried):
+                kept.append(retried)
+                break
+    return kept
+
+
 def _cap(groups: list[list[ScannerPose]], limit: int) -> list[ScannerPose]:
     """Cut the pool to `limit` poses WITHOUT starving any aim point.
 
@@ -175,9 +212,7 @@ def generate(points, normals, params: ScannerParams, *, seed: int,
     for done, index in enumerate(aims):
         ladder_poses = dedupe(ladder(points[index], normals[index], params,
                                      lock_roll=lock_roll))
-        if keep is not None:
-            ladder_poses = [pose for pose in ladder_poses if keep(pose)]
-        groups.append(ladder_poses)
+        groups.append(gate_with_roll_retry(ladder_poses, keep))
         if progress is not None:
             progress(done + 1, len(aims))
 
@@ -221,9 +256,7 @@ def refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
     for done, index in enumerate(aims):
         ladder_poses = dedupe(ladder(leak_points[index], leak_normals[index], params,
                                      lock_roll=lock_roll))
-        if keep is not None:
-            ladder_poses = [pose for pose in ladder_poses if keep(pose)]
-        groups.append(ladder_poses)
+        groups.append(gate_with_roll_retry(ladder_poses, keep))
         if progress is not None:
             progress(done + 1, len(aims))
     limit = int(params.max_candidates if max_candidates is None else max_candidates)
@@ -314,9 +347,7 @@ def feature_refine(leak_points, leak_normals, params: ScannerParams, *, seed: in
     for done, index in enumerate(aims):
         poses = dedupe(feature_ladder(leak_points[index], leak_normals[index], params,
                                       lock_roll=lock_roll))
-        if keep is not None:
-            poses = [pose for pose in poses if keep(pose)]
-        groups.append(poses)
+        groups.append(gate_with_roll_retry(poses, keep))
         if progress is not None:
             progress(done + 1, len(aims))
     limit = int(params.max_candidates if max_candidates is None else max_candidates)

@@ -525,10 +525,30 @@ def read_moved_viewpoints(result: dict) -> list[dict]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def relocation_config(monkeypatch, *, robot=None):
+    """Pin the configuration the relocation's reach audit runs with.
+
+    The synthetic poses of these fixtures sit at the robot's own origin, inside the shoulder
+    envelope, so the shipped gate would refuse every one of them - exactly the reason the
+    planning tests use a gate-off configuration. Reach itself is covered by
+    `test_a_relocation_that_leaves_the_arm_envelope_writes_no_program`.
+    """
+    from dataclasses import replace
+
+    from scanplan.config import load_config
+
+    config = load_config()
+    if robot is None:
+        robot = replace(config.robot, enabled=False)
+    config = replace(config, robot=robot)
+    monkeypatch.setattr(scanweb, "_relocation_config", lambda _run_dir: config)
+
+
 def test_relocation_moves_the_planned_path_without_replanning(tmp_path, monkeypatch):
     """A datum correction must translate the delivered path, not plan a new one."""
     monkeypatch.chdir(tmp_path)
     make_relocatable_run(tmp_path, "run_020")
+    relocation_config(monkeypatch)
 
     def explode(data, progress=None):
         raise AssertionError("a relocation must not re-plan")
@@ -578,6 +598,7 @@ def test_relocation_rotates_the_path_with_the_new_frame(tmp_path, monkeypatch):
     """A rotated installation must rotate the poses, not just their positions."""
     monkeypatch.chdir(tmp_path)
     make_relocatable_run(tmp_path, "run_021")
+    relocation_config(monkeypatch)
     # new registration = 90 deg about Z; measured points are the CAD points rotated.
     measured = [[0.0, 0.0, 0.0], [0.0, 100.0, 0.0], [-80.0, 0.0, 0.0]]
 
@@ -594,6 +615,48 @@ def test_relocation_rotates_the_path_with_the_new_frame(tmp_path, monkeypatch):
     assert moved[0]["axis"] == pytest.approx([0.0, 0.0, 1.0], abs=1e-9)
     assert moved[0]["roll_deg"] == pytest.approx(15.0)
     assert result["measured_frame"] == "robot UFRAME 1"
+
+
+def test_a_relocation_that_leaves_the_arm_envelope_writes_no_program(tmp_path, monkeypatch):
+    """A rigid shift can walk the path out of the arm's envelope, and nothing used to ask.
+
+    Measured on 2026-10-30: a path was relocated three times (50 -> 100 -> 350 mm) and the
+    exported program stopped in ROBOGUIDE at MOTN-018 on its first J move, because the
+    relocated viewpoints carry no joint evidence and the exporter only audits Cartesian
+    poses under UFRAME 0. The reports and the 3D view are still written - they are what
+    shows WHY the program is missing - but the `.LS` is not.
+    """
+    from dataclasses import replace
+
+    from scanplan.config import load_config
+
+    monkeypatch.chdir(tmp_path)
+    make_relocatable_run(tmp_path, "run_023")
+    config = load_config()
+    no_room = replace(
+        config.robot,
+        mechanical_limits_deg=tuple((0.0, 0.0) for _ in range(6)),
+        soft_limits_deg=tuple((0.0, 0.0) for _ in range(6)),
+    )
+    relocation_config(monkeypatch, robot=no_room)
+
+    with pytest.raises(ValueError, match="超出机器人包络"):
+        scanweb.relocate_job({
+            "run_id": "run_023",
+            "measured_points_mm": [[10.0, 0.0, 0.0], [110.0, 0.0, 0.0], [10.0, 80.0, 0.0]],
+            "prog_name": "PART05",
+        })
+
+    output = Path("output/web_runs/run_023_reloc")
+    assert not (output / "PART05.LS").exists(), "a program the arm cannot fly is not a delivery"
+    assert (output / "viewpoints.json").is_file(), "the operator still needs the evidence"
+    report = json.loads((output / "registration_report.json").read_text(encoding="utf-8"))
+    reach = report["relocalisation"]["robot_reachability_after_shift"]
+    assert reach["checked"] == 2
+    assert reach["feasible"] == 0
+    assert [failure["order"] for failure in reach["failures"]] == [0, 1]
+    contract = json.loads((output / "PART05_frame.json").read_text(encoding="utf-8"))
+    assert contract["program_written"] is False
 
 
 def test_relocation_refuses_a_correction_beyond_the_error_limit(tmp_path, monkeypatch):

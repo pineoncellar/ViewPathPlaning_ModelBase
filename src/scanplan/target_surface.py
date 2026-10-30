@@ -38,6 +38,9 @@ from .sheet_split import SheetSplit
 
 _OVERSAMPLE = 3.0
 _MIN_DRAWS = 2_000
+# Share of the target face above which the fixture-contact exemption is reported as
+# suspicious rather than as a clamp footprint (see `build_target`).
+_CONTACT_WARNING_SHARE = 0.20
 
 
 @dataclass(frozen=True)
@@ -205,6 +208,15 @@ def build_target(part, split: SheetSplit, face: str, station: Station,
     say(f"  fixture contact: {int(contact.sum())} samples "
         f"({100.0 * contact.mean():.3f}% = {contact.mean() * face_area:.0f} mm2) within "
         f"{distance:.1f} mm and on the outward side")
+    # A clamp shades a rim, not a third of the panel. When the exempt set grows this far the
+    # usual cause is not a clamp but a fixture model that duplicates the part (every sample
+    # is then within a thickness of "the fixture"), and the plan quietly loses most of its
+    # target. Say so instead of shipping a plan that skips half the face.
+    if contact.mean() > _CONTACT_WARNING_SHARE:
+        say(f"  WARNING: {100.0 * contact.mean():.1f}% of the target face is treated as "
+            "clamped by the fixture. Check that the fixture model is not a copy of the "
+            "part - with the two meshes on top of each other every sample reads as buried "
+            "in its clamp.")
 
     direction = dominant_normal(all_samples.normals, all_samples.area_mm2)
     if not contact.any():

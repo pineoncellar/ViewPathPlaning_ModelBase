@@ -209,6 +209,8 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
         result.report["face_candidates"] = result.face_candidates
         if selection_record is not None:
             result.report["target_face_selection"] = selection_record
+        if station.winding:
+            result.report["part_winding"] = station.winding
         return result
 
     face_rep = reporter.band("segmentation", 0.10, 1.0)
@@ -217,6 +219,8 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
                         progress=face_rep)
     if selection_record is not None:
         result.report["target_face_selection"] = selection_record
+    if station.winding:
+        result.report["part_winding"] = station.winding
     return result
 
 

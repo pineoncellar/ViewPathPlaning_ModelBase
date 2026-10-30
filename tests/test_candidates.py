@@ -14,7 +14,15 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from scanplan.candidates import _cap, aim_indices, dedupe, generate, ladder, refine
+from scanplan.candidates import (
+    _cap,
+    aim_indices,
+    dedupe,
+    gate_with_roll_retry,
+    generate,
+    ladder,
+    refine,
+)
 from scanplan.config import load_config
 from scanplan.scanner_model import ScannerPose
 from scanplan.target_surface import sample_face
@@ -210,3 +218,34 @@ def test_a_large_refinement_is_capped_reproducibly(flat_plate, params_placeholde
     second = refine(points, normals, params_placeholder, seed=2, max_candidates=40)
     assert len(first) == 40
     assert [tuple(pose.position) for pose in first] == [tuple(pose.position) for pose in second]
+
+
+def test_a_pose_the_gate_refuses_is_retried_at_another_roll_about_the_same_axis():
+    # The roll does not change what the scanner looks at, but it sweeps the FLANGE round a
+    # 0.6 m circle because the tool is that long - so it can decide whether the arm can hold
+    # a pose whose aim was fine. Station 20261030_105857 lost 1.4 % of the face this way.
+    pose = ScannerPose(position=np.array([100.0, 200.0, 300.0]),
+                       axis=np.array([0.0, 0.0, -1.0]), roll_deg=10.0)
+
+    def keep(candidate):
+        return candidate.roll_deg >= 50.0
+
+    kept = gate_with_roll_retry([pose], keep)
+    assert len(kept) == 1
+    assert kept[0].roll_deg == pytest.approx(55.0)
+    assert np.allclose(kept[0].axis, pose.axis) and np.allclose(kept[0].position,
+                                                               pose.position)
+
+
+def test_a_pose_the_gate_accepts_is_passed_through_untouched():
+    pose = ScannerPose(position=np.array([0.0, 0.0, 300.0]),
+                       axis=np.array([0.0, 0.0, -1.0]), roll_deg=12.5)
+    kept = gate_with_roll_retry([pose], lambda _candidate: True)
+    assert kept == [pose]
+    assert gate_with_roll_retry([pose], None) == [pose]
+
+
+def test_a_pose_no_roll_can_rescue_is_dropped():
+    pose = ScannerPose(position=np.array([0.0, 0.0, 300.0]),
+                       axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0)
+    assert gate_with_roll_retry([pose], lambda _candidate: False) == []

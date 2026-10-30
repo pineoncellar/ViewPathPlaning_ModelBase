@@ -32,6 +32,7 @@ import numpy as np
 import trimesh
 
 from scanplan.config import load_config, override
+from scanplan.kinematics import KinematicGate
 from scanplan.pipeline import plan, write_outputs
 from scanplan.registration import RigidRegistration, fit_points
 from scanplan.report import (
@@ -955,6 +956,72 @@ def _run_program_name(run_dir: Path) -> str:
     return ""
 
 
+def _relocation_config(run_dir: Path):
+    """The configuration the ORIGINAL plan ran with, for the post-shift reach audit.
+
+    Read from the old coverage report because that is the file that names it; fall back to
+    the shipped configuration when it is missing (an old run, or one planned with a config
+    that has since moved). The robot section is what matters here.
+    """
+    source = None
+    report_path = run_dir / "coverage_report.json"
+    if report_path.is_file():
+        try:
+            loaded = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            source = (loaded.get("config") or {}).get("source")
+    try:
+        return load_config(source) if source else load_config()
+    except (OSError, ValueError):
+        return load_config()
+
+
+def _reach_audit(moved, config) -> dict:
+    """Ask the arm about every moved point, in the CORRECTED frame.
+
+    A re-localisation is not a re-plan, but it is a rigid MOVE, and the envelope does not
+    move with it. On 2026-10-30 a path was relocated three times (50 -> 100 -> 350 mm) and
+    the exported program stopped at MOTN-018 on its first J move: the shift had walked the
+    poses out of reach and no stage had asked the robot, because the relocated viewpoints
+    carry no joint evidence and the exporter only audits Cartesian poses under UFRAME 0.
+
+    The gate used here is the planner's own, on the same numbers the planner checked, so a
+    verdict means exactly what it meant during planning - unlike a blind IK in a user frame
+    nobody calibrated.
+    """
+    gate = KinematicGate(config.robot)
+    if not gate.active:
+        return {"enabled": False, "checked": 0, "feasible": 0, "failures": []}
+    failures = []
+    for viewpoint in moved:
+        verdict = gate.check(viewpoint.position, viewpoint.axis, viewpoint.roll_deg)
+        if verdict.ok:
+            continue
+        failures.append({
+            "order": int(viewpoint.order),
+            "position": [round(float(value), 2) for value in viewpoint.position],
+            "reason": verdict.reason,
+        })
+    return {"enabled": True, "checked": len(moved),
+            "feasible": len(moved) - len(failures),
+            "envelope_source": gate.robot.limits_source if gate.robot else None,
+            "failures": failures}
+
+
+def _reach_refusal_message(reach: dict, *, relocalisation_shift: float) -> str:
+    """Why the `.LS` is not written, in words the operator can act on."""
+    count = len(reach["failures"])
+    orders = ", ".join(str(item["order"]) for item in reach["failures"][:8])
+    more = "..." if count > 8 else ""
+    return (
+        f"重新定位后 {count} / {reach['checked']} 个点位超出机器人包络"
+        f"（本步位移 {relocalisation_shift:.0f} mm，程序序号 {orders}{more}），"
+        "本次没有写出 .LS：这么大的刚体位移已不是基准修正，请用修正后的现场坐标重新规划路径。"
+    )
+
+
 def relocate_job(data: dict, progress=None) -> dict:
     """Move a completed run's path into a corrected field frame - without re-planning.
 
@@ -1118,23 +1185,35 @@ def relocate_job(data: dict, progress=None) -> dict:
 
         announce("export", 0.5, "exporting the FANUC program")
         options = _relocation_export_options(run_dir, prog_name)
-        contract = export_ls(moved, output, prog_name=prog_name, uframe=uframe,
-                             utool=utool,
-                             order=not any(vp.stroke_id is not None for vp in moved),
-                             **options)
-        contract["frame"]["axes"] = (
+        # Ask the arm before writing anything: a shift large enough to leave the envelope is
+        # exactly what a relocation cannot detect on its own, and the .LS is the one artifact
+        # that must never be written when the answer is no.
+        reach = _reach_audit(moved, _relocation_config(run_dir))
+        announce("export", 0.55,
+                 f"reachability {reach['feasible']} / {reach['checked']} points")
+        export_error = None
+        contract: dict = {}
+        if reach["failures"]:
+            export_error = _reach_refusal_message(reach, relocalisation_shift=float(
+                np.linalg.norm(delta[:3, 3])))
+        else:
+            contract = export_ls(moved, output, prog_name=prog_name, uframe=uframe,
+                                 utool=utool,
+                                 order=not any(vp.stroke_id is not None for vp in moved),
+                                 **options)
+        contract.setdefault("frame", {})["axes"] = (
             f"Robot UFRAME {uframe} axes; the delivered path was rigidly moved from the "
             "original installation by the corrected datum registration."
         )
-        contract["frame"]["note"] = (
+        contract.setdefault("frame", {})["note"] = (
             "See registration_report.json for the datum pairs, the new transform and the "
             "old transform it replaced. The path itself was NOT re-planned."
         )
-        contract["uframe_utool"]["uframe_note"] = (
+        contract.setdefault("uframe_utool", {})["uframe_note"] = (
             f"Teach/verify UFRAME {uframe} matches the field coordinate frame used for the "
             "corrected measured datum points."
         )
-        contract["placement"]["registration"] = {
+        contract.setdefault("placement", {})["registration"] = {
             "method": "corrected datum registration; path transformed, not re-planned",
             "measured_frame": registration.frame_label,
             "rms_error_mm": registration.rms_error_mm,
@@ -1142,9 +1221,15 @@ def relocate_job(data: dict, progress=None) -> dict:
             "relocated_from": run_id,
             "report": "registration_report.json",
         }
+        if export_error is not None:
+            contract["program_written"] = False
+            contract["refusal"] = export_error
         (output / f"{prog_name}_frame.json").write_text(
             json.dumps(contract, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        announce("export", 0.62, "program exported")
+        if export_error is None:
+            announce("export", 0.62, "program exported")
+        else:
+            announce("export", 0.62, "program NOT written: points outside the arm envelope")
 
         # --- reports -----------------------------------------------------------------
         relocalisation = {
@@ -1163,10 +1248,13 @@ def relocate_job(data: dict, progress=None) -> dict:
             "not_recomputed": [
                 "tracker_ok per viewpoint: the tracker does not move with the part, so "
                 "visibility was NOT re-tested",
-                "robot reachability, joint limits and collision: judged in the OLD frame; "
-                "the joint evidence (CONFIG/joints) was dropped rather than carried over",
-                "cell occlusion by the robot arm: never modelled",
+                "collision and cell occlusion: never modelled, in the old frame or the new one",
+                "the joint evidence itself: CONFIG and joints are dropped, not carried over, "
+                "so the reachability audit starts from the Cartesian pose",
             ],
+            # What the shift DID cost, measured rather than assumed: the envelope does not
+            # move with the part, so every point is asked again in the corrected frame.
+            "robot_reachability_after_shift": reach,
             "when_to_replan": (
                 "re-plan when the correction is large compared with the scanner standoff, "
                 "when the tracker is marginal, or when robot.enabled is on and the shift "
@@ -1239,12 +1327,26 @@ def relocate_job(data: dict, progress=None) -> dict:
 
         summary_path = run_dir / "summary.txt"
         if summary_path.is_file():
+            if reach["failures"]:
+                reach_line = (
+                    f"robot reachability after the shift: {reach['feasible']} / "
+                    f"{reach['checked']} points inside the arm's envelope - the .LS was "
+                    "NOT written, re-plan instead\n"
+                )
+            elif reach["enabled"]:
+                reach_line = (
+                    f"robot reachability after the shift: {reach['checked']} / "
+                    f"{reach['checked']} points inside the arm's envelope\n"
+                )
+            else:
+                reach_line = "robot reachability after the shift: NOT checked (gate off)\n"
             note = (
                 f"\nre-localised from {run_id}: the planned path was transformed by the "
                 f"corrected datum registration (shift {relocalisation['shift_mm']:.3f} mm), "
                 "not re-planned.\n"
                 "  coverage, incidence and order are the original run's figures.\n"
-                "  tracker visibility and robot reachability were NOT re-tested.\n"
+                "  tracker visibility was NOT re-tested.\n"
+                f"  {reach_line}"
             )
             (output / "summary.txt").write_text(
                 summary_path.read_text(encoding="utf-8") + note, encoding="utf-8")
@@ -1268,6 +1370,10 @@ def relocate_job(data: dict, progress=None) -> dict:
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
             viewer_note = f"；3D 视图未能重新生成：{error}"
             print(f"[scanplan-web] 3D view not re-rendered: {error}", flush=True)
+        # Last, so the operator still gets the reports and the 3D view that show WHY: a
+        # program the arm cannot fly is not a delivery.
+        if export_error is not None:
+            raise ValueError(export_error)
     except Exception:
         (output / "job_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
         raise

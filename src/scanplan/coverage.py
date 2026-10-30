@@ -35,13 +35,14 @@ from scipy.spatial import cKDTree
 
 from .config import PlannerConfig
 from .raycast import nearest_across
+from .rolls import roll_for_axis
 from .scanner_model import ScannerModel, ScannerPose, measure_near
 from .scene import Station
 from .target_surface import SampleSet
 
 REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by_base",
            "blocked_by_tracker", "only_poses_that_collide", "unreachable_joint_limit",
-           "candidate_found")
+           "beyond_arm_reach", "not_facing", "no_line", "candidate_found")
 _COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_kinematics",
                  "rejected_no_points", "rays")
 # Below this many target samples the ball query costs more than it saves.
@@ -304,4 +305,22 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
         unclaimed = ~resolved & (reasons == "never_in_view")
         reasons[unclaimed & ~reached & ~faced] = "not_facing"
         reasons[unclaimed & ~reached & faced] = "no_line"
+        # A sample nobody aimed at can still be beyond the arm, and the pools cannot say so:
+        # they are filtered by the joint gate BEFORE this stage ever sees them, so a pose the
+        # arm refuses leaves no trace here and the miss is blamed on the aim ladder. Ask the
+        # gate directly with the one pose that would see the sample best - head-on at the
+        # working distance - and report the arm as the cause when it refuses that too.
+        # Measured on station 20261030_105857: 589 uncovered samples, all of them at the far
+        # end of the panel, every one of them a pose the arm could not hold.
+        if gate is not None and gate.active:
+            still = np.flatnonzero(unclaimed)
+            if len(still):
+                standoff = float(cfg.scanner.standoff_mm)
+                head_on = points[still] + normals[still] * standoff
+                verdicts = [gate.check(position, -normal, roll_for_axis(-normal))
+                            for position, normal in zip(head_on, normals[still], strict=True)]
+                beyond = np.array([verdict.reason == "unreachable" for verdict in verdicts])
+                limited = np.array([verdict.reason == "joint_limit" for verdict in verdicts])
+                reasons[still[beyond]] = "beyond_arm_reach"
+                reasons[still[limited]] = "unreachable_joint_limit"
     return reasons

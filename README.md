@@ -54,7 +54,7 @@ uv run scanplan web                 # 浏览器工位界面，默认 http://127.
 | `viewpoints.json` | 视点集：位置 + 光轴 + 滚转 + 覆盖点数/面积 + 入射角 + `tracker_ok` + 来源，以及程序顺序 `order` / 所属带 `stroke_id` / 角色 `role`；关节门打开时另带 `config` / `branch` / `joints_deg` / `j5_margin_deg` |
 | `viewpoints.csv` | 同一份数据，便于 Excel 目视 |
 | `exempt_points.csv` | 被夹持区豁免的点云（供人工核对 CAD 夹持区与实物是否一致） |
-| `unreachable_points.csv` | 漏扫点云，**每点带原因**（`blocked_by_part` / `blocked_by_fixture` / `blocked_by_base` / `blocked_by_tracker` / `never_in_view` / `only_poses_that_collide` / `unreachable_joint_limit` / `no_line` / `not_facing`） |
+| `unreachable_points.csv` | 漏扫点云，**每点带原因**（`blocked_by_part` / `blocked_by_fixture` / `blocked_by_base` / `blocked_by_tracker` / `never_in_view` / `only_poses_that_collide` / `unreachable_joint_limit` / `beyond_arm_reach` / `no_line` / `not_facing`） |
 | `coverage_report.json` | 覆盖报告：覆盖率、视点数、入射角分布、漏扫聚类、参数出处（数据表 / 推导 / 未实测）、路径与中断统计、以及**它没有建模什么**；另含 `surface_profile` / `budget` / `kinematics` 三块（见[配置与修改指南](docs/configuration.md#改完看哪里)） |
 | `summary.txt` | 上面那些数字的人读版本 |
 | `viewpoints_3d.html` | **单文件 3D 视图**：零件/夹具/底座 + 视点位置、光轴与视场锥 + 已覆盖/未覆盖采样 + 程序路径与回放 |

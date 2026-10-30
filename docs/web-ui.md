@@ -101,16 +101,24 @@ New-NetFirewallRule -DisplayName "ScanPlan Web 8765" -Direction Inbound `
   扫描带的程序顺序原样保留。
 - 新运行写进 `<原编号>_reloc`（重名再追加时间戳），原运行及其 `.LS` 保持不动。
 
-变换做不到的三件事写进 `registration_report.json` 的 `relocalisation` 与覆盖报告，而不是
+变换做不到的两件事写进 `registration_report.json` 的 `relocalisation` 与覆盖报告，而不是
 假装重算过：
 
 1. **覆盖率不变**：零件与路径一起移动，可测集和覆盖面积就是原运行的数字；
-2. **`tracker_ok` 没有重算**：跟踪器不跟着零件走，视点相对跟踪器的位置已经变了；
-3. **机器人可达性 / 关节限位没有重算**：原 `CONFIG`、关节角是旧坐标系下的判断，已从交付的
-   `viewpoints.json` 里**丢弃**而不是沿用。
+2. **`tracker_ok` 没有重算**：跟踪器不跟着零件走，视点相对跟踪器的位置已经变了。
 
-修正量相对工作距离较大、跟踪器本来就勉强，或开着 `robot.enabled` 时，应改完点位后完整
-重新规划一次。
+**但机器人可达性会重新核**（`relocalisation.robot_reachability_after_shift`）。以前这里写的是
+"没有重算"，代价是 2026-10-30 那天：一条路径被连续重新定位三次（50 → 100 → 350 mm），导出的
+`.LS` 在 ROBOGUIDE 里第一次 `J` 运动就停在 `MOTN-018 位置不可达` —— 交付点里没有关节证据，
+而导出端只在 `UFRAME 0` 下才会对笛卡尔点位做逆解，于是没人问过机器人。现在重新定位会用规划器
+同一个关节门逐点复核：
+
+- 全部在内 → 照常写 `.LS`，summary 里多一行 `robot reachability after the shift: 19 / 19`；
+- 有点位超出包络 → **不写 `.LS`**（报告、3D 视图照常写出，方便看是哪几点），页面报错并列出
+  程序序号，`<NAME>_frame.json` 记 `program_written: false`。
+
+修正量相对工作距离较大、跟踪器本来就勉强时，就应该改完点位后完整重新规划一次，而不是连着
+重新定位几次。
 
 ### 5. 历史项目：复用与清理
 

@@ -226,3 +226,24 @@ def test_a_station_file_with_a_utf8_bom_is_accepted(tmp_path, folded_plate, fixt
     path = write_station_file(tmp_path, folded_plate, fixture_box, base_box)
     path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
     assert load_station_description(path).part == tmp_path / "part.stl"
+
+
+def test_a_clean_station_keeps_its_fixture(station):
+    assert station.fixture_ignored is False
+    assert "fixture" in station.obstacles()
+
+
+def test_a_fixture_that_is_a_copy_of_the_part_is_not_used_as_a_clamp(
+        tmp_path, flat_plate, base_box):
+    # Station 20261030_100955 shipped exactly this: the operator uploaded the part as the
+    # fixture because there was no clamp model. The copy lies ON the face being scanned, so
+    # the fixture-contact rule exempted a contiguous half of the target and the feature mask
+    # called every remaining sample hard. A body that duplicates the part is not an obstacle.
+    path = write_station_file(tmp_path, flat_plate, flat_plate, base_box)
+    station = load_station(load_station_description(path), cloud_seed=3)
+
+    assert station.fixture_ignored is True
+    assert "fixture" not in station.obstacles()
+    top_face = np.array([[0.0, 0.0, 0.7]])
+    assert station.clearance_mm(top_face)[0] > 50.0, \
+        "clearance must be measured to the base, not to a copy sitting on the part"

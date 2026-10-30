@@ -14,6 +14,7 @@ footprint inside the base.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from scipy.spatial import cKDTree
 from .config import read_json
 from .geometry import sample_surface_seeded
 from .raycast import RayCaster
+from .winding import repair_winding
 
 IDENTITY_4X4 = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
                 (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
@@ -89,6 +91,16 @@ class Station:
     base_cloud_mm: np.ndarray
     fixture_tree: cKDTree
     base_tree: cKDTree
+    # What `winding.repair_winding` did to the part, empty when nothing had to be fixed.
+    # It is carried on the station because the split, the sampling and the exemption all
+    # read `part.face_normals`, so a run has to be able to say the mesh was repaired.
+    winding: dict = field(default_factory=dict)
+    # True when the "fixture" model turned out to be a copy of the part (see
+    # `_is_duplicate_of`). Such a model is not a clamp: it lies ON the face being scanned,
+    # so letting it act as an obstacle makes every sample look clamped and every sample
+    # look like a hard feature. It is dropped from clearance, contact and occlusion, and
+    # the run says so instead of silently losing half its target.
+    fixture_ignored: bool = False
     _obstacles: dict[str, Any] | None = field(default=None, init=False, repr=False,
                                               compare=False)
 
@@ -99,11 +111,10 @@ class Station:
         building an intersector per call would dominate a real part's runtime.
         """
         if self._obstacles is None:
-            self._obstacles = {
-                "part": RayCaster(self.part),
-                "fixture": RayCaster(self.fixture),
-                "base": RayCaster(self.base),
-            }
+            self._obstacles = {"part": RayCaster(self.part)}
+            if not self.fixture_ignored:
+                self._obstacles["fixture"] = RayCaster(self.fixture)
+            self._obstacles["base"] = RayCaster(self.base)
         return self._obstacles
 
     def clearance_mm(self, points) -> np.ndarray:
@@ -111,8 +122,10 @@ class Station:
         points = np.asarray(points, dtype=float).reshape(-1, 3)
         if len(points) == 0:
             return np.zeros(0)
-        to_fixture = self.fixture_tree.query(points, k=1)[0]
         to_base = self.base_tree.query(points, k=1)[0]
+        if self.fixture_ignored:
+            return to_base
+        to_fixture = self.fixture_tree.query(points, k=1)[0]
         return np.minimum(to_fixture, to_base)
 
     def nearest_obstacle_point(self, points) -> np.ndarray:
@@ -120,8 +133,10 @@ class Station:
         points = np.asarray(points, dtype=float).reshape(-1, 3)
         if len(points) == 0:
             return np.zeros((0, 3))
-        to_fixture, fixture_index = self.fixture_tree.query(points, k=1)
         to_base, base_index = self.base_tree.query(points, k=1)
+        if self.fixture_ignored:
+            return self.base_cloud_mm[base_index]
+        to_fixture, fixture_index = self.fixture_tree.query(points, k=1)
         use_fixture = (to_fixture <= to_base)[:, None]
         return np.where(use_fixture, self.fixture_cloud_mm[fixture_index],
                         self.base_cloud_mm[base_index])
@@ -190,25 +205,66 @@ def load_station_description(path: str | Path) -> StationDescription:
     )
 
 
-def load_models(description: StationDescription) -> tuple[trimesh.Trimesh, ...]:
+def load_models(description: StationDescription, *,
+                log: Callable[[str], None] | None = None,
+                ) -> tuple[trimesh.Trimesh, ...]:
     """The three models in the station frame, without the clearance clouds.
 
     Kept separate from :func:`load_station` because the 3D view needs the meshes only:
     sampling 400k obstacle points to draw a picture would waste the bulk of its runtime.
     """
+    part, fixture, base, _winding = _load_models(description, log)
+    return part, fixture, base
+
+
+def _load_models(description: StationDescription,
+                 log: Callable[[str], None] | None
+                 ) -> tuple[trimesh.Trimesh, trimesh.Trimesh, trimesh.Trimesh, dict]:
+    """All three meshes plus what the winding repair did to the part."""
     part = apply_transform(_load_mesh(description.part, "part"),
                            read_transform(description.transform_part))
     fixture = apply_transform(_load_mesh(description.fixture, "fixture"),
                               read_transform(description.transform_fixture))
     base = _load_mesh(description.base, "base")
-    return part, fixture, base
+    part, winding = _repair_part_winding(part, log)
+    return part, fixture, base, winding
+
+
+def _repair_part_winding(part: trimesh.Trimesh,
+                         log: Callable[[str], None] | None
+                         ) -> tuple[trimesh.Trimesh, dict]:
+    """Make the part's two sheet faces point away from each other.
+
+    Only the PART is repaired. The fixture and the base are used through distances and
+    ray hits, neither of which cares which way a triangle was wound, and silently
+    rewriting a customer's fixture model would be a change nobody asked for.
+    """
+    say = log or (lambda _message: None)
+    repaired, info = repair_winding(part, log=log)
+    if info.get("applied"):
+        say(f"  part winding repaired: {info['flipped_faces']} faces "
+            f"({info['flipped_area_mm2'] / 1e6:.4f} m2, {100.0 * info['share']:.1f} %) were "
+            f"wound into the sheet (thickness {info['thickness_mm']:g} mm) and now face out")
+    elif info.get("flipped_faces"):
+        say(f"  WARNING: {info['flipped_faces']} faces of the part are wound into the "
+            "sheet and could not be repaired; the target face and the fixture-contact "
+            "exemption will be wrong until the mesh is re-exported")
+    return repaired, info
 
 
 def load_station(description: StationDescription, *, cloud_seed: int,
                  fixture_cloud_points: int = 200_000,
-                 base_cloud_points: int = 200_000) -> Station:
+                 base_cloud_points: int = 200_000,
+                 log: Callable[[str], None] | None = None) -> Station:
     """Load the three models, realign part and fixture, and sample the obstacles."""
-    part, fixture, base = load_models(description)
+    part, fixture, base, winding = _load_models(description, log)
+    say = log or (lambda _message: None)
+    fixture_ignored = _is_duplicate_of(fixture, part)
+    if fixture_ignored:
+        say("  WARNING: the fixture model is the same body as the part (same face count, "
+            "area and bounds). An identical copy is not a clamp - it lies on the surface "
+            "being scanned - so it is ignored for clearance, contact and occlusion. "
+            "Upload the real fixture if there is one.")
 
     fixture_cloud = sample_surface_seeded(
         fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)[0]
@@ -218,7 +274,28 @@ def load_station(description: StationDescription, *, cloud_seed: int,
         part=part, fixture=fixture, base=base, description=description,
         fixture_cloud_mm=fixture_cloud, base_cloud_mm=base_cloud,
         fixture_tree=cKDTree(fixture_cloud), base_tree=cKDTree(base_cloud),
+        winding=winding, fixture_ignored=fixture_ignored,
     )
+
+
+def _is_duplicate_of(mesh, other, *, area_tol: float = 0.005,
+                     bounds_tol_mm: float = 1.0) -> bool:
+    """Whether `mesh` is the same body as `other`.
+
+    The same TESSELLATION is not required - the web UI writes both files itself and a
+    re-export carries different bytes - so the test is the three quantities a copy cannot
+    change: face count, surface area, and the bounding box.
+    """
+    if mesh is None or other is None:
+        return False
+    if len(mesh.faces) == 0 or len(mesh.faces) != len(other.faces):
+        return False
+    area = float(mesh.area)
+    reference = float(other.area)
+    if reference <= 0.0 or abs(area - reference) > area_tol * reference:
+        return False
+    return bool(np.allclose(np.asarray(mesh.bounds, dtype=float),
+                            np.asarray(other.bounds, dtype=float), atol=bounds_tol_mm))
 
 
 def check_alignment(station: Station, *, base_plane_mm: float | None = None,
