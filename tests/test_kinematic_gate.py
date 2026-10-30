@@ -10,8 +10,10 @@ consistent branch per point.
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from scanplan.config import RobotParams
 from scanplan.coverage import attribute_uncovered, evaluate
@@ -20,8 +22,10 @@ from scanplan.path import (
     LEVEL_JOINT,
     ROLE_COVERAGE,
     PathPoint,
+    _BranchOnly,
     _joint_move,
     _nearest_readings,
+    _unwrap_readings,
     assign_branches,
     build_path,
 )
@@ -229,6 +233,92 @@ def test_nearest_readings_undoes_an_avoidable_full_turn():
     moved = _nearest_readings(values, previous, robot)
     assert abs(moved[5] - (-20.0)) < 1e-9
     assert np.array_equal(moved[:5], values[:5])
+
+
+def test_a_whole_chain_is_unwrapped_not_just_the_next_point():
+    """A reading a turn away at the START of the chain is unreachable for a forward pass.
+
+    The single-pass version had no predecessor to compare the first point against, so a first
+    point written -340 where +19.91 was meant stayed wrong and every later point inherited the
+    offset. This is the shape measured on the delivered 64-point program: J6 -340.09 -> -8.07
+    commanded 332 degrees for a 28 degree move. Looking at the chain as a whole fixes it,
+    because -8.07 next door says which side of the turn the first point belongs on.
+    """
+    robot = gate().robot
+    chain = [_BranchOnly(joints_deg=(0.0, 0.0, 0.0, 0.0, -60.0, j6),
+                         shoulder="N", elbow="U", config="N U T, 0, 0, 0",
+                         j5_margin_deg=30.0, min_margin_deg=30.0)
+             for j6 in (-340.09, -8.07, 0.0)]
+    _unwrap_readings(chain, robot)
+    assert chain[0].joints_deg[5] == pytest.approx(19.91, abs=1e-6)
+    assert chain[1].joints_deg[5] == pytest.approx(-8.07, abs=1e-6)
+
+
+def test_no_segment_of_the_unwrapped_chain_jumps_more_than_the_bottleneck():
+    """The objective is the worst segment, not the total, so one bad step cannot hide in it."""
+    robot = gate().robot
+    readings = [10.0, -170.0, 20.0, 190.0]
+    chain = [_BranchOnly(joints_deg=(0.0, 0.0, 0.0, 0.0, -60.0, j6),
+                         shoulder="N", elbow="U", config="N U T, 0, 0, 0",
+                         j5_margin_deg=30.0, min_margin_deg=30.0)
+             for j6 in readings]
+    _unwrap_readings(chain, robot)
+    joined = np.array([item.joints_deg for item in chain], dtype=float)
+    steps = np.abs(np.diff(joined, axis=0))
+    assert steps.max() <= 190.0
+    for item in chain:
+        assert robot.feasible(item.joints_deg)
+
+
+def _stub_solution(joints, config="N U T, 0, 0, 0"):
+    return SimpleNamespace(joints_deg=tuple(float(v) for v in joints), config=config,
+                           min_margin_deg=30.0, j5_margin_deg=30.0)
+
+
+class _StubGate:
+    """A gate that hands back prepared solutions, so the DP can be tested on its own."""
+
+    active = True
+
+    def __init__(self, table):
+        self.table = table
+
+    def solutions(self, position, axis, roll_deg):
+        return self.table[tuple(np.round(np.asarray(position, dtype=float), 6))]
+
+
+def test_the_j6_weight_changes_the_choice_but_never_the_reported_degrees():
+    """The weight is a preference between options; the program still moves what it says.
+
+    Two branches can both be feasible while one turns J6 far more than the other. Without a
+    weight the sequencing pass takes whichever has the smaller WORST axis change, which may be
+    the one that spins the wrist; with a weight it takes the smaller J6 when that is the axis
+    that costs most. The step the report prints must stay the real degrees either way.
+    """
+    near = np.array([0.0, 0.0, 0.0])
+    far = np.array([100.0, 0.0, 0.0])
+    table = {
+        tuple(np.round(near, 6)): [_stub_solution((0.0, 0.0, 0.0, 0.0, -60.0, 0.0))],
+        tuple(np.round(far, 6)): [
+            _stub_solution((40.0, 0.0, 0.0, 0.0, -60.0, 0.0)),     # big J1, no J6
+            _stub_solution((5.0, 0.0, 0.0, 0.0, -60.0, 20.0)),     # small J1, 20 deg of J6
+        ],
+    }
+    points = [PathPoint(position=near, axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                        role=ROLE_COVERAGE, source="greedy"),
+              PathPoint(position=far, axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                        role=ROLE_COVERAGE, source="greedy")]
+    gate = _StubGate(table)
+
+    plain = assign_branches(points, gate, 400.0)
+    assert plain.solutions[1].joints_deg[5] == 20.0
+    assert plain.max_step_deg == 20.0
+
+    weighted = assign_branches(points, gate, 400.0, j6_weight=3.0)
+    assert weighted.solutions[1].joints_deg[5] == 0.0
+    # the weight is 3 and the worst change is 40 degrees of J1: reported as 40, not 120
+    assert weighted.max_step_deg == 40.0
+    assert weighted.failed == [] and weighted.broken == []
 
 
 def test_every_delivered_point_is_on_the_branch_the_program_can_ask_for(clamped_plate, cfg):

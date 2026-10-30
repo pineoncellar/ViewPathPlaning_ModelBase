@@ -59,6 +59,14 @@ def summary_lines(report: dict) -> list[str]:
                      f"{strokes['swept_coverage_pct']:.2f}%")
         for violation in path.get("constraint_violations", []):
             lines.append(f"CONSTRAINT             {violation}")
+    approach = report.get("approach") or {}
+    poses = approach.get("poses") or {}
+    if poses.get("available"):
+        lines.append(
+            f"approach               {poses['looking_up_over_0_deg']} pose(s) look up "
+            f"(max {poses['max_look_up_deg']:g} deg), {poses['below_part_bottom']} below the "
+            f"part bottom; {approach['target']['area_facing_down_pct']:.2f}% of the target "
+            "faces down - reported, not screened")
     kinematics = report.get("kinematics", {})
     lines += [
         f"ray backend            {report['runtime']['ray_backend']}",
@@ -76,6 +84,14 @@ def summary_lines(report: dict) -> list[str]:
             f"worst step {kinematics.get('max_step_deg')} deg "
             f"(limit {kinematics.get('max_step_deg_limit')}), "
             f"branches {kinematics.get('branch_histogram')}")
+        j6 = kinematics.get("j6") or {}
+        if j6.get("available"):
+            lines.append(
+                f"J6                     total {j6['total_step_deg']} deg, "
+                f"worst {j6['worst_step_deg']} deg at segment {j6['worst_step_at']}, "
+                f"dominant on {j6['dominant_segments']} of {j6['segments']} segments "
+                f"({j6['lever_arm_mm']:g} mm lever = {j6['mm_per_deg']:g} mm/deg) "
+                f"- reported, not refused")
         program = report.get("program", {})
         levels = program.get("connector_levels") or {}
         if levels:

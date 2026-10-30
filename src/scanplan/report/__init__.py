@@ -45,6 +45,7 @@ from ..viewpoints import (  # noqa: F401  (re-exported for the exporters)
     viewpoints_from_path,
     viewpoints_from_selection,
 )
+from .approach import approach_block
 from .coverage import (
     angle_diversity_block,
     cluster_points,
@@ -74,6 +75,7 @@ from .writers import plain, write_report
 
 __all__ = [
     "Viewpoint",
+    "approach_block",
     "build_report",
     "cluster_points",
     "coverage_layers_block",
@@ -125,6 +127,8 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
         "failure_attribution": failure_attribution_block(
             config, path, coverage_stats["uncovered_by_reason"]),
         "program": program_block(config, viewpoints, path),
+        "approach": approach_block(config=config, station=station, target=target,
+                                   viewpoints=viewpoints, path=path),
         "stroke_plan": stroke_block(strokes, path, swept_coverage_pct,
                                     pose_only_coverage_pct),
         "angle_diversity": angle_diversity_block(coverage, selection.chosen, path),

@@ -331,11 +331,23 @@ class RobotParams:
     j5_min_abs_deg: float
     max_step_deg: float
     wrist_identified: bool
+    # Degrees of J6 change above which a segment is LISTED in the report. Reported, never
+    # enforced: refusing such a move means dropping the sweep behind it, and the coverage
+    # that sweep carried. The lever arm below is what makes the number mean something.
+    j6_report_deg: float = 90.0
     joint_span_fraction: float = 0.9
     # Which wrist branch a delivered solution may use: `T` (J5 negative), `F` (J5 positive)
     # or `any`. `T` is the site default because the program writes Cartesian points with the
     # constant CONFIG `N U T` - see `Robot.solutions` for the two measurements behind it.
     wrist_flip_policy: str = "T"
+    # How many times its own size a J6 change counts for when the planner chooses BETWEEN
+    # otherwise comparable solutions. 1.0 is "count it like any other axis", i.e. the
+    # behaviour before 2026-10-30. J6 turns the flange about the tool axis, and the scanner
+    # sits 249 mm off that axis, so one degree of J6 slides it 4.35 mm sideways - along the
+    # part rather than towards it, which is the one direction the 45 mm body sphere cannot
+    # see anything in. This is a preference, never a limit: it cannot make an infeasible
+    # solution feasible, and it never drops a sweep.
+    j6_weight: float = 1.0
 
     @classmethod
     def disabled(cls) -> RobotParams:
@@ -925,6 +937,10 @@ def _validate_robot(robot: RobotParams) -> None:
                          "the limit', which is what the alarm-prone poses looked like")
     if robot.max_step_deg <= 0.0:
         raise ValueError("'robot.max_step_deg' must be positive")
+    if robot.j6_weight <= 0.0:
+        raise ValueError("'robot.j6_weight' must be positive: it multiplies the cost of a "
+                         "J6 change when two solutions are compared, and 1.0 is 'no "
+                         "preference'")
     if robot.wrist_flip_policy not in WRIST_FLIP_POLICIES:
         raise ValueError(f"'robot.wrist_flip_policy' must be one of "
                          f"{WRIST_FLIP_POLICIES}, not {robot.wrist_flip_policy!r}: it picks "

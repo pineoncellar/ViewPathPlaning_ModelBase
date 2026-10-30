@@ -312,6 +312,44 @@ def test_the_report_says_which_deliverable_it_is(planned):
     assert "same result v1 produces" in strokes["note"]
 
 
+def test_the_approach_block_is_reported_but_never_screens(planned):
+    """It answers "does this plan ask the arm to come from underneath?" and changes nothing.
+
+    Asserting the second half matters more than the first: a number this close to a
+    constraint will be read as one, so the planner's own output must be identical with and
+    without it.
+    """
+    report = planned["report"]
+    block = report["approach"]
+    assert block["report_only"] is True
+    assert block["poses"]["total"] == len(planned["viewpoints"])
+    for key in ("base_top_z_mm", "part_bottom_z_mm", "clearance_part_to_base_mm"):
+        assert isinstance(block[key], float)
+    target = block["target"]
+    assert 0.0 <= target["area_facing_down_pct"] <= 100.0
+
+    again = build_report(config=planned["config"], model=planned["model"],
+                         station=planned["station"], split=planned["split"],
+                         target=planned["target"], coverage=planned["coverage"],
+                         selection=planned["selection"], viewpoints=planned["viewpoints"])
+    for key in ("coverage_pct", "viewpoints", "uncovered_points", "pool_reach_pct"):
+        assert again[key] == report[key]
+
+
+def test_the_j6_block_counts_the_segments_it_says_it_counts(planned):
+    """The lever arm is derived, the histogram adds up, and the worst step is where it says."""
+    block = planned["report"]["kinematics"]["j6"]
+    tool = np.array(planned["config"].robot.tool_xyz_mm, dtype=float)
+    assert block["lever_arm_mm"] == pytest.approx(float(np.hypot(tool[0], tool[1])), abs=0.01)
+    assert block["report_deg"] == planned["config"].robot.j6_report_deg
+    if not block["available"]:
+        assert "fewer than two" in block["reason"]
+        return
+    assert sum(block["histogram"].values()) == block["segments"]
+    assert 1 <= block["worst_step_at"] <= block["segments"]
+    assert block["dominant_segments"] <= block["segments"]
+
+
 def test_the_summary_ends_with_the_caveat(planned):
     lines = summary_lines(planned["report"])
     text = "\n".join(lines)

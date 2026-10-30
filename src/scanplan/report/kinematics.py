@@ -76,6 +76,60 @@ def kinematics_block(config: PlannerConfig, viewpoints, path, kinematics=None) -
     if viewpoints:
         records = [viewpoint.as_dict() for viewpoint in viewpoints]
         block["points_with_config"] = sum(1 for item in records if item.get("config"))
+    block["j6"] = _j6_block(config, joints, assignment)
+    return block
+
+
+def _j6_block(config: PlannerConfig, joints: np.ndarray, assignment) -> dict:
+    """How much J6 moves, and how much of it is unavoidable.
+
+    J6 is reported on its own because it is the axis that moves the scanner SIDEWAYS: the head
+    sits ~250 mm off the flange axis, so one degree of J6 slides the optical origin 4.35 mm
+    along an arc roughly parallel to the surface being scanned. That is the one direction the
+    45 mm body sphere is blind in, so a big J6 step is the least-checked large motion in the
+    program.
+
+    `over_report_deg` is REPORTED, never enforced - the same policy `max_step_deg` follows.
+    A limit would either drop sweeps (and coverage with them) or sit so high it changes
+    nothing; a preference in the sequencing cost is what actually reduces the number, and
+    `j6_weight` is where that lives.
+    """
+    limit = float(getattr(config.robot, "j6_report_deg", 90.0))
+    tool = np.asarray(config.robot.tool_xyz_mm, dtype=float).reshape(3)
+    lever = float(np.hypot(tool[0], tool[1]))
+    block = {
+        "lever_arm_mm": round(lever, 2),
+        "mm_per_deg": round(lever * np.pi / 180.0, 3),
+        "weight": float(getattr(config.robot, "j6_weight", 1.0)),
+        "report_deg": limit,
+        "note": ("lever_arm_mm is the tool offset projected onto the flange plane - the radius "
+                 "J6 swings the scanner origin along. `over_report` lists segment numbers and "
+                 "is reported, not refused; `weight` is how much a J6 change counts when the "
+                 "planner chooses between solutions"),
+    }
+    if len(joints) < 2:
+        block["available"] = False
+        block["reason"] = "fewer than two delivered points carry a joint state"
+        return block
+    steps = np.abs((np.diff(joints, axis=0) + 180.0) % 360.0 - 180.0)
+    j6 = steps[:, 5]
+    edges = (0.0, 20.0, 45.0, 90.0, 180.0, 360.0)
+    histogram = {}
+    for low, high in zip(edges[:-1], edges[1:], strict=True):
+        count = int(((j6 >= low) & (j6 < high)).sum())
+        if count:
+            histogram[f"{low:.0f}-{high:.0f}"] = count
+    block.update({
+        "available": True,
+        "total_step_deg": round(float(j6.sum()), 1),
+        "worst_step_deg": round(float(j6.max()), 1),
+        "worst_step_at": int(np.argmax(j6)) + 1,
+        "mean_step_deg": round(float(j6.mean()), 1),
+        "dominant_segments": int((steps.argmax(axis=1) == 5).sum()),
+        "segments": int(len(j6)),
+        "over_report": [index + 1 for index, value in enumerate(j6) if value > limit],
+        "histogram": histogram,
+    })
     return block
 
 

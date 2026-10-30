@@ -487,9 +487,12 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
     separately and then found to be inconsistent.
 
     A wrist flip (J5 changing sign) is allowed but priced at `_J5_FLIP_PENALTY_DEG`, because
-    the alternative may be losing the sweep and the controller does perform the move.
+    the alternative may be losing the sweep and the controller does perform the move. J6
+    changes are priced at `robot.j6_weight` times their size, for the reason
+    `_joint_step_deg` gives.
     """
     states = [_ItemJoints() for _ in items]
+    weight = float(cfg.robot.j6_weight)
     options: list[list[tuple]] = []
     for position, (_index, entry, leave) in enumerate(items):
         found, reason = _item_options(entry, leave, kin, cfg)
@@ -509,7 +512,8 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
             best_cost, best_source = float("inf"), 0
             for source, (_prev_solution, prev_exit, _prev_margin) in enumerate(previous):
                 cost = total[depth - 1][source] + _joint_step_deg(prev_exit,
-                                                                  solution.joints_deg)
+                                                                  solution.joints_deg,
+                                                                  weight)
                 if float(np.asarray(prev_exit)[4]) * float(solution.joints_deg[4]) < 0.0:
                     cost += _J5_FLIP_PENALTY_DEG
                 if cost < best_cost:
@@ -762,22 +766,74 @@ def _nearest_readings(values, previous, robot) -> np.ndarray:
 def _unwrap_readings(solutions: list, robot) -> None:
     """Rewrite the delivered joint readings so no axis travels the long way round.
 
-    In place, over the finished sequence: each point takes the equivalent reading nearest the
-    one before it. The physical pose is untouched - only the number the controller is told
-    changes - so nothing that was verified has to be verified again.
+    In place, over the finished sequence. The physical pose is untouched - only the number the
+    controller is told changes - so nothing that was verified has to be verified again.
+
+    Chain-wide, not point by point. The previous version was a single forward pass: each point
+    took the reading nearest the one before it, so a point that had already been written a turn
+    away dragged everything after it along. Measured on the 64-point program of 2026-10-30, one
+    point carried J6 = -340.09 where +19.91 was meant, and the forward pass never recovered:
+    the segment out of it commanded 332 degrees for a 28 degree move, and the file's total J6
+    travel was 2439 degrees against a physical lower bound of 2135.
+
+    What replaces it is a bottleneck shortest path over the whole chain: each point offers every
+    equivalent reading of each axis that is still inside the usable band, and the choice
+    minimises the LARGEST single-axis change anywhere on the path, with total travel breaking
+    ties. Largest rather than total on purpose - "no segment may jump" is the requirement, and
+    minimising the sum will happily move a jump from one segment to a better-looking one
+    elsewhere. Both criteria are computed over the delivered order, so what is optimised is what
+    the program commands. A few dozen states per point and a few hundred points, so this is exact
+    and costs nothing next to the inverse kinematics that already ran.
     """
-    previous = None
-    for index, item in enumerate(solutions):
-        if item is None:
+    live = [index for index, item in enumerate(solutions) if item is not None]
+    if len(live) < 2:
+        return
+    options: list[list[np.ndarray]] = []
+    for index in live:
+        values = np.asarray(solutions[index].joints_deg, dtype=float)
+        per_axis = [robot.wraps(axis, float(values[axis])) or [float(values[axis])]
+                    for axis in range(6)]
+        feasible = [np.array(combo, dtype=float) for combo in _readings_product(per_axis)
+                    if robot.feasible(combo)]
+        options.append(feasible or [values])
+
+    infinity = (float("inf"), float("inf"))
+    total = [[infinity] * len(option) for option in options]
+    parent = [[0] * len(option) for option in options]
+    total[0] = [(0.0, 0.0)] * len(options[0])
+    for depth in range(1, len(options)):
+        for pick, candidate in enumerate(options[depth]):
+            for source, previous in enumerate(options[depth - 1]):
+                step = np.abs(candidate - previous)
+                cost = (max(total[depth - 1][source][0], float(step.max())),
+                        total[depth - 1][source][1] + float(step.sum()))
+                if cost < total[depth][pick]:
+                    total[depth][pick] = cost
+                    parent[depth][pick] = source
+
+    pick = min(range(len(options[-1])), key=lambda slot: total[-1][slot])
+    chosen: list[np.ndarray] = [options[0][0]] * len(options)
+    for depth in range(len(options) - 1, -1, -1):
+        chosen[depth] = options[depth][pick]
+        if depth:
+            pick = parent[depth][pick]
+
+    for slot, index in enumerate(live):
+        values = chosen[slot]
+        item = solutions[index]
+        if float(np.abs(values - np.asarray(item.joints_deg, dtype=float)).max()) <= 1e-9:
             continue
-        values = np.asarray(item.joints_deg, dtype=float)
-        if previous is not None:
-            moved = _nearest_readings(values, previous, robot)
-            if float(np.abs(moved - values).max()) > 1e-9:
-                solutions[index] = replace(
-                    item, joints_deg=tuple(float(value) for value in moved),
-                    config=robot.config_string(moved, item.shoulder, item.elbow))
-        previous = np.asarray(solutions[index].joints_deg, dtype=float)
+        solutions[index] = replace(
+            item, joints_deg=tuple(float(value) for value in values),
+            config=robot.config_string(values, item.shoulder, item.elbow))
+
+
+def _readings_product(per_axis: list[list[float]]):
+    """Every combination of the per-axis equivalent readings, as tuples."""
+    combos: list[tuple[float, ...]] = [()]
+    for options in per_axis:
+        combos = [prefix + (float(value),) for prefix in combos for value in options]
+    return combos
 
 
 
@@ -900,15 +956,27 @@ def _note_drop(plan: PathPlan, reason: str) -> None:
     plan.drop_reasons[key] = plan.drop_reasons.get(key, 0) + 1
 
 
-def _joint_step_deg(first, second) -> float:
+def _joint_step_deg(first, second, j6_weight: float = 1.0) -> float:
     """Largest single-axis change between two joint sets, circularly.
 
     Circular because the controller takes the shortest path per axis: +179 and -181 are two
     degrees apart, not 360, and a straight subtraction would report a crossing that is not
     there.
+
+    `j6_weight` > 1 prices a J6 change as if it were bigger than it is. J6 turns the flange
+    about the tool axis, and the scanner sits about 250 mm off that axis, so one degree of J6
+    slides the head 4.35 mm ALONG an arc that is roughly parallel to the surface being
+    scanned - a direction the 45 mm body sphere cannot see anything in. Weighting it makes the
+    two sequencing passes prefer a solution that leaves J6 alone whenever the alternatives are
+    otherwise comparable. It never makes an infeasible move feasible: feasibility is decided
+    elsewhere, by the limits and by the connector.
     """
     delta = (np.asarray(second, dtype=float) - np.asarray(first, dtype=float))
-    return float(np.max(np.abs((delta + 180.0) % 360.0 - 180.0)))
+    steps = np.abs((delta + 180.0) % 360.0 - 180.0)
+    if j6_weight != 1.0:
+        steps = steps.copy()
+        steps[5] *= float(j6_weight)
+    return float(np.max(steps))
 
 
 def _joint_move(first, second, cfg: PlannerConfig, station: Station, model: ScannerModel,
@@ -967,7 +1035,8 @@ def _chain_route(first_joints, corners, entry_joints, cfg: PlannerConfig, statio
         options = kin.solutions(corner.position, corner.axis, corner.roll_deg)
         if not options:
             return [], False
-        ordered = sorted(options, key=lambda item: _joint_step_deg(held, item.joints_deg))
+        ordered = sorted(options, key=lambda item: _joint_step_deg(
+            held, item.joints_deg, float(cfg.robot.j6_weight)))
         landed = None
         for item in ordered:
             ok, _margin, _reason = _joint_move(held, item.joints_deg, cfg, station, model,
@@ -1275,8 +1344,8 @@ class BranchAssignment:
         return not self.failed and not self.broken
 
 
-def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
-                    ) -> BranchAssignment:
+def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
+                    j6_weight: float = 1.0) -> BranchAssignment:
     """Pick a joint branch for every delivered point so the sequence jumps as little as it can.
 
     Picking the locally best branch at every point is the mistake this exists to prevent:
@@ -1284,6 +1353,10 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
     in joint space. The search is a small dynamic programme - at most eight branches per
     point, a few hundred points - minimising the total joint travel subject to a hard limit
     on each step.
+
+    `j6_weight` prices a J6 change as if it were that many times bigger, for the reason
+    `_joint_step_deg` gives; it decides between candidates, never whether a point is feasible.
+    The steps it REPORTS are always the real degrees, because that is what the program does.
 
     Points without any feasible solution are reported, never silently filled in with
     something plausible.
@@ -1303,7 +1376,7 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
         for j, option in enumerate(candidates[index]):
             best = (float("inf"), 0)
             for k, previous in enumerate(candidates[index - 1]):
-                cost = total[index - 1][k] + _step_between(previous, option)
+                cost = total[index - 1][k] + _step_between(previous, option, j6_weight)
                 if cost < best[0]:
                     best = (cost, k)
             total[index][j] = best[0]
@@ -1334,19 +1407,26 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
         histogram=histogram)
 
 
-def _step_between(first, second) -> float:
+def _step_between(first, second, j6_weight: float = 1.0) -> float:
     """Largest single-axis joint change between two solutions, in degrees.
 
     Circular: a reading of +179 and one of -181 are two degrees apart, not 360. The
     controller takes the shortest path per axis, so the sequence has to be judged the same
     way - otherwise a wrist sitting near the wrap is reported as a 358 degree jump and the
     continuity constraint looks violated when it is not.
+
+    `j6_weight` is a cost multiplier for the ordering pass only; callers that REPORT a step
+    leave it at 1.0 so the number they print is the number the machine will move.
     """
     if first is None or second is None:
         return 0.0
     delta = (np.asarray(second.joints_deg, dtype=float)
              - np.asarray(first.joints_deg, dtype=float))
-    return float(np.max(np.abs((delta + 180.0) % 360.0 - 180.0)))
+    steps = np.abs((delta + 180.0) % 360.0 - 180.0)
+    if j6_weight != 1.0:
+        steps = steps.copy()
+        steps[5] *= float(j6_weight)
+    return float(np.max(steps))
 
 
 def transition_poses(plan: PathPlan, cfg: PlannerConfig) -> list[ScannerPose]:

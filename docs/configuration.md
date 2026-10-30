@@ -131,6 +131,8 @@ uv run scanplan plan --station input/<工位>.json \
 | `robot.joint_span_fraction` | `0.9` | 每个轴只用其量程的 90%（以中点为基准缩放），避免顶着限位运行 |
 | `robot.j5_min_abs_deg` | `8.0` | 腕奇异保护：`\|J5\|` 不小于这个值 |
 | `robot.max_step_deg` | `40.0` | **只报不拦**：相邻交付点的最大关节步，超限计数进报告。实测 58 段里 1 段超 180°、5 段在 150–181°（见下） |
+| `robot.j6_weight` | `1.0` | J6 变化在**两处排序**里按几倍计价（`1.0` = 与其它轴同权）。它是偏好不是限制，不会让不可行变可行，也不会丢带 |
+| `robot.j6_report_deg` | `90.0` | 报告里点名"|ΔJ6| 超过这个度数"的段。**只报不拦** |
 | `robot.wrist_flip_policy` | `T` | 只允许 J5 为负的那一支腕解（见下文），因为程序里的 CONFIG 只能写 `N U T` |
 | `robot.soft_limits_deg` / `mechanical_limits_deg` | 见文件 | 两套限位取交集，报告写明用了哪套 |
 | `robot.wrist_identified` | `true` | 关掉后禁止输出绝对关节值，门只能做分支排序 |

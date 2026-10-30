@@ -246,7 +246,8 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
         # state has to be known BEFORE the connector can be checked, so it is decided there.
         # Re-running the assignment here would override per-point motion and representation
         # with a second choice made after the corners were already committed.
-        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg))
+        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg),
+                                     j6_weight=float(cfg.robot.j6_weight))
         path.branches = assignment
         path.max_step_deg = assignment.max_step_deg
         if assignment.failed:
