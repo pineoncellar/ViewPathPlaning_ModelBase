@@ -56,7 +56,25 @@
       "limited by candidate generation and not by the selection algorithm."
     ],
     "refine_rounds": 2,
-    "refine_aim_grid_mm": 25.0
+    "refine_aim_grid_mm": 25.0,
+
+    "_comment_feature": [
+      "The hard-feature pass (2026-10-29). The head-on ladder cannot scan a side wall: the",
+      "footprint lies parallel to it and the incidence limit is passed within a few mm of the",
+      "bend. What does reach a wall, or the rim a clamp shades, is the same ladder tilted almost",
+      "to the limit from the free side - hence a separate family, aimed only at leftovers.",
+      "feature_tilts_deg MUST stay below max_incidence_deg: a tilt at the limit sees the sample",
+      "it was aimed at at zero cosine, i.e. it cannot see it at all.",
+      "feature_tilt_azimuths sweeps the tilt around the normal, so the free side is found even",
+      "when the fixture blocks one of them; 12 is 30 deg apart.",
+      "feature_aim_grid_mm is finer than aim_grid_mm because a wall is a few mm wide.",
+      "The family is emitted at roll 0 only: a tilted pose is a compromise already, and a 90",
+      "deg roll would add a 90 deg J6 turn for area the head-on sweep already covers."
+    ],
+    "feature_tilts_deg": [30.0, 40.0],
+    "feature_tilt_azimuths": 12,
+    "feature_aim_grid_mm": 15.0,
+    "feature_rounds": 1
   },
 
   "target": {
@@ -81,16 +99,18 @@
       "nothing about the motion between them. Same coverage either way."
     ],
     "_comment_acceptance_sweeps": [
-      "97.0 (2026-10-29). Measured on the site station with the CONFIG family bounded to the",
-      "one the cell has run (`N U T`), the three deliverables are",
+      "99.0 (2026-10-29, site request): the workshop asked for 99 % and accepted the point",
+      "count that comes with it (30+ points is normal, one station ran 71). The earlier",
+      "measurement that set 97 was taken before the hard-feature line existed, when the",
+      "only thing raising the bar did was add stops to the area tail:",
       "  99% target: 99.02% in 71 corners / 11.9 m - poses only, not one sweep",
       "  97% target: 97.75% in 28 corners / 9.6 m - SEVEN sweeps plus poses for the pockets",
       "  90% target: 91.13% in 14 corners / 5.7 m - five sweeps, no poses",
-      "The middle one is the shape of COV90.LS, the program that ran on the cell. The last",
-      "1.3 points of coverage cost 43 extra corners and turn the program back into a sequence",
-      "of stops. It stays a site number: raise it if a future pool can sweep more."
+      "With `require_sweeps` on, a 99 % target is reached by the pose plan (the sweeps cannot",
+      "follow a curved panel that far), so the delivered program is stops rather than bands.",
+      "Lower this when a shorter program matters more than the last 1.5 points."
     ],
-    "coverage_target_pct": 97.0,
+    "coverage_target_pct": 99.0,
     "delivery_mode": "path",
 
     "_comment_surface_bias": [
@@ -112,7 +132,27 @@
       "layer, so the selection path is exactly today's."
     ],
     "surface_bias": 0.5,
-    "max_points": null
+    "max_points": null,
+
+    "_comment_features": [
+      "feature_coverage_pct is the SECOND acceptance figure, and it is not a fraction of the",
+      "area: the side walls of a 1 m2 panel are a few tenths of a percent, so a 97 % area plan",
+      "can leave every one of them unscanned and still meet its number. This one is a share of",
+      "the hard features only: walls, bends and the rim a clamp shades (a sample closer than",
+      "feature_clearance_mm to the fixture or the base, or leaning more than feature_wall_deg",
+      "off the face's dominant normal).",
+      "Both targets must be met before greedy stops, so raising this covers the walls without",
+      "making the whole plan denser. null switches the criterion off and reproduces the",
+      "area-only behaviour.",
+      "Measured on station 20261029_105606 (1.05 m2, 37174 wall/rim samples of 0.325 m2):",
+      "   90 -> 20 corners, 97.29 % area, 94.44 % features, 3 J6 moves over 60 deg",
+      "   95 -> 21 corners, 97.88 % area, 96.06 % features, 1 J6 move over 60 deg",
+      "   98 -> 37 corners, 98.95 % area, 98.00 % features, 3 J6 moves over 60 deg",
+      "95 is the shipped value: one extra corner for the walls. 98 triples the program."
+    ],
+    "feature_coverage_pct": 95.0,
+    "feature_wall_deg": 45.0,
+    "feature_clearance_mm": 15.0
   },
 
   "tracker": {
@@ -197,7 +237,22 @@
     "repair_budget_share": 0.2,
     "pool_mode": "full",
     "side_scan_tilt_deg": 45.0,
-    "require_sweeps": true
+    "require_sweeps": true,
+
+    "_comment_j6": [
+      "J6 turns the head about its own optical axis. Inside a sweep it does not turn at all -",
+      "a sweep is one pose written as two corners - so every J6 movement in the program is a",
+      "repositioning move between sweeps, and the branch search is where it is decided.",
+      "j6_step_weight is what one degree of J6 costs next to a degree of the worst other axis.",
+      "1.5 rather than the old 0.5: on the 2026-10-29 station the worst J6 step was 94.8 deg,",
+      "which is the wrist spinning a quarter turn between two sweeps that look almost the same",
+      "way - the arm could have taken the turn instead.",
+      "max_j6_step_deg is the turn a single move should stay under. It is NOT a hard drop rule:",
+      "a program with one 70 deg J6 move is delivered and the report says so, exactly like",
+      "robot.max_step_deg. The search avoids it by charging far more than any alternative."
+    ],
+    "j6_step_weight": 1.5,
+    "max_j6_step_deg": 60.0
   },
 
   "_comment_motion": [
@@ -209,7 +264,14 @@
   "motion": {
     "type": "L",
     "termination": "CNT0",
-    "speed_mm_s": 100.0
+    "speed_mm_s": 100.0,
+    "_comment_joint_speed": [
+      "Speed of the joint (J) moves that do not scan - in a stroke plan every retract,",
+      "traverse and re-orientation instruction. They are the moves that turn the wrist (up to",
+      "180 deg of J6 in one instruction), so the site asked for 5 % instead of the old 50 %.",
+      "A percentage is required: FANUC refuses a mm/sec rate on a joint instruction."
+    ],
+    "joint_speed": "5%"
   },
 
   "occlusion_tol_mm": 2.0,
@@ -305,6 +367,30 @@
     "joint_margin_deg": 5.0,
     "j5_min_abs_deg": 8.0,
     "max_step_deg": 40.0,
+
+    "_comment_motion_check": [
+      "A move between two legal corners can still leave the envelope in between - a wrist that",
+      "unwinds, a reach that has to straighten - and the controller interpolates the whole",
+      "segment whatever the corners look like. Every delivered move is therefore sampled at",
+      "motion_check_step_mm AND motion_check_step_deg (the tighter of the two counts: an",
+      "in-place re-orientation covers no millimetres), the IK is followed from the branch the",
+      "previous point ended on, and a move whose interpolated poses leave the envelope is",
+      "refused while the route is built.",
+      "50 mm / 10 deg is a compromise: at 10 mm the check costs more than the ray casting it",
+      "protects, and a breach narrower than 10 deg of wrist turn over 50 mm of travel is not a",
+      "failure the controller would report either."
+    ],
+    "motion_check_step_mm": 50.0,
+    "motion_check_step_deg": 10.0,
+
+    "_comment_elbow": [
+      "Room kept at each end of the elbow's own travel. `bend -> 0` (links folded flat) and",
+      "`bend -> 180` (straight) are the two collinear postures where the fitted geometry is",
+      "least trustworthy and where the controller reports MOTN-018 instead of solving: the",
+      "2026-10-29 PART010 program carried a point at bend = 8.4 deg and ROBOGUIDE stopped",
+      "there with TPIF-012 / MOTN-018."
+    ],
+    "elbow_margin_deg": 10.0,
     "wrist_identified": true,
     "config_wrist_letter": "T",
 

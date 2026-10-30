@@ -57,7 +57,7 @@
                 <span class="upload-formats">STL / STEP / IGES · 工位基座</span>
               </label>
             </div>
-            <p class="inline-hint">导入的模型当前坐标直接作为整车坐标，三份数模需预先按装配关系对齐。STL 以外的格式（STEP / IGES / OBJ / PLY 等）会先自动三角化为 STL；PRT、SLDPRT、CATPart 等原生格式请先在 CAD 中导出为 STEP 或 IGES。底座留空时，服务会自动生成一块位于零件下方的参考平板作为遮挡基准。</p>
+            <p class="inline-hint">导入的模型当前坐标直接作为整车坐标，三份数模需预先按装配关系对齐。STL 以外的格式（STEP / IGES / OBJ / PLY 等）会先自动三角化为 STL；PRT、SLDPRT、CATPart 等原生格式请先在 CAD 中导出为 STEP 或 IGES。底座留空时，服务优先使用 <code>input/base.stl</code> 作为底座；该文件不存在时，会生成一块位于主扫描面背后的参考平板作为遮挡基准。</p>
 
             <div class="section-label config-title"><span>整车主扫描面</span><small>扫描仪所在侧 / 主面外法向</small></div>
             <div class="form-row">

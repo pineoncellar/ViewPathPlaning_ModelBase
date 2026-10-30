@@ -204,30 +204,118 @@ def _sync_input_part(raw: bytes, input_dir: Path) -> Path:
     return part_path
 
 
-def _synthetic_base(part: trimesh.Trimesh, fixture: trimesh.Trimesh) -> trimesh.Trimesh:
-    """A flat reference plate under the uploaded models when no base is supplied.
+def _reference_base(part: trimesh.Trimesh, fixture: trimesh.Trimesh,
+                    scan_axis) -> trimesh.Trimesh:
+    """A flat reference plate placed BEHIND the main scan face.
 
-    The planner traces the base as an obstacle, so it cannot simply be omitted.
-    A plate well below the part and fixture keeps the base from creating false
-    occlusion while still giving the station a closed, printable reference body.
+    The planner traces the base as an obstacle, so it cannot simply be omitted. Where the
+    plate goes is not cosmetic either, and the way it used to be built got it wrong on a
+    real part: it was laid under the models in the VEHICLE frame, which assumes +Z is "down"
+    there. A vertically clamped panel is exactly the case where that is false - on the
+    2026-10-29 station the main scan face axis is +Y, so the plate was built below in Z,
+    ended up in FRONT of the panel once the registration was applied, and the coverage
+    report then described the plate's own shadow.
+
+    The plate is therefore built in the frame of the SCAN AXIS: square to it, spanning the
+    part's silhouette, with its mounting surface just behind the lowest point of part and
+    fixture along that axis. Whatever "down" means in the customer's CAD, the plate can then
+    never stand between the head and the face being scanned.
     """
-    bounds = np.vstack((np.asarray(part.bounds, dtype=float),
-                        np.asarray(fixture.bounds, dtype=float)))
-    low = bounds.min(axis=0)
-    high = bounds.max(axis=0)
-    span = np.maximum(high - low, 1.0)
-    thickness = max(20.0, float(span[2]) * 0.04)
-    plate = trimesh.creation.box(extents=[
-        float(span[0]) + 120.0,
-        float(span[1]) + 120.0,
-        thickness,
-    ])
-    plate.apply_translation([
-        float((low[0] + high[0]) * 0.5),
-        float((low[1] + high[1]) * 0.5),
-        float(low[2] - thickness * 0.5 - 2.0),
-    ])
+    axis = np.asarray(scan_axis, dtype=float).reshape(3)
+    length = float(np.linalg.norm(axis))
+    if not np.isfinite(length) or length <= 1e-9:
+        raise ValueError("the main scan-face axis has no direction")
+    axis = axis / length
+    helper = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    first = np.cross(helper, axis)
+    first = first / float(np.linalg.norm(first))
+    second = np.cross(axis, first)
+
+    points = np.vstack((np.asarray(part.vertices, dtype=float),
+                        np.asarray(fixture.vertices, dtype=float)))
+    along = points @ axis
+    low = float(along.min())
+    span = max(float(along.max()) - low, 1.0)
+    across_first = points @ first
+    across_second = points @ second
+    extent_first = float(np.ptp(across_first)) + 120.0
+    extent_second = float(np.ptp(across_second)) + 120.0
+    thickness = max(20.0, span * 0.04)
+
+    plate = trimesh.creation.box(extents=[extent_first, extent_second, thickness])
+    frame = np.eye(4)
+    frame[:3, :3] = np.stack([first, second, axis], axis=1)
+    plate.apply_transform(frame)
+    plate.apply_translation(
+        first * float((across_first.min() + across_first.max()) * 0.5)
+        + second * float((across_second.min() + across_second.max()) * 0.5)
+        + axis * (low - 2.0 - thickness * 0.5)
+    )
     return plate
+
+
+def _default_base(part: trimesh.Trimesh, fixture: trimesh.Trimesh, scan_axis,
+                  input_dir: Path | None = None) -> tuple[trimesh.Trimesh, str]:
+    """The base to use when none was uploaded, and where it came from.
+
+    `input/base.stl` first: it is the station's own base, so tracing it is more honest than
+    tracing a plate - the clamp, the part's shadow and the head's standoff all depend on
+    what is really there. It is used exactly as it is, in the uploaded (vehicle) frame,
+    because a real base's own coordinates are the assembly's coordinates.
+
+    A reference plate behind the scan face is the fallback for a run that has no base file
+    at all - a fresh clone, or a station whose base was never exported. Returning the source
+    string keeps "which base was traced" answerable from the report instead of guessable
+    from the viewer.
+    """
+    folder = Path.cwd() / "input" if input_dir is None else Path(input_dir)
+    candidate = folder / "base.stl"
+    if candidate.exists():
+        try:
+            base = _load_stl(candidate.read_bytes(), "input/base.stl")
+        except ValueError:
+            # A truncated or empty file must not stop a run: the plate is still a valid
+            # (if conservative) obstacle, and the report says which one was used.
+            base = None
+        if base is not None and _behind_the_scan_face(base, part, fixture, scan_axis):
+            return base, "input/base.stl"
+        if base is not None:
+            # A base that sits entirely IN FRONT of the main scan face cannot be this
+            # station's base - it was exported in some other frame - and tracing it would
+            # put a wall between the head and the part. That is the exact failure the
+            # reference plate exists to avoid, so the plate wins here.
+            return (_reference_base(part, fixture, scan_axis),
+                    "reference plate behind the scan face "
+                    "(input/base.stl is in front of the scan face)")
+    return _reference_base(part, fixture, scan_axis), "reference plate behind the scan face"
+
+
+def _behind_the_scan_face(base: trimesh.Trimesh, part: trimesh.Trimesh,
+                          fixture: trimesh.Trimesh, scan_axis) -> bool:
+    """Whether `base` is on the far side of the main scan face, or at least not in front.
+
+    The head works in the +axis half-space, so a body whose every point is beyond the
+    assembly along +axis is somewhere else entirely and would shade the whole face. A real
+    base sits under or behind the fixture, i.e. its projection overlaps the assembly's.
+    """
+    axis = np.asarray(scan_axis, dtype=float).reshape(3)
+    length = float(np.linalg.norm(axis))
+    if not np.isfinite(length) or length <= 1e-9:
+        return True
+    axis = axis / length
+    assembly = np.vstack((np.asarray(part.vertices, dtype=float),
+                          np.asarray(fixture.vertices, dtype=float)))
+    return float((np.asarray(base.vertices, dtype=float) @ axis).min()) <= \
+        float((assembly @ axis).max()) + 1.0
+
+
+def _synthetic_base(part: trimesh.Trimesh, fixture: trimesh.Trimesh) -> trimesh.Trimesh:
+    """The reference plate with the default (vehicle +Z) scan axis - kept for callers.
+
+    `_reference_base` is the real implementation; this name stays because a plate "under the
+    models" is what a caller with no scan axis in hand means.
+    """
+    return _reference_base(part, fixture, np.array([0.0, 0.0, 1.0]))
 
 
 def _vehicle_point(matrix: np.ndarray, point) -> list[float]:
@@ -376,6 +464,9 @@ def _public_config() -> dict:
     return {
         "delivery_mode": "pose" if config.target.delivery_mode == "lean" else "stroke",
         "coverage_target_pct": config.target.coverage_target_pct,
+        # The second acceptance figure: a page that shows the coverage target must show
+        # this one too, or "97 %" reads as if the walls were included.
+        "feature_coverage_pct": config.target.feature_coverage_pct,
         "surface_bias": float(config.target.surface_bias),
         "max_points": config.target.max_points,
         "pool_mode": config.stroke.pool_mode,
@@ -383,6 +474,7 @@ def _public_config() -> dict:
         "motion": config.motion.type,
         "termination": config.motion.termination,
         "speed_mm_s": float(config.motion.speed_mm_s),
+        "joint_speed": config.motion.joint_speed,
         "config_source": config.source,
         "parameter_sources": dict(config.parameter_sources),
     }
@@ -418,6 +510,9 @@ def _export_options(config, viewpoints, data: dict) -> dict:
             "speed": f"{config.motion.speed_mm_s:g} mm/sec",
             "termination": config.motion.termination,
             "order": False,
+            # The J moves between sweeps are the ones that turn the wrist; their speed is
+            # its own setting (`motion.joint_speed`, 5 % by default).
+            "joint_speed": config.motion.joint_speed,
         }
     return {
         "motion": str(data.get("motion", "J")),
@@ -456,8 +551,16 @@ def solve_job(data: dict, progress=None) -> dict:
     part = _load_stl(part_raw, "part")
     base_payload = models.get("base") or {}
     base_supplied = isinstance(base_payload, dict) and bool(base_payload.get("stl_base64"))
-    base = (_decode_stl(base_payload, "base") if base_supplied
-            else _synthetic_base(part, support))
+    # The scan axis is read before the base because the fallback base is PLACED relative to
+    # it: a reference plate has to sit behind the face being scanned, whichever vehicle axis
+    # that face happens to look along (see `_reference_base`).
+    face_axis_vehicle = _vector(data.get("scan_face_axis"), "main scan-face axis")
+    if not np.isclose(np.linalg.norm(face_axis_vehicle), 1.0, atol=1e-6):
+        raise ValueError("main scan-face axis must be one of the six unit vehicle axes")
+    if base_supplied:
+        base, base_source = _decode_stl(base_payload, "base"), "uploaded"
+    else:
+        base, base_source = _default_base(part, support, face_axis_vehicle)
     base_reset, support_reset, part_reset = resets
 
     try:
@@ -465,9 +568,6 @@ def solve_job(data: dict, progress=None) -> dict:
     except ValueError as error:
         raise ValueError(str(error)) from error
 
-    face_axis_vehicle = _vector(data.get("scan_face_axis"), "main scan-face axis")
-    if not np.isclose(np.linalg.norm(face_axis_vehicle), 1.0, atol=1e-6):
-        raise ValueError("main scan-face axis must be one of the six unit vehicle axes")
     axis_options = np.vstack((np.eye(3), -np.eye(3)))
     if not np.any(np.all(np.isclose(axis_options, face_axis_vehicle, atol=1e-9), axis=1)):
         raise ValueError("main scan-face axis must be exactly +X/-X/+Y/-Y/+Z/-Z")
@@ -554,7 +654,14 @@ def solve_job(data: dict, progress=None) -> dict:
         # 99.0% on the SAME station file: the run was planning a face made of the wrong
         # regions, and the delivery stage then dropped eight strokes it could not reach.
         # One source of truth for the split, so the page and the CLI cannot disagree.
-        result = plan(station, config, face="upper",
+        #
+        # Which SIDE is planned is decided by the axis the operator picked, not by the
+        # split's "upper"/"lower" labels: those come from an arbitrary sign (see
+        # `pipeline.facing_face`). Hard-coding "upper" here planned a 113 cm2 spray of
+        # back-facing facets on station 20261029_225454 while the 1.15 m2 face the
+        # operator had clicked - the one drawn in the "main scan face" colour - was never
+        # sampled.
+        result = plan(station, config, face_axis=axis_in_measured,
                       progress=lambda stage, fraction, detail="": announce(
                           stage, 0.10 + 0.80 * fraction, detail))
         announce("report", 0.92, "planning finished")
@@ -565,6 +672,7 @@ def solve_job(data: dict, progress=None) -> dict:
             "max_error_mm": registration.max_error_mm,
             "cad_face_axis_vehicle": face_axis_vehicle.tolist(),
             "scan_face_axis_measured_frame": axis_in_measured.tolist(),
+            "target_face": str(result.report.get("face", "")),
         }
         write_outputs(result, output)
         announce("export", 0.93, "coverage and viewer written")
@@ -630,6 +738,10 @@ def solve_job(data: dict, progress=None) -> dict:
             "part_scan_face_axis_vehicle": face_axis_vehicle.tolist(),
             "scan_face_axis_measured_frame": scan_axis_target.tolist(),
             "max_registration_error_mm": tolerance,
+            # Which base the plan traced: an uploaded one, the station's own `input/base.stl`,
+            # or the reference plate placed behind the scan face. It is a planning input, so
+            # the report has to say which one it was.
+            "base_source": base_source,
             "outputs": [entry["name"] for entry in _download_entries(prog_name)],
             "warning": (
                 "This is geometric planning only; verify robot reachability, collision, "
@@ -695,6 +807,7 @@ def solve_job(data: dict, progress=None) -> dict:
         "utool": int(data.get("utool", 1)),
         "elapsed_seconds": round(time.perf_counter() - started, 2),
         "base_supplied": base_supplied,
+        "base_source": base_source,
         "viewpoints": delivered,
         "viewer_url": f"/api/viewer?run_id={run_id}",
         "downloads": _download_entries(prog_name),
@@ -827,6 +940,9 @@ def _relocation_export_options(run_dir: Path, prog_name: str) -> dict:
         "motion": str(program.get("motion") or "J"),
         "speed": str(program.get("speed") or "100%"),
         "termination": str(program.get("termination") or "FINE"),
+        # The speed of the NON-scanning joint moves of the original program. Older runs
+        # carry none, in which case the exporter's own default applies.
+        "joint_speed": program.get("joint_speed"),
     }
 
 

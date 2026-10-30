@@ -20,7 +20,9 @@ uv run scanplan view --viewpoints output/<零件>/viewpoints.json \
 
 `--station` 给出三个数模的路径与它们的配准变换；也可以直接给
 `--part/--fixture/--base` 三个路径，此时按单位变换处理。可以加的还有
-`--config`（覆盖配置）、`--tracker x,y,z`（给出跟踪器真实位姿）、
+`--config`（覆盖配置）、`--coverage-target 97.5`（面积验收线，`none` = 跑到耗尽）、
+`--feature-target 95`（**硬特征**验收线：侧壁、折弯、夹具压边，`none` = 关掉这条线）、
+`--tracker x,y,z`（给出跟踪器真实位姿）、
 `--tracker-sweep`（不给位姿时，报告 192 个候选摆位的差别）、`--no-3d`（不写 3D 视图）、
 `--max-faces`（3D 视图里每个模型的显示面数上限）、`--quiet`。
 模板见 [`configs/station.example.json`](../configs/station.example.json)。
@@ -30,6 +32,10 @@ uv run scanplan view --viewpoints output/<零件>/viewpoints.json \
 > 而两面面积、料厚、定向比例**全都一模一样**。报告里因此记录了 `through_axis`（分面认为
 > 的"厚度方向"）和一段说明，供人核对。**默认的 `--face auto` 不受影响**，它两面各算一次
 > 可达性、取高的那一面，这也是推荐用法。
+>
+> 网页端不走名字：它把界面里选的「整车主扫描面」轴向传给 `plan(face_axis=...)`，由两个分面
+> 的**带符号投影面积**判定该扫哪一侧，判定结果写在报告的 `target_face_selection` 里。
+> 命令行没有那个轴向输入，所以才需要 `auto` 或人工核对 `through_axis`。
 
 `plan` 与 `.LS` 导出**刻意分开**：ROBOGUIDE 的坐标系契约（用哪个 `UFRAME`、原点落在
 哪里）需要与现场商定，可能只要求重新导出而不必重跑规划。所以 `ls` 只读视点文件，

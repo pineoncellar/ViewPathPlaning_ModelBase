@@ -230,7 +230,13 @@ def test_a_stroke_plan_scans_with_l_moves_and_repositions_with_j(tmp_path):
     moves = re.findall(r"^\s*\d+:([LJ]) P\[(\d+)\]", text, re.MULTILINE)
     assert moves == [("J", "1"), ("L", "2"), ("J", "3"), ("J", "4")]
     assert "L P[2] 100mm/sec CNT0" in text
-    assert "J P[1] 50% FINE" in text
+    # the moves that turn the wrist are slow by default: 5 % unless asked otherwise
+    assert "J P[1] 5% FINE" in text
+
+    other = tmp_path / "slow"
+    adapt.export(points, other, prog_name=PROG, order=False, motion="L",
+                 speed="100mm/sec", termination="CNT0", joint_speed="2%")
+    assert "J P[1] 2% FINE" in (other / f"{PROG}.LS").read_text(encoding="ascii")
 
 
 def test_a_pose_only_plan_keeps_the_configured_motion(tmp_path):

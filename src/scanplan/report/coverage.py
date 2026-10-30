@@ -80,6 +80,7 @@ def coverage_block(*, config: PlannerConfig, model: ScannerModel, station: Stati
         "uncovered_by_reason": counts,
         "leak_reasons": leak_reason_list,
         "leak_regions": cluster_points(leak_points, leak_areas),
+        "features": feature_block(config, target, coverage, selection, leak_reasons),
         "incidence_histogram": {
             "counts": [int(v) for v in histogram],
             "bin_edges_deg": [round(float(v), 3) for v in edges],
@@ -90,6 +91,55 @@ def coverage_block(*, config: PlannerConfig, model: ScannerModel, station: Stati
             "empty_pool": bool(len(angles) == 0),
         },
         "greedy_curve": [[count, round(pct, 3)] for count, pct in selection.curve],
+    }
+
+
+def feature_block(config: PlannerConfig, target: TargetSet, coverage: CoverageResult,
+                 selection: Selection, leak_reasons) -> dict:
+    """The hard-feature figures: walls, bends and the rim a clamp shades.
+
+    Separate from the area figure on purpose. A wall is a few tenths of a percent of a
+    panel, so the area number cannot tell a reviewer whether the walls were scanned, and
+    that is the question a stamped part raises. The block also names WHY the leftovers are
+    left: a wall the pool cannot see needs a different tilt, a wall the arm cannot hold
+    needs a different station.
+    """
+    mask = coverage.feature
+    if mask is None or target.features is None:
+        return {"enabled": False,
+                "note": "the hard-feature criterion is off (target.feature_coverage_pct "
+                        "is null), so only the area figure was applied"}
+    mask = np.asarray(mask, dtype=bool)
+    area = np.asarray(target.samples.area_mm2, dtype=float)
+    covered = np.asarray(selection.covered, dtype=bool)
+    total = float(area[mask].sum())
+    hit = float(area[mask & covered].sum())
+    # `leak_reasons` holds one entry per UNCOVERED sample, in the order of `uncovered`;
+    # spreading it back over all samples is what lets the same reason be read per feature.
+    reasons_all = np.full(len(covered), "", dtype=object)
+    reasons_all[np.flatnonzero(~covered)] = np.asarray(leak_reasons, dtype=object)
+    reasons: dict[str, int] = {}
+    for reason in reasons_all[mask & ~covered]:
+        reasons[str(reason)] = reasons.get(str(reason), 0) + 1
+    points = np.asarray(target.samples.points, dtype=float)[mask]
+    return {
+        "enabled": True,
+        "wall_deg": config.target.feature_wall_deg,
+        "clearance_mm": config.target.feature_clearance_mm,
+        "target_pct": config.target.feature_coverage_pct,
+        "covered_pct": round(0.0 if total <= 0.0 else 100.0 * hit / total, 3),
+        "samples": int(mask.sum()),
+        "area_mm2": round(total, 1),
+        "uncovered_samples": int((mask & ~covered).sum()),
+        "uncovered_by_reason": reasons,
+        "uncovered_regions": cluster_points(points[~covered[mask]],
+                                            area[mask][~covered[mask]]),
+        "definition": (
+            "a target sample is a hard feature when its normal leans more than wall_deg "
+            "off the face's area-weighted mean normal (a forming wall or a bend), or when "
+            "it sits within clearance_mm of the fixture or the base (the rim a clamp "
+            "shades). These are the samples a head-on sweep cannot follow, so they are "
+            "judged on their own denominator instead of hiding inside the area figure"),
     }
 
 

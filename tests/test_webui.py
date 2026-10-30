@@ -16,12 +16,14 @@ from scanview import save_target_samples
 from scanweb import (
     _available_run_id,
     _decode_stl,
+    _default_base,
     _delete_history_run,
     _history_run_payload,
     _history_runs,
     _init_history,
     _preview_registration,
     _record_history_run,
+    _reference_base,
     _registration_from_payload,
     _sync_input_part,
     _synthetic_base,
@@ -52,10 +54,29 @@ def test_the_page_defaults_come_from_the_shipped_configuration():
     assert config["surface_bias"] == pytest.approx(0.5)
     assert config["robot_enabled"] is True
     assert config["motion"] in ("J", "L")
+    # the page must also be able to show the second acceptance figure and the J speed
+    assert config["feature_coverage_pct"] == pytest.approx(95.0)
+    assert config["joint_speed"] == "5%"
     assert set(config["parameter_sources"]) == {
         "stroke.min_gain_mm2_per_step", "stroke.min_stroke_mm", "stroke.seed_dirs",
         "stroke.order_axis_weight_mm_per_deg", "stroke.parallel_weight",
         "stroke.repair_budget_share"}
+
+
+def test_a_stroke_deliverable_carries_the_configured_joint_speed():
+    """The J moves between sweeps are the ones that spin the wrist; the page must not
+    re-introduce the exporter default by forgetting to pass the setting."""
+    from types import SimpleNamespace
+
+    config = scanweb._delivery_config({})
+    viewpoint = SimpleNamespace(stroke_id=3)
+    options = scanweb._export_options(config, [viewpoint], {})
+    assert options["motion"] == config.motion.type
+    assert options["joint_speed"] == config.motion.joint_speed == "5%"
+    assert options["order"] is False
+
+    pose_only = scanweb._export_options(config, [SimpleNamespace(stroke_id=None)], {})
+    assert "joint_speed" not in pose_only
 
 
 def test_preview_registration_reports_exact_measured_transform():
@@ -109,6 +130,54 @@ def test_synthetic_base_sits_below_the_part_and_fixture():
     assert base.bounds[1][2] < part.bounds[0][2]
     assert base.extents[0] >= fixture.extents[0]
     assert base.extents[1] >= fixture.extents[1]
+
+
+def test_the_reference_base_sits_behind_the_main_scan_face():
+    """The plate follows the SCAN AXIS, not the vehicle's +Z.
+
+    On the 2026-10-29 station the main scan face looks along +Y, so a plate laid "under the
+    models" in Z ended up in FRONT of the panel once registration was applied - the head's
+    own standoff then sat inside the base and the coverage report described its shadow.
+    """
+    part = trimesh.creation.box(extents=[100.0, 2.0, 80.0])
+    fixture = trimesh.creation.box(extents=[140.0, 60.0, 120.0])
+    fixture.apply_translation([0.0, 40.0, 0.0])
+    axis = np.array([0.0, 1.0, 0.0])            # the head looks along +Y
+
+    base = _reference_base(part, fixture, axis)
+
+    assembly = np.vstack((part.vertices, fixture.vertices))
+    assert float((base.vertices @ axis).max()) < float((assembly @ axis).min())
+    # it is the scan face that matters, so laying the same plate in the vehicle frame
+    # would put it in the wrong half-space
+    naive = _synthetic_base(part, fixture)
+    assert float((naive.vertices @ axis).max()) > float((assembly @ axis).min())
+
+
+def test_the_default_base_prefers_the_stations_own_file(tmp_path):
+    part = trimesh.creation.box(extents=[100.0, 80.0, 2.0])
+    fixture = trimesh.creation.box(extents=[140.0, 120.0, 40.0])
+    fixture.apply_translation([0.0, 0.0, 20.0])
+    part.apply_translation([0.0, 0.0, 50.0])
+
+    base, source = _default_base(part, fixture, np.array([0.0, 0.0, 1.0]), tmp_path)
+    assert source == "reference plate behind the scan face"
+    assert base.bounds[1][2] < 0.0
+
+    (tmp_path / "base.stl").write_bytes(
+        trimesh.creation.box(extents=[600.0, 400.0, 30.0]).export(file_type="stl"))
+    base, source = _default_base(part, fixture, np.array([0.0, 0.0, 1.0]), tmp_path)
+    assert source == "input/base.stl"
+    assert base.extents[0] == pytest.approx(600.0, abs=1.0)
+
+
+def test_an_unreadable_station_base_falls_back_to_the_plate(tmp_path):
+    part = trimesh.creation.box(extents=[100.0, 80.0, 2.0])
+    fixture = trimesh.creation.box(extents=[140.0, 120.0, 40.0])
+    (tmp_path / "base.stl").write_bytes(b"not an stl")
+
+    _, source = _default_base(part, fixture, np.array([0.0, 0.0, 1.0]), tmp_path)
+    assert source == "reference plate behind the scan face"
 
 
 def test_reset_poses_are_parsed_as_vehicle_frame_rigid_transforms():

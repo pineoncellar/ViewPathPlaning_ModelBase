@@ -189,6 +189,36 @@ def test_auto_plans_both_faces_and_keeps_the_better_one(clamped_plate, quick_cfg
         result.report["coverage_pct"], abs=0.05)
 
 
+def test_the_scan_axis_decides_which_side_of_the_blank_is_planned(clamped_plate, quick_cfg):
+    """`upper`/`lower` are labels; the operator's axis is a direction.
+
+    Station 20261029_225454 shipped a plan for the BACK of the panel because the page
+    hard-coded `face="upper"` and the split's arbitrary sign had named the far side
+    "upper": 113 cm2 of scattered back-facing facets were planned while the 1.15 m2 face
+    the operator had clicked was never sampled. Passing the axis must settle the side by
+    itself.
+    """
+    top = plan(clamped_plate.station, quick_cfg, face_axis=[0.0, 0.0, 1.0])
+    bottom = plan(clamped_plate.station, quick_cfg, face_axis=[0.0, 0.0, -1.0])
+    assert top.target.face != bottom.target.face
+    assert (top.target.samples.points[:, 2] > 0.6).all()
+    assert (bottom.target.samples.points[:, 2] < 0.1).all()
+    assert top.report["target_face_selection"]["chosen"] == top.target.face
+    assert bottom.report["target_face_selection"]["face_axis"] == [0.0, 0.0, -1.0]
+
+
+def test_the_axis_outranks_the_upper_lower_word(clamped_plate, quick_cfg):
+    # A caller that still passes a word (an old page, a script) must not be able to plan
+    # the far side while claiming the axis it was given.
+    stated = plan(clamped_plate.station, quick_cfg, face="lower")
+    resolved = plan(clamped_plate.station, quick_cfg, face="lower",
+                    face_axis=[0.0, 0.0, 1.0])
+    assert stated.target.face == "lower"
+    assert resolved.target.face != "lower"
+    assert (resolved.target.samples.points[:, 2] > 0.6).all()
+    assert resolved.report["target_face_selection"]["requested"] == "lower"
+
+
 def test_the_refine_loop_stays_inside_its_budget(clamped_plate, cfg):
     result = plan(clamped_plate.station, cfg, face="upper")
     assert result.report["counters"]["refine_rounds"] <= cfg.scanner.refine_rounds

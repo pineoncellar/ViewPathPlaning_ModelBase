@@ -85,6 +85,96 @@ def rotation_angle_deg(first, second) -> float:
                                              -1.0, 1.0))))
 
 
+def _unit(vector) -> np.ndarray:
+    array = np.asarray(vector, dtype=float).reshape(3)
+    length = float(np.linalg.norm(array))
+    if not np.isfinite(length) or length <= _EPS:
+        raise ValueError("direction has no length")
+    return array / length
+
+
+def slerp_axis(first, second, fraction: float) -> np.ndarray:
+    """The optical axis `fraction` of the way from `first` towards `second`.
+
+    A great-circle interpolation, which is what a controller holds when it turns a tool
+    from one attitude to another along a straight line: the axis sweeps the shortest arc.
+    The antiparallel case has no shortest arc - every perpendicular is equal - so a fixed
+    perpendicular is chosen and the axis walks through it, and the caller is guaranteed a
+    well-defined 1-degree-per-degree turn instead of a silent zero-length step.
+    """
+    start, end = _unit(first), _unit(second)
+    cosine = float(np.clip(np.dot(start, end), -1.0, 1.0))
+    angle = float(np.arccos(cosine))
+    share = float(np.clip(fraction, 0.0, 1.0))
+    if angle < 1e-9:
+        return start
+    if np.pi - angle < 1e-9:
+        helper = np.array([1.0, 0.0, 0.0]) if abs(start[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        perpendicular = _unit(np.cross(start, helper))
+        return _unit(np.cos(np.pi * share) * start + np.sin(np.pi * share) * perpendicular)
+    sine = float(np.sin(angle))
+    return _unit((np.sin((1.0 - share) * angle) * start + np.sin(share * angle) * end)
+                 / sine)
+
+
+def interpolated_pose(first, second, fraction: float):
+    """One point along an `L` move between two scanner poses.
+
+    Position is linear (that is what `L` means), the axis follows :func:`slerp_axis`, and
+    the roll is interpolated as an angle. `first` and `second` may be anything carrying
+    `position`, `axis` and `roll_deg` - a `ScannerPose`, a `PathPoint` or a viewpoint - so
+    the same walk serves the planner and the report.
+    """
+    share = float(np.clip(fraction, 0.0, 1.0))
+    start = np.asarray(first.position, dtype=float).reshape(3)
+    end = np.asarray(second.position, dtype=float).reshape(3)
+    roll_start = float(first.roll_deg)
+    roll_end = float(second.roll_deg)
+    # shortest way round: a 350 degree roll difference is a 10 degree turn
+    delta_roll = (roll_end - roll_start + 180.0) % 360.0 - 180.0
+    return (start + (end - start) * share,
+            slerp_axis(first.axis, second.axis, share),
+            roll_start + delta_roll * share)
+
+
+def pose_walk(first, second, *, step_mm: float, step_deg: float):
+    """The intermediate poses of an `L` move, destination included, origin excluded.
+
+    Sampled on BOTH steps and the tighter one wins: an in-place re-orientation covers no
+    millimetres at all, so a length-only rule would sample it once - at the far end - and
+    report a move legal that spent its middle outside the envelope. The number of samples
+    is capped by whichever step is coarser, so a 900 mm flight costs the same whether it
+    turns or not.
+    """
+    if step_mm <= 0.0 or step_deg <= 0.0:
+        raise ValueError("step_mm and step_deg must be positive")
+    length = float(np.linalg.norm(np.asarray(second.position, dtype=float)
+                                  - np.asarray(first.position, dtype=float)))
+    swing = float(np.degrees(np.arccos(np.clip(
+        float(np.dot(_unit(first.axis), _unit(second.axis))), -1.0, 1.0))))
+    roll = abs((float(second.roll_deg) - float(first.roll_deg) + 180.0) % 360.0 - 180.0)
+    count = max(1, int(np.ceil(length / step_mm)), int(np.ceil((swing + roll) / step_deg)))
+    for index in range(1, count + 1):
+        fraction = index / count
+        yield (fraction, *interpolated_pose(first, second, fraction))
+
+
+@dataclass(frozen=True)
+class MoveVerdict:
+    """What checking one whole MOVE said, as opposed to checking its two corners.
+
+    `reason` is `ok`, `off` (gate disabled), `unreachable` (no solution at some point along
+    the way) or `joint_limit` (a solution exists but sits outside the deliverable envelope).
+    `at_fraction` says where along the move that happened, which is what turns "this move
+    is refused" into something a person can look at.
+    """
+
+    ok: bool
+    reason: str
+    at_fraction: float | None = None
+    joints_deg: tuple[float, ...] | None = None
+
+
 def turn_digits(value_deg: float) -> int:
     """Whole revolutions past the axis's own travel; 0 for anything inside +-360.
 
@@ -279,9 +369,42 @@ class Robot:
         reachable = (high if value >= 0.0 else -low) - margin
         return float(min(abs(value) - self.params.j5_min_abs_deg, reachable - abs(value)))
 
+    def elbow_bend_deg(self, joints) -> float:
+        """The angle the two links make, in degrees: 0 is folded flat, 180 is straight.
+
+        Recomputed from the joint values rather than carried along, because the value that
+        matters for a delivered point is the one the CONTROLLER will be at - not the one the
+        solver happened to work in. `bend -> 0` and `bend -> 180` are the two collinear
+        postures where the closed form is most sensitive to a millimetre of tool error and
+        where a real controller reports MOTN-018 instead of solving.
+        """
+        values = np.asarray(joints, dtype=float).reshape(6)
+        angles = self._forward_angles(values)
+        a2, b = angles["a2"], angles["b"]
+        params = self.params
+        radius = (params.base_offset_mm + params.upper_arm_mm * np.sin(a2)
+                  + params.forearm_mm * np.sin(b) - params.forearm_offset_mm * np.cos(b))
+        height = (params.j2_height_mm + params.upper_arm_mm * np.cos(a2)
+                  + params.forearm_mm * np.cos(b) + params.forearm_offset_mm * np.sin(b))
+        links = (params.upper_arm_mm, self.forearm_effective_mm)
+        dr = radius - params.base_offset_mm
+        cosine = ((dr * dr + height * height - links[0] ** 2 - links[1] ** 2)
+                  / (2.0 * links[0] * links[1]))
+        return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
     def feasible(self, joints, margin_deg: float | None = None) -> bool:
-        """Whether this joint set is inside the limits with margin and away from J5 = 0."""
+        """Whether this joint set is inside the limits with margin and away from J5 = 0.
+
+        Also refuses a collinear elbow (`elbow_margin_deg`): the export audit goes through
+        here, so a point an older plan accepted at `bend = 8 deg` is caught before a program
+        is written rather than on the pendant.
+        """
         required = (self.params.joint_margin_deg if margin_deg is None else float(margin_deg))
+        elbow = float(getattr(self.params, "elbow_margin_deg", 0.0))
+        if elbow > 0.0:
+            bend = self.elbow_bend_deg(joints)
+            if bend < elbow or bend > 180.0 - elbow:
+                return False
         return bool(self.margins(joints).min() >= required and self.j5_margin(joints) >= 0.0)
 
     # -- inverse -------------------------------------------------------------
@@ -300,15 +423,32 @@ class Robot:
         found: list[Solution] = []
         allowed = {str(family).upper().strip().replace("  ", " ")
                    for family in getattr(self.params, "allowed_configs", ()) or ()}
+        # A pinned wrist letter is a CONSTRAINT on which branch is acceptable, not just a
+        # label to print. Writing `N U T` over a solution whose J5 is positive asks the
+        # controller for the other wrist branch - J4 and J6 turn 180 deg, and where that
+        # branch is outside the travel the controller stops with MOTN-018 "position not
+        # reachable". The 2026-10-29 PART010 program had 13 of its 27 points like that.
+        pinned = str(getattr(self.params, "config_wrist_letter", "auto")).upper()
+        elbow_margin = float(getattr(self.params, "elbow_margin_deg", 0.0))
         for shoulder, elbow, arm in self._arm_solutions(wrist):
             a1x, a2, b = arm["a1x"], arm["a2"], arm["b"]
             for flip, wrist_angles, singular in self._wrist_solutions(a1x, b, flange):
+                if pinned in ("T", "F"):
+                    # `T` is the negative-J5 branch by construction (see `_wrist_solutions`).
+                    if (pinned == "T") != (flip == "T"):
+                        continue
                 joints = self._controller_angles(a1x, a2, b, *wrist_angles)
                 placed = self._place(joints)
                 if placed is None:
                     continue
                 if verify and not self._reproduces(placed, point, target):
                     continue
+                if elbow_margin > 0.0:
+                    bend = self.elbow_bend_deg(placed)
+                    if bend < elbow_margin or bend > 180.0 - elbow_margin:
+                        # Collinear links: the posture the fitted geometry describes worst,
+                        # and the one the controller refuses rather than solving.
+                        continue
                 config = self.config_string(placed, shoulder, elbow)
                 if allowed and config.split(",")[0].strip().upper() not in allowed:
                     # A family this cell has not proven. The front/back posture numbers J2
@@ -481,7 +621,11 @@ class KinematicGate:
         self.robot = Robot(params) if params.enabled else None
         self._cache: dict[tuple, Verdict] = {}
         self._expand: dict[tuple, list[Solution]] = {}
+        self._moves: dict[tuple, MoveVerdict] = {}
         self.queries = 0
+        # Samples taken along interpolated moves, so "the move was checked" is a number in
+        # the report rather than a claim about code that ran.
+        self.move_samples = 0
 
     @property
     def active(self) -> bool:
@@ -519,6 +663,8 @@ class KinematicGate:
     def summary(self) -> dict:
         """Cache statistics, so "the gate was on" is a measurement rather than a claim."""
         return {"poses_asked": int(self.queries), "distinct_poses": len(self._cache),
+                "moves_checked": len(self._moves),
+                "move_samples": int(self.move_samples),
                 "robot": self.params.model, "limits_source":
                 (self.robot.limits_source if self.robot is not None else "gate disabled")}
 
@@ -542,9 +688,116 @@ class KinematicGate:
         self._expand[self._key(position, axis, roll_deg)] = found
         return found
 
+    def follow(self, reference_joints, position, axis, roll_deg: float) -> Solution | None:
+        """The feasible solution at this pose that stays closest to `reference_joints`.
+
+        This is what a controller does: it does not pick a branch per point, it stays on the
+        one it is already on. Judging each sample of a move on its own ("some solution
+        exists here") would answer a different question from the one that matters, because
+        the branch that exists halfway along may be one the arm has to jump to - which is a
+        move the controller refuses.
+        """
+        if self.robot is None:
+            return None
+        from .geometry import scanner_frame
+
+        rotation = scanner_frame(np.asarray(axis, dtype=float), float(roll_deg))
+        options = [item for item in self.robot.solutions(position, rotation, verify=False)
+                   if item.ok]
+        options.sort(key=lambda item: joint_distance(item.joints_deg, reference_joints))
+        for item in options:
+            if self.robot.reproduces(item.joints_deg, position, rotation):
+                return item
+        return None
+
+    def move(self, first, second, *, motion: str = "L") -> MoveVerdict:
+        """Whether the WHOLE move between two poses stays inside the deliverable envelope.
+
+        Two different questions, and the configured motion decides which one applies:
+
+        * `J` - the controller interpolates the joint values. The deliverable envelope is a
+          box, so a straight line between two inside points is inside everywhere: the two
+          corners settle it, and sampling would only re-prove convexity. (J6 gets no such
+          guarantee in the other direction: it is the axis a joint move spins, which is
+          why `stroke.max_j6_step_deg` exists separately.)
+        * `L` - the controller interpolates the TCP along a straight line and turns the tool
+          along the shortest arc, so the joints in between are the IK of poses that were
+          never checked. A reach that has to straighten, or a wrist that has to unwind,
+          leaves the envelope halfway along while both ends sit comfortably inside it. Those
+          are the moves this samples.
+
+        The branch is followed from the start of the move (see :meth:`follow`), not chosen
+        afresh at every sample.
+        """
+        if self.robot is None:
+            return MoveVerdict(True, "off")
+        motion = str(motion).upper()
+        key = (self._key(first.position, first.axis, first.roll_deg),
+               self._key(second.position, second.axis, second.roll_deg), motion,
+               float(self.params.motion_check_step_mm),
+               float(self.params.motion_check_step_deg))
+        cached = self._moves.get(key)
+        if cached is not None:
+            return cached
+        start = self.check(first.position, first.axis, first.roll_deg)
+        if not start.ok:
+            # Reported by the caller as an unreachable CORNER, which is the more specific
+            # answer; the move itself cannot be judged from a start that does not exist.
+            verdict = MoveVerdict(False, f"start_{start.reason}", 0.0)
+            self._moves[key] = verdict
+            return verdict
+        if motion == "J":
+            # A joint move interpolates each axis linearly, and a box is convex, so the two
+            # corners settle the limits. What they do NOT settle is the wrist: J5 crossing
+            # zero is the singularity, and a linear interpolation between +30 and -30 goes
+            # straight through it. `feasible` keeps |J5| >= j5_min_abs at every point, so
+            # the only way across is a sign change - refused here.
+            end = self.check(second.position, second.axis, second.roll_deg)
+            start_j5 = float(start.solution.joints_deg[4]) if start.solution else 0.0
+            end_j5 = float(end.solution.joints_deg[4]) if end.solution else 0.0
+            if start_j5 * end_j5 < 0.0:
+                verdict = MoveVerdict(False, "wrist_flip", None,
+                                      tuple(start.solution.joints_deg))
+                self._moves[key] = verdict
+                return verdict
+            verdict = MoveVerdict(True, "ok", None,
+                                  (start.solution.joints_deg if start.solution else None))
+            self._moves[key] = verdict
+            return verdict
+        reference = start.solution.joints_deg if start.solution is not None else None
+        if reference is None:
+            verdict = MoveVerdict(False, "joint_limit", 0.0)
+            self._moves[key] = verdict
+            return verdict
+        verdict = MoveVerdict(True, "ok", None, tuple(reference))
+        for fraction, position, axis, roll in pose_walk(
+                first, second, step_mm=float(self.params.motion_check_step_mm),
+                step_deg=float(self.params.motion_check_step_deg)):
+            self.move_samples += 1
+            found = self.follow(reference, position, axis, roll)
+            if found is None:
+                verdict = MoveVerdict(False, "unreachable", float(fraction), tuple(reference))
+                break
+            reference = found.joints_deg
+            verdict = MoveVerdict(True, "ok", float(fraction), tuple(reference))
+        self._moves[key] = verdict
+        return verdict
+
     @staticmethod
     def _key(position, axis, roll_deg: float) -> tuple:
         return (round(float(position[0]), 1), round(float(position[1]), 1),
                 round(float(position[2]), 1), round(float(axis[0]), 4),
                 round(float(axis[1]), 4), round(float(axis[2]), 4),
                 round(float(roll_deg), 2))
+
+
+def joint_distance(first, second) -> float:
+    """The worst single-axis joint change between two joint vectors, the short way round."""
+    delta = (np.asarray(second, dtype=float) - np.asarray(first, dtype=float))
+    return float(np.max(np.abs((delta + 180.0) % 360.0 - 180.0)))
+
+
+def joint_step(first, second, axis: int) -> float:
+    """One axis' joint change between two joint vectors, degrees, shortest way round."""
+    delta = float(np.asarray(second, dtype=float)[axis] - np.asarray(first, dtype=float)[axis])
+    return abs((delta + 180.0) % 360.0 - 180.0)

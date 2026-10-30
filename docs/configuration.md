@@ -140,6 +140,8 @@ uv run scanplan plan --station input/<工位>.json \
 | `robot.joint_margin_deg` | `5.0` | **每个轴两端各预留多少度**（现场接受 5–10）。硬门要求交付点离限位 ≥ 这个值 |
 | `robot.j5_min_abs_deg` | `8.0` | 腕奇异保护：`\|J5\|` 不小于这个值 |
 | `robot.max_step_deg` | `40.0` | **只报不拦**：相邻交付点的最大关节步，超限计数进报告 |
+| `robot.elbow_margin_deg` | `10.0` | 肘部离开自身行程两端的余量。`bend→0`（两杆折叠贴合）与 `bend→180`（伸直）是共线姿态：闭式解还会给数，控制器却直接报 `MOTN-018 位置不可达`（2026-10-29 的 PART010 就卡在 `bend = 8.4°` 的点上）。`Robot.feasible` 也用它，所以导出前的关节复核同样会拒这类点 |
+| `robot.motion_check_step_mm` / `_deg` | `50` / `10` | 逐段检查一段运动时的采样步长（更紧的那个生效）；`J` 运动按凸包络只查端点 + J5 不过零，`L` 运动逐点采样 |
 | `robot.limits_usage_frac` | `1.0` | 可以用数据表包络的多大比例。**现已设 1.0**：不再用“90% 量程”当软限位——那是每轴不同的余量（J1 18.5°、J2 6.8°、J4 36°），机器本身没有这个道理；余量统一交给 `joint_margin_deg`（5–10°） |
 | `robot.soft_limits_deg` / `mechanical_limits_deg` | 见文件 | 数据表限位（R-2000iC/125L，reach 2655）与控制器软限位，两者取交集；报告写明用了哪套、用了多少比例 |
 | `robot.wrist_identified` | `true` | 关掉后禁止输出绝对关节值，门只能做分支排序 |
@@ -149,6 +151,7 @@ uv run scanplan plan --station input/<工位>.json \
 
 两条要记住的语义：
 
+- **CONFIG 的第三位是约束，不是标签。** `robot.config_wrist_letter` 钉成 `T` 时，求解阶段就**只接受** J5 < 0 的那支解。以前是“把 F 分支的关节值写成 `N U T`”——控制器按 T 去解，J4/J6 差 180°，解不出或超行程就报 `MOTN-018`。2026-10-29 的 PART010 有 13/27 个点是这种“字不符实”的点。
 - **硬门对三件事丢条目**：间隙 ≤ 0、过渡点解不出逆解、**交付点没有任何落在可用包络内的关节解**。
   `stroke.max_rot_deg_per_mm` 是未标定常数，**只报不拦**——拿它丢带会把覆盖率从 99% 打到 82%。
 - 丢掉的条目走**排除重选**，不是只过滤；只过滤不重选同样会把覆盖率打下去。
@@ -168,6 +171,77 @@ uv run scanplan plan --station input/<工位>.json \
 uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
                    --prog-name PART01 --joint-blocks --out output/<零件>/
 ```
+
+## 硬特征（侧壁、折弯、夹具边）的第二条验收线
+
+面积验收线管不了侧壁：1 m² 的面板上，一块立壁只占千分之几，97% 的计划把每一块侧壁都漏掉也照样
+"达标"。所以 `target.feature_coverage_pct`（默认 `95.0`）是**独立分母**的第二条线——它只算硬特征：
+
+- 法向偏离整面面积加权平均法向超过 `target.feature_wall_deg`（默认 45°）的样本=立壁/折弯；
+- 离夹具或底座小于 `target.feature_clearance_mm`（默认 15 mm）的样本=被夹具压住的边缘。
+
+两条线**都满足**贪心才会停；修剪（prune）也不许把硬特征覆盖率剪回去。报告 `features` 块给出
+`covered_pct` / `area_mm2` / `uncovered_by_reason` / `uncovered_regions`。`feature_coverage_pct`
+写 `null` 就退回"只看面积"的老行为。
+
+面积目标已经满足、硬特征还不满足时，`scanner.feature_rounds`（默认 1）轮**斜扫补充**会跑：只对
+剩下的硬特征样本，按 `scanner.feature_tilts_deg`（默认 `[30, 40]`，**必须小于
+`max_incidence_deg`**）绕法向扫一圈 `scanner.feature_tilt_azimuths`（默认 12）个方位、两种符号，
+瞄准网格 `scanner.feature_aim_grid_mm`（默认 15 mm，比主网格细，因为侧壁只有几毫米宽）。这一族
+**只用 roll 0**：斜扫本来就是折中，再加 90° 滚转等于白送一次 90° 的 J6 转动。
+
+```json
+{"target": {"feature_coverage_pct": 95.0}}
+```
+
+## J6 与"整个过程都在行程里"
+
+`stroke.max_j6_step_deg`（默认 `60`）是单次重定位允许的 J6 转角，`stroke.j6_step_weight`
+（默认 `1.5`，旧行为是常数 0.5）是分支搜索里"一度 J6 值多少度其它轴"。扫描带内 J6 恒为零——
+一条带就是一个姿态写成两个角点——所以程序里每一次 J6 都属于带间重定位，超限时写进
+`CONSTRAINT` 与 `kinematics.j6_steps_over_limit`：**只报不丢**（和 `robot.max_step_deg` 同一
+性质），因为没有任何控制器数据支持一个硬阈值。分支搜索对"超过 cap 的 J6"加一个远大于任何真实
+代价的罚分，所以只要有别的分支就不会撞上去。
+
+角点合法不等于**运动**合法：`robot.motion_check_step_mm`（默认 50）与
+`robot.motion_check_step_deg`（默认 10）把每一段交付运动按更紧的那个步长采样，IK 从**上一点所在
+的分支**一路跟下去（控制器不会每点重挑分支），中途离开可用包络就拒这条路线——间隙和行程是同一种
+硬约束。`J` 运动不用采样：包络是凸盒，两端在内则整段在内（只有 J5 过零的腕奇异要单独判）；
+`L` 运动必须采样，因为中间的关节值是没检查过的位姿算出来的。
+
+报告 `kinematics.motion_check` 给出 `moves_checked` 与 IK 采样数，summary 里是一行 `moves`。
+
+`motion.joint_speed`（默认 `"5%"`）是**不扫描的那些关节运动**的速度——扫描带方案里每一个
+回缩、过渡、重定位指令都是 `J`，也是腕部真正转动的地方（单条指令里 J6 最多能转 180°）。必须
+写百分比：FANUC 不接受关节指令上的 mm/sec。字段同时写进 `<NAME>_frame.json` 的
+`program.joint_speed`，重定位导出沿用它。
+
+`stroke.lock_roll` 不只管扫描带：位姿梯子也用同一个 `roll_for_axis` 约定。以前位姿池同时有
+roll 0 和 90，会和 roll 90 的扫描带背对背，量出来是 74–95° 的 J6 停顿式转动；统一之后 J6 只跟
+轴向变化走。
+
+## 回缩点：先保证"拿得住"
+
+连接路线里的等待点（回缩点）是硬门最常卡住的地方，而它卡住时的报错原话是
+"no retract corner the arm can hold"——**这句话只说症状**。2026-10-29 station 上它一口气丢了
+4 个点位（8.5 个百分点的覆盖率），真正的原因分两类，现在各有对策：
+
+1. **回缩方向只往外/往上**。沿 `-axis`（垂直向上）回缩 80 mm，在 2 m 半径的远端点位等于要求
+   肘部再伸直一点——而那正是远端最缺的行程。现在 `_retract_directions` 在"沿轴后退"和
+   "安全平面法向"之后**还会朝机器人方向水平拉回**（`-unit(x, y)`）：距离变短而不是变长，间隙
+   照样按同一套 `_segment_margin` 判，且放在最后试，不会让已经能走的路线变差。
+2. **只有比 `retract_clearance_mm` 更短的抬升才拿得住**。`_LIFT_FACTORS` 现在也往 1 以下走
+   （`1, 2, 3, 4, 6, 8, 0.6, 0.35`）：回缩点只需要把头从零件上抬开，20 mm 比 80 mm 更容易在
+   包络里；往上的大抬升仍然先试，所以原来能走的不会变。报告里"up to N mm of lift"用的是
+   抬升阶梯的**上限**（`_MAX_LIFT_FACTOR`），不是最后一档。
+
+硬门拒掉一条路线时，`path._refusal_note` 会在 `CONSTRAINT` 里写清**是哪一段、什么原因**
+（哪个角点没有逆解 / 哪一段 `J`/`L` 中途离开包络），所以下一次看报告不必再猜。
+
+位姿交付（99% 这类高目标下 `require_sweeps` 常常回落到位姿方案）还有一条独立规则：被硬门拒掉
+的点不再"从清单里划掉"，而是**带上排除掩码重选**（`selection.select(exclude=)` +
+`delivery._pose_reselect`）。一个位姿大约 3% 面积，划掉一个就是三个百分点，而重选会把它换成
+另一个能连上的点。
 
 ## 改完看哪里
 

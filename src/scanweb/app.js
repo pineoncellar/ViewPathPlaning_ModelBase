@@ -1413,7 +1413,14 @@ function formatElapsed(seconds) {
 
 function renderResult(result) {
   $("resultName").textContent = result.program_name + " · 扫描路径规划";
-  $("resultSubtitle").textContent = "目标面 " + (result.face || "—") + " · " + result.datum_count + " 点配准 · " + result.measured_frame;
+  // `upper` / `lower` 只是分面给出的几何名，操作员看的是"界面里点橙色的那一面"。
+  // 把本次用的主扫描面轴向一起写出来，免得目标面显示成 lower 时以为扫反了。
+  const plannedAxis = Array.isArray(result.scan_face_axis_vehicle)
+    ? axisFromVector(result.scan_face_axis_vehicle) : null;
+  const plannedSide = plannedAxis
+    ? "（主扫描面 " + (AXIS_LABELS[plannedAxis] || plannedAxis) + " 一侧）" : "";
+  $("resultSubtitle").textContent = "目标面 " + (result.face || "—") + plannedSide + " · "
+    + result.datum_count + " 点配准 · " + result.measured_frame;
   $("metricCoverage").innerHTML = Number(result.coverage_pct).toFixed(2) + "<small>%</small>";
   $("metricViewpoints").textContent = result.point_count;
   $("metricPoints").textContent = Number(result.target_points).toLocaleString();
@@ -1434,7 +1441,9 @@ function renderResult(result) {
       ? [["定位方式", "自 " + result.relocated_from + " 变换 "
           + Number(result.shift_mm || 0).toFixed(2) + " mm（未重新规划）"]]
       : []),
-    ["底座", result.base_supplied ? "已导入" : "未导入 · 已自动生成参考板"],
+    ["底座", result.base_supplied
+      ? "已导入"
+      : "未导入 · 使用 " + (result.base_source || "参考板（主扫描面背后）")],
     ["未覆盖原因", reasons],
     ["输出目录", result.output_dir]
   ];

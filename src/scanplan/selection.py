@@ -45,6 +45,11 @@ class Selection:
     # `len(chosen)` is NOT that number once poses and strokes are mixed: ten strokes are
     # twenty corners and thirty poses are thirty.
     corners: int | None = None
+    # The hard-feature figures the selection was judged by, when the caller asked for them.
+    # Kept on the selection so a later ranking (`pipeline.ranking._rank`) can compare two
+    # plans on the same scale instead of on the area figure alone.
+    feature_coverage_pct: float | None = None
+    feature_target_pct: float | None = None
 
     @property
     def cost_corners(self) -> int:
@@ -95,6 +100,40 @@ def _pick(score: np.ndarray, gains: np.ndarray, tie) -> int:
     return int(close[int(np.argmax(preferences[close]))])
 
 
+def feature_percent(cov: CoverageResult, area, covered) -> float | None:
+    """The area share of the HARD FEATURES that `covered` reaches, or None when unset.
+
+    Measured on its own denominator, not on the whole face: a wall is a few tenths of a
+    percent of a panel, so mixing the two would let a 97 % total hide a completely
+    unscanned wall - which is exactly the failure this figure exists to name.
+    """
+    if cov.feature is None or len(cov.feature) == 0:
+        return None
+    mask = np.asarray(cov.feature, dtype=bool)
+    weights = np.asarray(area, dtype=float)[mask]
+    total = float(weights.sum())
+    if total <= 0.0:
+        return None
+    return float(100.0 * weights[np.asarray(covered, dtype=bool)[mask]].sum() / total)
+
+
+def _met(covered_pct: float, feature_pct: float | None,
+         coverage_target_pct: float | None, feature_target_pct: float | None) -> bool:
+    """Whether BOTH acceptance figures are met - the area one and the feature one.
+
+    Two conditions joined by AND rather than one number, because they answer different
+    questions: "how much of the panel is measured" and "is any of the hard geometry left".
+    A caller that passes neither gets the historical behaviour (run until nothing new is
+    covered), which is what keeps the regression profile honest.
+    """
+    if coverage_target_pct is not None and covered_pct < float(coverage_target_pct):
+        return False
+    if feature_target_pct is not None and (feature_pct is None
+                                           or feature_pct < float(feature_target_pct)):
+        return False
+    return coverage_target_pct is not None or feature_target_pct is not None
+
+
 def _empty_selection(cov: CoverageResult, target_area: float) -> Selection:
     """The answer when the candidate pool is empty: deliver nothing, invent nothing.
 
@@ -111,7 +150,8 @@ def _empty_selection(cov: CoverageResult, target_area: float) -> Selection:
 
 def select(cov: CoverageResult, area_mm2=None, *,
            coverage_target_pct: float | None = None,
-           tie=None,
+           feature_target_pct: float | None = None,
+           tie=None, exclude=None,
            log: Callable[[str], None] | None = None) -> Selection:
     """Greedy set cover on covered AREA, then a repair pass for the leftovers.
 
@@ -125,6 +165,12 @@ def select(cov: CoverageResult, area_mm2=None, *,
     new coverage, which is the behaviour of the validated round-4 run (50 poses, 99.10%,
     repair 0).
 
+    `exclude` bans rows, and it exists for the same reason `select_groups` has one: when the
+    delivery stage refuses an item, the selection has to be re-run WITHOUT it rather than
+    have the item quietly deleted. The pose-only deliverable used to do the latter, and on
+    the 2026-10-29 station one refused pose carried 0.92 of a percentage point - the plan
+    then reported 98.59% while the pool reached 99.51% and the requirement was 99%.
+
     The same target stops the repair pass, and that is deliberate: repair adds one pose per
     reachable-but-uncovered sample, so running it after a met target would hand back
     everything the target just saved - the measured run spent seven tenths of its point
@@ -135,7 +181,13 @@ def select(cov: CoverageResult, area_mm2=None, *,
     say = log or (lambda _message: None)
     if coverage_target_pct is not None and not 0.0 < coverage_target_pct <= 100.0:
         raise ValueError("coverage_target_pct must be in (0, 100]")
+    if feature_target_pct is not None and not 0.0 < feature_target_pct <= 100.0:
+        raise ValueError("feature_target_pct must be in (0, 100]")
     matrix = cov.matrix()
+    banned = (np.zeros(matrix.shape[0], dtype=bool) if exclude is None
+              else np.asarray(exclude, dtype=bool))
+    if len(banned) != matrix.shape[0]:
+        raise ValueError("one exclusion flag per candidate is required")
     area = (np.asarray(cov.area_mm2, dtype=float) if area_mm2 is None
             else np.asarray(area_mm2, dtype=float))
     if len(area) != cov.n_targets:
@@ -153,31 +205,38 @@ def select(cov: CoverageResult, area_mm2=None, *,
     greedy: list[int] = []
     curve: list[tuple[int, float]] = []
     while True:
-        if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
+        if _met(covered_pct(), feature_percent(cov, area, covered),
+                coverage_target_pct, feature_target_pct):
             break
         gains = matrix @ np.where(covered, 0.0, area)
+        if banned.any():
+            gains = np.where(banned, 0.0, gains)
         best = _pick(gains, gains, tie)
         if gains[best] <= 0.0:
             break
         greedy.append(best)
         covered |= _row(matrix, best)
         curve.append((len(greedy), covered_pct()))
-    say(f"  greedy: {len(greedy)} poses -> {covered_pct():.2f}%")
+    say(f"  greedy: {len(greedy)} poses -> {covered_pct():.2f}%"
+        + _feature_note(feature_percent(cov, area, covered)))
 
     repair: list[int] = []
     reachable = cov.pool_reach()
     for target in np.flatnonzero(reachable & ~covered):
-        if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
+        if _met(covered_pct(), feature_percent(cov, area, covered),
+                coverage_target_pct, feature_target_pct):
             # The remainder past the target is what the workshop patches by hand. Repairing
             # it here would hand the whole point of the target back: it adds one pose per
             # reachable-but-uncovered sample, which is exactly the tail the target exists
             # to cut off.
-            say(f"  repair: stopped at the {coverage_target_pct:g}% target with "
+            say(f"  repair: stopped at the acceptance target with "
                 f"{int((reachable & ~covered).sum())} reachable samples left uncovered")
             break
         if covered[target]:
             continue          # an earlier repair pose already took this one with it
         candidates = np.flatnonzero(_row(matrix, None, column=target))
+        if banned.any():
+            candidates = candidates[~banned[candidates]]
         if len(candidates) == 0:
             continue
         gains = matrix[candidates] @ np.where(covered, 0.0, area)
@@ -193,11 +252,19 @@ def select(cov: CoverageResult, area_mm2=None, *,
         chosen=chosen, greedy=greedy, repair=repair, covered=covered, curve=curve,
         coverage_area_mm2=float(area[covered].sum()), target_area_mm2=target_area,
         sources=np.array(["greedy"] * len(greedy) + ["repair"] * len(repair), dtype=object),
+        feature_coverage_pct=feature_percent(cov, area, covered),
+        feature_target_pct=feature_target_pct,
     )
+
+
+def _feature_note(feature_pct: float | None) -> str:
+    """The hard-feature figure as a suffix for a log line, or nothing when unset."""
+    return "" if feature_pct is None else f", hard features {feature_pct:.1f}%"
 
 
 def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
                   repair_ok=None, coverage_target_pct: float | None = None,
+                  feature_target_pct: float | None = None,
                   tie=None, weight=None, lam: float = 0.0, exclude=None,
                   log: Callable[[str], None] | None = None) -> Selection:
     """Set cover over candidates of MIXED kind: strokes and single poses together.
@@ -217,6 +284,8 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
     say = log or (lambda _message: None)
     if coverage_target_pct is not None and not 0.0 < coverage_target_pct <= 100.0:
         raise ValueError("coverage_target_pct must be in (0, 100]")
+    if feature_target_pct is not None and not 0.0 < feature_target_pct <= 100.0:
+        raise ValueError("feature_target_pct must be in (0, 100]")
     matrix = cov.matrix()
     area = (np.asarray(cov.area_mm2, dtype=float) if area_mm2 is None
             else np.asarray(area_mm2, dtype=float))
@@ -248,7 +317,8 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
     greedy: list[int] = []
     curve: list[tuple[int, float]] = []
     while True:
-        if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
+        if _met(covered_pct(), feature_percent(cov, area, covered),
+                coverage_target_pct, feature_target_pct):
             break
         gains = matrix @ np.where(covered, 0.0, area)
         # `max(cost, eps)` rather than `cost + 1`: the +1 was "one millimetre, ignore it",
@@ -263,13 +333,15 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
         greedy.append(best)
         covered |= _row(matrix, best)
         curve.append((len(greedy), covered_pct()))
-    say(f"  greedy over groups: {len(greedy)} candidates -> {covered_pct():.2f}%")
+    say(f"  greedy over groups: {len(greedy)} candidates -> {covered_pct():.2f}%"
+        + _feature_note(feature_percent(cov, area, covered)))
 
     repair: list[int] = []
     reachable = cov.pool_reach()
     for target in np.flatnonzero(reachable & ~covered):
-        if coverage_target_pct is not None and covered_pct() >= coverage_target_pct:
-            say(f"  repair over groups: stopped at the {coverage_target_pct:g}% target with "
+        if _met(covered_pct(), feature_percent(cov, area, covered),
+                coverage_target_pct, feature_target_pct):
+            say("  repair over groups: stopped at the acceptance target with "
                 f"{int((reachable & ~covered).sum())} reachable samples left uncovered")
             break
         if covered[target]:
@@ -290,6 +362,8 @@ def select_groups(cov: CoverageResult, costs, *, area_mm2=None,
         coverage_area_mm2=float(area[covered].sum()), target_area_mm2=target_area,
         sources=np.array(["greedy"] * len(greedy) + ["repair"] * len(repair), dtype=object),
         corners=int(round(float(costs[chosen].sum()))) if chosen else 0,
+        feature_coverage_pct=feature_percent(cov, area, covered),
+        feature_target_pct=feature_target_pct,
     )
 
 

@@ -27,12 +27,23 @@ def summary_lines(report: dict) -> list[str]:
         f"max incidence          {report['placeholders']['max_incidence_deg']:.0f} deg "
         "(PLACEHOLDER)",
     ]
+    features = report.get("features", {})
+    if features.get("enabled"):
+        lines.append(
+            f"hard features          {features['covered_pct']:.2f}% of "
+            f"{features['area_mm2'] / 1e6:.4f} m2 "
+            f"({features['samples']} wall/rim samples)  target "
+            f"{features['target_pct']:g}% "
+            + ("met" if features["covered_pct"] + 1e-9 >= features["target_pct"]
+               else "NOT MET"))
     path = report.get("program", {})
     if path.get("path_length_mm") is not None:
         interrupts = path.get("interrupts", {})
         lines += [
             f"motion                 {path['motion']} {path['speed_mm_s']:g} mm/s "
-            f"{path['termination']}",
+            f"{path['termination']}"
+            + (f"  |  J {path['joint_speed']} FINE (no-scan moves)"
+               if path.get("joint_speed") else ""),
             f"path                   {path['turns']} corners, "
             f"{path['path_length_mm']:.0f} mm, "
             f"{interrupts.get('translation', 0)} translation + "
@@ -64,8 +75,17 @@ def summary_lines(report: dict) -> list[str]:
             f"joints                 min margin {kinematics.get('min_margin_deg')} deg, "
             f"worst step {kinematics.get('max_step_deg')} deg "
             f"(limit {kinematics.get('max_step_deg_limit')}), "
-            f"worst J6 step {kinematics.get('max_j6_step_deg')} deg, "
-            f"branches {kinematics.get('branch_histogram')}")
+            f"worst J6 step {kinematics.get('max_j6_step_deg')} deg "
+            f"(limit {kinematics.get('max_j6_step_deg_limit')})"
+            + (f", {kinematics['j6_steps_over_limit']} over"
+               if kinematics.get("j6_steps_over_limit") else "")
+            + f", branches {kinematics.get('branch_histogram')}")
+        motion = kinematics.get("motion_check", {})
+        if motion.get("moves_checked"):
+            lines.append(
+                f"moves                  {motion['moves_checked']} checked between their "
+                f"corners at {motion['step_mm']:g} mm / {motion['step_deg']:g} deg "
+                f"({motion['samples']} IK samples)")
         if kinematics.get("points_without_solution"):
             lines.append(
                 f"JOINT                  {kinematics['points_without_solution']} delivered "

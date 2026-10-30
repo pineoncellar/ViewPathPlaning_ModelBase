@@ -588,7 +588,9 @@ def test_exporting_a_stroke_plan_refuses_to_re_sort(tmp_path):
     moves = re.findall(r"^\s*\d+:([LJ]) P\[(\d+)\]", text, re.MULTILINE)
     assert moves == [("J", "1"), ("L", "2"), ("J", "3"), ("L", "4")]
     assert "L P[2] 100 mm/sec CNT0" in text
-    assert "J P[1] 50% FINE" in text
+    # the non-scanning joint moves run at `motion.joint_speed` (5 % by default)
+    assert "J P[1] 5% FINE" in text
+    assert contract["program"]["joint_speed"] == "5%"
     assert contract["program"]["termination"] == "CNT0"
     assert contract["program"]["strokes"] == [0, 1]
 

@@ -70,9 +70,10 @@ def definition_block(*, config: PlannerConfig, target: TargetSet, split: SheetSp
                 "blank as the split's orientation seed happens to order them, and that seed "
                 "is not anchored to the station file. Swapping the seed swaps the names "
                 "while leaving both areas, the thickness and the orientation fraction "
-                "identical - so check `through_axis` above (which way the split calls "
-                "'up') instead of trusting the word, and prefer face='auto', which compares "
-                "both sides."
+                "identical. The web UI therefore plans the side the main scan-face axis "
+                "points at (`target_face_selection` records that decision and both "
+                "projections); only a caller without an axis should fall back to "
+                "face='auto', which compares both sides."
             ),
         },
         "face": target.face,

@@ -51,7 +51,18 @@ _FULL_TURN_DEG = 360.0
 # Multiples of `retract_clearance_mm` the connector tries before giving up. A fixed lift
 # assumes the space behind the head is empty, and on a real cell it is not: the base sits
 # behind the upper face and the fixture behind the lower one.
-_LIFT_FACTORS = (1.0, 2.0, 3.0, 4.0, 6.0, 8.0)
+#
+# The ladder now also goes BELOW 1, and that is the fix for a failure the report used to
+# blame on clearance: retracting 80 mm along the axis puts the TCP further from the base, and
+# on a pose near the far edge of a 2.4 m panel that corner is simply outside the arm's reach.
+# "No retract corner the arm can hold" then dropped the pose and took its area with it - on
+# the 2026-10-29 station four poses, 8.5 points of coverage. A shorter waiting point is the
+# right answer: the retract only has to lift the head clear of the part, which `_segment_margin`
+# still checks, and 20 mm is far more likely to be holdable than 80. The bigger lifts stay
+# first so nothing that already worked gets worse.
+_LIFT_FACTORS = (1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 0.6, 0.35)
+# The lift the report quotes as "every route tried" - the CAP of the ladder, not its last rung.
+_MAX_LIFT_FACTOR = max(factor for factor in _LIFT_FACTORS if factor >= 1.0)
 # What a change of the CONFIG letters costs the branch search, in degrees of joint travel.
 # Sized above the swings it is meant to avoid (158-168 deg on the measured program) but not
 # so high that it forces a family which then needs a bigger detour elsewhere.
@@ -63,6 +74,14 @@ _CONFIG_CHANGE_COST_DEG = 240.0
 # axis of each step; this makes it prefer the branch that spends the turn on the arm instead
 # when both options cost the same all-axis step.
 _J6_COST_WEIGHT = 0.5
+# What it costs the branch search to exceed `stroke.max_j6_step_deg` on one move. Sized an
+# order of magnitude above any real alternative (the largest plausible step is a 360 deg
+# wrist turn), so the search only accepts an over-cap J6 move when no branch avoids it.
+_J6_OVER_CAP_COST = 10_000.0
+# What crossing the wrist singularity costs the branch search: J5 = 0 is where J4 and J6
+# become collinear, and a joint move between a +J5 and a -J5 point passes through it. The
+# pinned T letter hides that switch from `_config_penalty`, so it is charged here.
+_WRIST_FLIP_COST_DEG = 1_000.0
 
 ROLE_COVERAGE = "coverage"
 ROLE_RETRACT = "retract"
@@ -586,7 +605,7 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
     if normal is not None and plane is not None and _crosses_direction(previous, entry):
         found = _cross_group(previous, entry, cfg, station, model, rotation,
                              normal=normal, plane=plane, visible=visible)
-        if found is not None and _route_allowed(found[0], kin):
+        if found is not None and _route_allowed([*found[0], entry], kin, cfg, previous):
             route, margin = found
             _record(plan, same, margin, rotation, 0.0, LEVEL_SAFE_PLANE, entry, cfg)
             return route
@@ -594,14 +613,14 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
     if limit <= 0 and same:
         margin, seen = _segment_margin(previous, entry, cfg, station, model,
                                        visible=visible)
-        if margin > 0.0 and seen:
+        if margin > 0.0 and seen and _route_allowed([entry], kin, cfg, previous):
             _record(plan, same, margin, rotation, 0.0, LEVEL_STRAIGHT, entry, cfg)
             return []
 
     if limit <= 1:
         found = _one_corner(previous, entry, cfg, station, model, rotation,
                             visible=visible, kin=kin, normal=normal)
-        if found is not None and _route_allowed(found[0], kin):
+        if found is not None and _route_allowed([*found[0], entry], kin, cfg, previous):
             points, margin = found
             _record(plan, same, margin, rotation, 0.0, LEVEL_ONE_CORNER, entry, cfg)
             return points
@@ -622,7 +641,7 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
     # `rate` is never a refusal either: how much rotation a millimetre of flight can absorb
     # rests on an uncalibrated constant, and dropping sweeps over it would make the plan look
     # legal by making it worse. Rate failures are recorded and counted instead.
-    reachable = _route_allowed(points, kin)
+    reachable = _route_allowed([*points, entry], kin, cfg, previous)
     legal = margin > 0.0 and reachable
     if not legal and normal is not None and plane is not None:
         # Last resort: leave through the common plane. The plane route used to be reserved
@@ -633,7 +652,7 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
         # cost a corner on a route that already worked.
         found = _cross_group(previous, entry, cfg, station, model, rotation,
                              normal=normal, plane=plane, visible=visible)
-        if found is not None and _route_allowed(found[0], kin):
+        if found is not None and _route_allowed([*found[0], entry], kin, cfg, previous):
             route, plane_margin = found
             _record(plan, same, plane_margin, rotation, 0.0, LEVEL_SAFE_PLANE, entry, cfg)
             return route
@@ -648,10 +667,20 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
         # delivered. It is recorded on its own line, never silent.
         direct, _seen = _segment_margin(previous, entry, cfg, station, model,
                                         visible=visible)
+        # ...but a direct move still has to obey the same two rules as a routed one: it may
+        # not pass through the part, and it may not leave the joint travel in the middle.
+        # The middle is the whole point of checking a MOVE - two legal corners joined by a
+        # line whose midpoint needs a reach the arm does not have is not a legal transit,
+        # whichever interpolation the controller picks.
+        move = _move_check(kin, previous, entry, cfg)
         plan.violations.append(
             f"the connector into stroke {entry.stroke_id} goes straight: no retract corner "
             f"the arm can hold was found on any route tried (direct clearance "
-            f"{direct:.1f} mm)")
+            f"{direct:.1f} mm"
+            + (", joint travel left at "
+               f"{100.0 * (move.at_fraction or 0.0):.0f}% of the move"
+               if move is not None and not move.ok else "")
+            + _refusal_note([*points, entry], kin, cfg, previous) + ")")
         _record(plan, same, direct, rotation, 0.0, LEVEL_STRAIGHT, entry, cfg)
         if strict and direct <= 0.0:
             # ...but "a move a programmer would write by hand" means a move that MISSES the
@@ -665,27 +694,119 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
                 f"{abs(direct):.1f} mm inside the geometry, so the sweep is dropped rather "
                 "than flown")
             return None
+        if strict and move is not None and not move.ok:
+            plan.violations.append(
+                f"the straight line into stroke {entry.stroke_id} is refused: its "
+                f"interpolated joints leave the travel ({move.reason}), so the sweep is "
+                "dropped rather than flown")
+            return None
         return []
     if strict and margin <= 0.0:
         return None
     return points
 
 
-def _route_allowed(points, kin) -> bool:
-    """Whether the arm can hold every transition corner a route would insert.
+def _refusal_note(chain, kin, cfg: PlannerConfig, start=None) -> str:
+    """Why a proposed route was refused, as the first corner or segment that failed.
 
-    Only the corners are tested, not the segments between them: a `J` move between two
-    reachable poses is not a pose problem, and pretending to check an interpolated joint
-    path that this library does not model would be worse than saying so. What this catches
-    is the real failure - a retract point behind the head that is inside the robot's own
-    base, where no branch exists.
+    "No retract corner the arm can hold was found" is the SYMPTOM and it used to be the
+    whole line: the four reasons a route dies - a corner outside the envelope, a joint move
+    that crosses the wrist singularity, a straight line that leaves the envelope halfway,
+    or the clearance gate - all read the same in the report. On the 2026-10-29 station that
+    ambiguity is what let four poses be dropped with no way to tell whether the retract was
+    too high or the ladder too steep. The reason costs a handful of memoised lookups and is
+    empty when the gate is off.
+    """
+    if kin is None or not getattr(kin, "active", False):
+        return ""
+    corners = ([start] if start is not None else []) + list(chain)
+    for index, point in enumerate(corners):
+        verdict = kin.check(point.position, point.axis, point.roll_deg)
+        if not verdict.ok:
+            role = "start" if index == 0 else f"corner {index}"
+            reason = str(getattr(verdict, "reason", "no solution"))
+            return (f"; the route was refused earlier: the {role} "
+                    f"({getattr(point, 'role', 'point')}) has no solution inside the "
+                    f"envelope ({reason})")
+    for index, (first, second) in enumerate(zip(corners, corners[1:], strict=False)):
+        verdict = _move_check(kin, first, second, cfg)
+        if verdict is not None and not verdict.ok:
+            share = ("" if verdict.at_fraction is None
+                     else f" at {100.0 * verdict.at_fraction:.0f}% of it")
+            return (f"; the route was refused earlier: its {len(corners) - 1} corner(s) are "
+                    f"holdable but the {_segment_motion(first, second, cfg)} move into "
+                    f"corner {index + 1} leaves the travel ({verdict.reason}{share})")
+    return ""
+
+
+def _route_allowed(points, kin, cfg: PlannerConfig | None = None, start=None) -> bool:
+    """Whether the arm can hold every corner AND every inch of a proposed route.
+
+    Two questions, and the second one is the one that was missing: a corner the arm cannot
+    hold is obviously fatal, but both corners of a move can be perfectly legal while the
+    MIDDLE of the move is not. A wrist that has to unwind, or a reach that has to straighten
+    to get from one side to the other, passes through joints that were never checked - and
+    the controller interpolates the whole segment whatever the corners look like. The site's
+    rule is that nothing in the program may leave the travel, so the segment is checked too.
+
+    `start` is the point the route begins at (the previous corner); without it only the
+    corners of the route itself are judged. The motion of each segment follows
+    :func:`_segment_motion`, i.e. the same rule the exporter writes into the program, so a
+    joint move is judged as a joint move and a sweep as a straight line.
     """
     if kin is None or not kin.active:
         return True
-    for point in points:
+    corners = list(points)
+    for point in corners:
         if not kin.check(point.position, point.axis, point.roll_deg).ok:
             return False
+    if cfg is None:
+        return True
+    chain = ([start] if start is not None else []) + corners
+    for first, second in zip(chain, chain[1:], strict=False):
+        verdict = _move_check(kin, first, second, cfg)
+        if verdict is not None and not verdict.ok:
+            return False
     return True
+
+
+def _move_check(kin, first: PathPoint, second: PathPoint, cfg: PlannerConfig):
+    """`kin.move(...)` for the motion these two points are flown with, or None.
+
+    None means "no move model available": a gate that only knows how to judge a POSE (a
+    test double, or any caller that supplied its own) must not turn the segment check into
+    an attribute error, and treating it as "no objection" is the same contract this module
+    has always had when `kin` is None.
+    """
+    if kin is None or not getattr(kin, "active", False):
+        return None
+    move = getattr(kin, "move", None)
+    if move is None:
+        return None
+    return move(first, second, motion=_segment_motion(first, second, cfg))
+
+
+def _segment_motion(first: PathPoint, second: PathPoint, cfg: PlannerConfig) -> str:
+    """Which interpolation the delivered program uses between these two points.
+
+    Mirrors `roboguide.adapt.export` exactly, and that reference is the point: the exporter
+    marks a point as part of a sweep only when it carries the SAME `stroke_id` as the
+    coverage point before it, and writes `L` for that one instruction only. Everything else
+    in a stroke plan - including the move between two separate poses, which are zero-length
+    strokes with different ids - is a joint move. Judging such a move as a straight line
+    (the first version of this function did) makes the envelope check far too strict: on the
+    2026-10-29 station it dropped two sweeps whose only route was a direct joint move,
+    which cost a full percentage point of coverage.
+    """
+    same_sweep = (first.role == ROLE_COVERAGE and second.role == ROLE_COVERAGE
+                  and first.stroke_id is not None
+                  and first.stroke_id == second.stroke_id)
+    if same_sweep:
+        return "L"
+    if first.stroke_id is None and second.stroke_id is None:
+        # A pose-only deliverable: every move follows the configured motion.
+        return str(cfg.motion.type).upper()
+    return "J"
 
 
 def _crosses_direction(previous: PathPoint, entry: PathPoint) -> bool:
@@ -758,12 +879,12 @@ def _record(plan: PathPlan, same: bool, margin: float, rotation: float, rate: fl
             plan.violations.append(
                 f"re-orientation of {rotation:.0f} deg cannot be spread under "
                 f"{cfg.stroke.max_rot_deg_per_mm:g} deg/mm on the {level} route, within "
-                f"{_LIFT_FACTORS[-1] * cfg.stroke.retract_clearance_mm:g} mm of lift")
+                f"{_MAX_LIFT_FACTOR * cfg.stroke.retract_clearance_mm:g} mm of lift")
     if margin <= 0.0:
         plan.violations.append(
             f"the connector into stroke {entry.stroke_id} keeps {margin:.1f} mm of body "
             f"clearance on every route tried, up to "
-            f"{_LIFT_FACTORS[-1] * cfg.stroke.retract_clearance_mm:g} mm of lift")
+            f"{_MAX_LIFT_FACTOR * cfg.stroke.retract_clearance_mm:g} mm of lift")
 
 
 def _retract_point(previous: PathPoint, lift: float, direction=None) -> PathPoint:
@@ -796,6 +917,21 @@ def _retract_directions(previous: PathPoint, normal) -> list[np.ndarray]:
         # again would only double the ray casts
         if float(np.dot(back, plane_out)) < float(np.cos(np.deg2rad(25.0))):
             out.append(plane_out)
+    # Third: pull the head IN towards the robot, horizontally. The first two directions both
+    # make the arm reach further, and on a panel scanned at 2 m radius that is the one thing
+    # the envelope has no room for - a retract 80 mm up needs a straighter elbow, which is
+    # exactly the axis the far poses have least of. Moving back over the base shortens the
+    # reach instead of lengthening it. Physical, not a fudge: the head keeps its pose while
+    # it is pulled in, the clearance along that segment is checked like any other, and this
+    # is tried LAST so no route that already worked gets cheaper or closer to the fixture.
+    position = np.asarray(previous.position, dtype=float)
+    flat = np.array([position[0], position[1], 0.0])
+    length = float(np.linalg.norm(flat))
+    if length > _ZERO_MM:
+        inward = -flat / length
+        if all(float(np.dot(inward, other)) < float(np.cos(np.deg2rad(25.0)))
+               for other in out):
+            out.append(inward)
     return out
 
 
@@ -823,7 +959,7 @@ def _one_corner_along(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
                                      - np.asarray(retract.position, dtype=float)))
         if reach <= 0.0 or rotation / reach > cfg.stroke.max_rot_deg_per_mm:
             continue
-        if not _route_allowed([retract], kin):
+        if not _route_allowed([retract, entry], kin, cfg, previous):
             # A smaller lift is worth trying: the retract point only has to be reachable,
             # and 50 mm is far more likely to be than 400 mm. Testing the gate INSIDE the
             # lift search is what keeps the hard gate from rejecting a sweep whose only
@@ -868,9 +1004,12 @@ def _two_corners_along(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig
     for factor in _LIFT_FACTORS:
         lift = float(cfg.stroke.retract_clearance_mm) * factor
         retract = _retract_point(previous, lift, direction)
+        # The approach corner sits behind the NEXT entry along the SAME direction, so a route
+        # that pulls the head in towards the robot also arrives on that side instead of
+        # diving in along the optical axis the retract just left.
         through = PathPoint(
             position=np.asarray(entry.position, dtype=float)
-            - np.asarray(entry.axis, dtype=float) * lift,
+            + np.asarray(direction, dtype=float) * lift,
             axis=np.asarray(previous.axis, dtype=float),
             roll_deg=float(previous.roll_deg),
             role=ROLE_TRAVERSE if same else ROLE_REORIENT,
@@ -886,7 +1025,7 @@ def _two_corners_along(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig
             margin = min(margin, found)
             seen = seen and tracker_ok
         rate_ok = same or rate <= cfg.stroke.max_rot_deg_per_mm
-        reachable = _route_allowed([retract, through], kin)
+        reachable = _route_allowed([retract, through, entry], kin, cfg, previous)
         points = [retract, through]
         if margin > 0.0 and rate_ok and seen and reachable:
             return points, float(margin), 0.0
@@ -912,9 +1051,14 @@ class BranchAssignment:
     solutions: list = field(default_factory=list)
     failed: list[int] = field(default_factory=list)
     broken: list[int] = field(default_factory=list)
+    # Moves whose J6 turn exceeds `stroke.max_j6_step_deg`. Reported rather than dropped,
+    # like `broken`: no controller data supports a hard threshold, and a program with one
+    # large wrist turn is still executable - it is the turn the page is asked to look at.
+    j6_over: list[int] = field(default_factory=list)
     max_step_deg: float = 0.0
     max_step_at: int | None = None
     max_j6_step_deg: float = 0.0
+    max_j6_step_at: int | None = None
     min_margin_deg: float | None = None
     histogram: dict[str, int] = field(default_factory=dict)
 
@@ -923,8 +1067,9 @@ class BranchAssignment:
         return not self.failed and not self.broken
 
 
-def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
-                    ) -> BranchAssignment:
+def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float, *,
+                    j6_step_weight: float | None = None,
+                    max_j6_step_deg: float | None = None) -> BranchAssignment:
     """Pick a joint branch for every delivered point so the sequence jumps as little as it can.
 
     Picking the locally best branch at every point is the mistake this exists to prevent:
@@ -941,9 +1086,22 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
     round (J1 167 deg on the 2026-10-28 program, J3 159 deg on the way back in). Nothing in
     the delivery geometry models that swing, so it is paid for here - as a preference, not a
     ban: when the only solution for a point sits in another family, the path still takes it.
+
+    `j6_step_weight` is what one degree of J6 costs next to a degree of the worst axis. J6
+    is the one axis that turns the head about its own optical axis, so it is the one the
+    page asks to keep steady; the default weight is the pre-config constant. `max_j6_step_deg`
+    adds a charge an order of magnitude above any real alternative when a transition would
+    exceed it - so the search avoids it whenever a branch exists that does not - and the
+    moves that still exceed it are listed in `j6_over`.
+
+    A move INSIDE one sweep must also not change branch: both corners of a sweep are the same
+    pose, so any difference between their joint values is a discontinuity the controller
+    resolves by jumping - in the middle of the sweep the scan depends on.
     """
     if gate is None or not gate.active:
         return BranchAssignment()
+    weight = _J6_COST_WEIGHT if j6_step_weight is None else float(j6_step_weight)
+    cap = None if max_j6_step_deg is None else float(max_j6_step_deg)
     candidates = [gate.solutions(point.position, point.axis, point.roll_deg)
                   for point in points]
     if not points:
@@ -954,12 +1112,27 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
     total = [[0.0] * len(options) for options in candidates]
     parent: list[list[int]] = [[0] * len(options) for options in candidates]
     for index in range(1, len(candidates)):
+        same_sweep = (points[index].stroke_id is not None
+                      and points[index].stroke_id == points[index - 1].stroke_id
+                      and points[index].role == ROLE_COVERAGE
+                      and points[index - 1].role == ROLE_COVERAGE)
         for j, option in enumerate(candidates[index]):
             best = (float("inf"), 0)
             for k, previous in enumerate(candidates[index - 1]):
                 cost = (total[index - 1][k] + _step_between(previous, option)
-                        + _J6_COST_WEIGHT * _axis_step_between(previous, option, 5)
+                        + weight * _axis_step_between(previous, option, 5)
                         + _config_penalty(previous, option))
+                if same_sweep and _config_penalty(previous, option) > 0.0:
+                    # Inside a sweep the two corners ARE the same pose, so a branch change
+                    # is never a preference - it is a jump the scan would ride through.
+                    cost += _CONFIG_CHANGE_COST_DEG
+                if float(previous.joints_deg[4]) * float(option.joints_deg[4]) < 0.0:
+                    # A joint move interpolates J5 linearly, so a sign change sends the
+                    # wrist through the singularity - and the pinned T letter would hide
+                    # the switch from `_config_penalty` above.
+                    cost += _WRIST_FLIP_COST_DEG
+                if cap is not None and _axis_step_between(previous, option, 5) > cap:
+                    cost += _J6_OVER_CAP_COST
                 if cost < best[0]:
                     best = (cost, k)
             total[index][j] = best[0]
@@ -983,6 +1156,8 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
     j6_steps = [_axis_step_between(picked[index - 1], picked[index], 5)
                 for index in range(1, len(picked))]
     broken = [index + 1 for index, step in enumerate(steps) if step > max_step_deg]
+    j6_over = ([index + 1 for index, step in enumerate(j6_steps) if step > cap]
+               if cap is not None else [])
     worst = max(steps) if steps else 0.0
     margins = [item.min_margin_deg for item in picked if item is not None]
     histogram: dict[str, int] = {}
@@ -991,11 +1166,40 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
             key = item.config.split(",")[0].strip()
             histogram[key] = histogram.get(key, 0) + 1
     return BranchAssignment(
-        solutions=picked, failed=failed, broken=broken, max_step_deg=float(worst),
+        solutions=picked, failed=failed, broken=broken, j6_over=j6_over,
+        max_step_deg=float(worst),
         max_step_at=(int(np.argmax(steps)) + 1 if steps else None),
         max_j6_step_deg=(float(max(j6_steps)) if j6_steps else 0.0),
+        max_j6_step_at=(int(np.argmax(j6_steps)) + 1 if j6_steps else None),
         min_margin_deg=(float(min(margins)) if margins else None),
         histogram=histogram)
+
+
+def move_failures(points: Sequence[PathPoint], solutions: Sequence, gate,
+                  cfg: PlannerConfig) -> list[int]:
+    """Indices of delivered points whose INCOMING move leaves the deliverable envelope.
+
+    The corners are judged by `assign_branches` (they all have a solution) and the connector
+    routes are judged while they are built. What neither sees is the move between two
+    already-chosen points of the final sequence: a straight sweep between two corners of one
+    pose, or a pose-only plan's flight from one viewpoint to the next. Those are the moves
+    that can leave the travel halfway along, and they are exactly the ones the site's rule
+    ("no point and no motion outside the travel") is about.
+
+    A joint move is skipped: the envelope is a box, so its two corners settle it (the wrist
+    sign flip is charged in `assign_branches`, where the branch is chosen).
+    """
+    if gate is None or not gate.active:
+        return []
+    bad: list[int] = []
+    for index in range(1, len(points)):
+        first, second = points[index - 1], points[index]
+        if _segment_motion(first, second, cfg) != "L":
+            continue
+        verdict = _move_check(gate, first, second, cfg)
+        if verdict is not None and not verdict.ok:
+            bad.append(index)
+    return bad
 
 
 def _unwrap_along(solutions: Sequence, limits) -> list:
@@ -1114,11 +1318,17 @@ def transition_poses(plan: PathPlan, cfg: PlannerConfig) -> list[ScannerPose]:
 
 def prune(strokes: Sequence[Stroke], sets: Sequence[np.ndarray], chosen: Sequence[int],
           area_mm2, target_area_mm2: float, *, target_pct: float,
-          max_rounds: int) -> list[int]:
+          max_rounds: int, feature=None, feature_target_pct: float | None = None
+          ) -> list[int]:
     """Drop strokes the target does not need, cheapest contribution first.
 
     `target_pct` is the requirement (99%), not the achieved peak: pruning against the
     peak would be a no-op by construction.
+
+    `feature` / `feature_target_pct` are the second acceptance figure. Pruning that only
+    knew the area target would happily remove the one sweep that covers 30 % of the walls
+    while the panel still sits above its area number - the selection bought that sweep on
+    purpose, so it is not the pruner's to spend.
 
     Contributions are priced from a per-sample "how many kept strokes cover me" count, so
     a stroke's own share is the area where that count is exactly one. Removing it is then
@@ -1135,6 +1345,19 @@ def prune(strokes: Sequence[Stroke], sets: Sequence[np.ndarray], chosen: Sequenc
     for index in kept:
         counts[sets[index]] += 1
     total = float(area[counts > 0].sum())
+
+    feature_mask = None if feature is None else np.asarray(feature, dtype=bool)
+    feature_target = None
+    if feature_mask is not None and feature_target_pct is not None:
+        feature_total = float(area[feature_mask].sum())
+        if feature_total > 0.0:
+            feature_target = float(feature_target_pct) * feature_total / 100.0
+
+    def feature_hit(count_array) -> float:
+        if feature_mask is None:
+            return 0.0
+        return float(area[feature_mask & (count_array > 0)].sum())
+
     for _ in range(max(0, int(max_rounds))):
         if total <= target or not kept:
             break
@@ -1144,6 +1367,12 @@ def prune(strokes: Sequence[Stroke], sets: Sequence[np.ndarray], chosen: Sequenc
             lost = float(area[row[counts[row] == 1]].sum())
             if total - lost < target:
                 continue
+            if feature_target is not None:
+                # The candidate's own share of the HARD features: area it alone covers.
+                exclusive = row[counts[row] == 1]
+                feature_lost = float(area[exclusive[feature_mask[exclusive]]].sum())
+                if feature_hit(counts) - feature_lost < feature_target:
+                    continue
             if best is None or lost < best[0]:
                 best = (lost, index)
         if best is None:

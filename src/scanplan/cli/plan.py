@@ -39,6 +39,10 @@ def configure(subparsers) -> None:
                          help="acceptance coverage in percent, or 'none' to run until the "
                               "coverage stops growing; overrides the configuration for "
                               "this run")
+    planner.add_argument("--feature-target", dest="feature_target",
+                         help="acceptance coverage of the HARD features (walls, bends and "
+                              "the rim a clamp shades) in percent, or 'none' to drop that "
+                              "criterion; overrides the configuration for this run")
     planner.add_argument("--face", choices=FACES, help="which face of the blank to scan")
     planner.add_argument("--tracker", help="tracker pose 'x,y,z' if the station has none")
     planner.add_argument("--tracker-aim", help="tracker aim point 'x,y,z'")
@@ -96,19 +100,23 @@ def run(args, parser: argparse.ArgumentParser) -> int:
 
 def _apply_overrides(cfg, args, parser: argparse.ArgumentParser):
     """Apply the flags that are not part of the configuration file merge."""
-    if args.coverage_target is None:
-        return cfg
-    raw = str(args.coverage_target).strip().lower()
-    if raw in ("none", "null", ""):
-        value = None
-    else:
+    for name, key in (("coverage_target", "coverage_target_pct"),
+                      ("feature_target", "feature_coverage_pct")):
+        raw_value = getattr(args, name, None)
+        if raw_value is None:
+            continue
+        raw = str(raw_value).strip().lower()
+        if raw in ("none", "null", ""):
+            cfg = override(cfg, target={key: None})
+            continue
         try:
             value = float(raw)
         except ValueError:
-            parser.error(f"--coverage-target takes a percentage or 'none', not "
-                         f"{args.coverage_target!r}")
+            parser.error(f"--{name.replace('_', '-')} takes a percentage or 'none', "
+                         f"not {raw_value!r}")
             return cfg
-    return override(cfg, target={"coverage_target_pct": value})
+        cfg = override(cfg, target={key: value})
+    return cfg
 
 
 def _station_description(args, parser: argparse.ArgumentParser) -> StationDescription:

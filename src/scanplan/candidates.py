@@ -27,6 +27,7 @@ import numpy as np
 
 from .config import ScannerParams
 from .geometry import grid_dedupe, tangents, tilt_axis
+from .rolls import roll_for_axis
 from .scanner_model import ScannerPose
 
 
@@ -44,7 +45,8 @@ def aim_indices(points, grid_mm: float) -> np.ndarray:
     return np.sort(np.asarray(kept, dtype=np.int64))
 
 
-def ladder(point, normal, params: ScannerParams) -> list[ScannerPose]:
+def ladder(point, normal, params: ScannerParams, *, lock_roll: bool = False
+           ) -> list[ScannerPose]:
     """The poses aimed at one surface point: every distance, tilt, azimuth and roll.
 
     Every tilt gets every roll, including zero tilt. The roll does NOT change the optical
@@ -85,6 +87,14 @@ def ladder(point, normal, params: ScannerParams) -> list[ScannerPose]:
                     axis = inward
                 else:
                     axis = tilt_axis(inward, tangent, float(tilt_deg))
+                if lock_roll:
+                    # One roll convention for the whole program: the roll the strokes are
+                    # grown with (`rolls.roll_for_axis`). Mixing a pose at roll 0 with a
+                    # sweep at roll 90 puts a 90 deg J6 turn in the middle of the program
+                    # for nothing - measured on 2026-10-29 as four J6 steps of 74-95 deg.
+                    poses.append(ScannerPose(position=position.copy(), axis=axis.copy(),
+                                             roll_deg=roll_for_axis(axis)))
+                    continue
                 for roll_deg in params.rolls_deg:
                     poses.append(ScannerPose(position=position.copy(), axis=axis.copy(),
                                              roll_deg=float(roll_deg)))
@@ -140,6 +150,7 @@ def _cap(groups: list[list[ScannerPose]], limit: int) -> list[ScannerPose]:
 def generate(points, normals, params: ScannerParams, *, seed: int,
              aim_grid_mm: float | None = None, max_candidates: int | None = None,
              keep: Callable[[ScannerPose], bool] | None = None,
+             lock_roll: bool = False,
              progress: Callable[[int, int], None] | None = None,
              log: Callable[[str], None] | None = None) -> list[ScannerPose]:
     """Build the candidate pool: a ladder on every aim cell of the target.
@@ -162,7 +173,8 @@ def generate(points, normals, params: ScannerParams, *, seed: int,
     aims = aim_indices(points, grid)
     groups: list[list[ScannerPose]] = []
     for done, index in enumerate(aims):
-        ladder_poses = dedupe(ladder(points[index], normals[index], params))
+        ladder_poses = dedupe(ladder(points[index], normals[index], params,
+                                     lock_roll=lock_roll))
         if keep is not None:
             ladder_poses = [pose for pose in ladder_poses if keep(pose)]
         groups.append(ladder_poses)
@@ -181,6 +193,7 @@ def generate(points, normals, params: ScannerParams, *, seed: int,
 def refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
            max_candidates: int | None = None,
            keep: Callable[[ScannerPose], bool] | None = None,
+           lock_roll: bool = False,
            progress: Callable[[int, int], None] | None = None,
            log: Callable[[str], None] | None = None) -> list[ScannerPose]:
     """Aim a new ladder at what is still uncovered, on a finer grid than the face.
@@ -206,7 +219,8 @@ def refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
     aims = aim_indices(leak_points, params.refine_aim_grid_mm)
     groups: list[list[ScannerPose]] = []
     for done, index in enumerate(aims):
-        ladder_poses = dedupe(ladder(leak_points[index], leak_normals[index], params))
+        ladder_poses = dedupe(ladder(leak_points[index], leak_normals[index], params,
+                                     lock_roll=lock_roll))
         if keep is not None:
             ladder_poses = [pose for pose in ladder_poses if keep(pose)]
         groups.append(ladder_poses)
@@ -216,4 +230,99 @@ def refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
     pool = _cap(groups, limit)
     say(f"  refinement: {len(aims)} leak aim points on a "
         f"{params.refine_aim_grid_mm:g} mm grid -> {len(pool)} candidates")
+    return pool
+
+
+def feature_ladder(point, normal, params: ScannerParams, *,
+                   lock_roll: bool = False) -> list[ScannerPose]:
+    """The poses aimed at ONE hard feature: tilted almost to the incidence limit.
+
+    A wall or a clamped rim is not merely under-served by the head-on ladder, it is
+    unreachable by it: the footprint of a head-on pose lies parallel to the wall, so its own
+    surface is at 90 degrees of incidence a few millimetres off the bend, and the rim beside
+    a clamp is shaded for the same geometric reason. What does reach them is the same ladder
+    tilted a long way off the normal from the free side, and that side is not known in
+    advance - the clamp is on one side and open air on the other - so the tilt is swept all
+    the way round in `feature_tilt_azimuths` steps, both signs.
+
+    The roll is fixed at 0. A tilted pose is already a compromise on incidence, and its
+    second roll (90 degrees) would add a 90 degree J6 turn for area the head-on sweep covers
+    anyway - the one axis the page asked to keep still.
+
+    The tilt magnitudes come from `feature_tilts_deg`, which the configuration validates to
+    stay BELOW `max_incidence_deg`: a tilt at the limit sees the sample it was aimed at at
+    zero cosine, i.e. it cannot see it at all.
+    """
+    point = np.asarray(point, dtype=float).reshape(3)
+    normal = np.asarray(normal, dtype=float).reshape(3)
+    normal = normal / np.linalg.norm(normal)
+    first_tangent, second_tangent = tangents(normal)
+    inward = -normal
+    azimuths = max(1, int(params.feature_tilt_azimuths))
+
+    poses: list[ScannerPose] = []
+    for distance in params.distances_mm:
+        position = point + normal * distance
+        # head-on first: a leak aim is not always a wall, sometimes the coarse aim grid
+        # simply skipped the cell this sample sits in.
+        poses.append(ScannerPose(position=position.copy(), axis=inward.copy(),
+                                 roll_deg=_feature_roll(inward, lock_roll)))
+        for index in range(azimuths):
+            turn = np.pi * index / azimuths
+            tangent = np.cos(turn) * first_tangent + np.sin(turn) * second_tangent
+            for tilt_deg in params.feature_tilts_deg:
+                for sign in (1.0, -1.0):
+                    axis = tilt_axis(inward, tangent, sign * float(tilt_deg))
+                    poses.append(ScannerPose(position=position.copy(), axis=axis.copy(),
+                                             roll_deg=_feature_roll(axis, lock_roll)))
+    return poses
+
+
+def _feature_roll(axis, lock_roll: bool) -> float:
+    """The roll a hard-feature pose is written with: 0, or the axis's own roll.
+
+    `lock_roll` follows the same convention as every other family, so a tilted sweep does
+    not arrive 90 deg twisted relative to its neighbours - a twist is a J6 turn, and the
+    page asked for those to stay small.
+    """
+    return float(roll_for_axis(axis)) if lock_roll else 0.0
+
+
+def feature_refine(leak_points, leak_normals, params: ScannerParams, *, seed: int,
+                   max_candidates: int | None = None,
+                   keep: Callable[[ScannerPose], bool] | None = None,
+                   lock_roll: bool = False,
+                   progress: Callable[[int, int], None] | None = None,
+                   log: Callable[[str], None] | None = None) -> list[ScannerPose]:
+    """A tilted pool aimed at the hard leftovers, capped the same way as every other pool.
+
+    `keep` (the joint gate) filters BEFORE the cap and the cap takes one pose per aim in
+    turn, so a wall whose best tilt the arm cannot hold does not starve its neighbours of
+    candidates. The aim grid is `feature_aim_grid_mm`, finer than the face grid because a
+    wall is a few millimetres wide.
+    """
+    say = log or (lambda _message: None)
+    leak_points = np.asarray(leak_points, dtype=float).reshape(-1, 3)
+    leak_normals = np.asarray(leak_normals, dtype=float).reshape(-1, 3)
+    if len(leak_points) == 0:
+        return []
+    if len(leak_points) != len(leak_normals):
+        raise ValueError("leak points and normals must be the same length")
+
+    aims = aim_indices(leak_points, params.feature_aim_grid_mm)
+    groups: list[list[ScannerPose]] = []
+    for done, index in enumerate(aims):
+        poses = dedupe(feature_ladder(leak_points[index], leak_normals[index], params,
+                                      lock_roll=lock_roll))
+        if keep is not None:
+            poses = [pose for pose in poses if keep(pose)]
+        groups.append(poses)
+        if progress is not None:
+            progress(done + 1, len(aims))
+    limit = int(params.max_candidates if max_candidates is None else max_candidates)
+    pool = _cap(groups, limit)
+    say(f"  hard features: {len(aims)} aim points on a "
+        f"{params.feature_aim_grid_mm:g} mm grid x "
+        f"{max(1, int(params.feature_tilt_azimuths))} tilt azimuth(s) x "
+        f"{len(params.feature_tilts_deg)} tilt(s) -> {len(pool)} candidates")
     return pool

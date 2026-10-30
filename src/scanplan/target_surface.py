@@ -53,12 +53,21 @@ class SampleSet:
 
 @dataclass(frozen=True)
 class TargetSet:
-    """What must be measured, and what was exempted and why."""
+    """What must be measured, what was exempted and why, and which samples are hard.
+
+    `features` marks the samples a head-on sweep cannot follow: the side walls and bends of
+    the stamping (a surface whose normal leans far off the face's dominant normal) and the
+    rim a clamp shades (anything close to the fixture or the base). It exists because the
+    AREA target cannot ask for them: a wall is a few tenths of a percent of a 1 m2 panel, so
+    a 97 % plan can leave every wall unscanned and still meet its number.
+    """
 
     face: str
     samples: SampleSet
     exempt: SampleSet
     face_area_mm2: float
+    features: np.ndarray | None = None
+    dominant_normal: np.ndarray | None = None
 
 
 def face_mesh(part, mask) -> trimesh.Trimesh:
@@ -111,6 +120,56 @@ def fixture_contact_mask(points, normals, station: Station, *,
     return (distance < distance_mm) & outward
 
 
+def dominant_normal(normals, area_mm2=None) -> np.ndarray:
+    """The area-weighted mean normal of a face: which way the panel mostly faces.
+
+    Area-weighted on purpose - a fine mesh around a small flange must not outvote the
+    panel it is attached to. The mean can be short when the face folds back on itself, so
+    a zero-length answer falls back to the first sample's normal rather than exploding.
+    """
+    values = np.asarray(normals, dtype=float).reshape(-1, 3)
+    if len(values) == 0:
+        raise ValueError("no normals to average")
+    weights = (np.ones(len(values)) if area_mm2 is None
+               else np.asarray(area_mm2, dtype=float))
+    total = (values * weights[:, None]).sum(axis=0)
+    length = float(np.linalg.norm(total))
+    if length <= 1e-9:
+        total = values[0]
+        length = float(np.linalg.norm(total))
+    return total / length
+
+
+def feature_mask(points, normals, station: Station, *, wall_deg: float = 45.0,
+                 clearance_mm: float = 15.0, dominant=None) -> np.ndarray:
+    """Which target samples are HARD: walls, bends, and the rim a clamp shades.
+
+    Two independent reasons, because the two failures look nothing alike in the viewer:
+
+    * a surface that leans more than `wall_deg` off the face's dominant normal is a forming
+      wall or a bend. A head-on sweep's footprint lies parallel to it and the incidence
+      limit is passed within a few millimetres of the bend, so it needs a tilted pass;
+    * a sample within `clearance_mm` of the fixture or the base is partly shaded by it,
+      whatever its own normal says. Those are the samples a tilted pass has to look past
+      the clamp to see.
+
+    Deliberately geometric and independent of the uncovered reasons: this set is decided
+    BEFORE any pose is tried, so it cannot quietly shrink to whatever the pool happened to
+    reach.
+    """
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    normals = np.asarray(normals, dtype=float).reshape(-1, 3)
+    if len(points) == 0:
+        return np.zeros(0, dtype=bool)
+    direction = (dominant_normal(normals) if dominant is None
+                 else np.asarray(dominant, dtype=float).reshape(3))
+    length = float(np.linalg.norm(direction))
+    direction = direction / length if length > 1e-9 else direction
+    leaning = (normals @ direction) < float(np.cos(np.deg2rad(wall_deg)))
+    close = station.clearance_mm(points) <= float(clearance_mm)
+    return np.asarray(leaning | close, dtype=bool)
+
+
 def build_target(part, split: SheetSplit, face: str, station: Station,
                  cfg: PlannerConfig | TargetParams, *, seed: int | None = None,
                  log: Callable[[str], None] | None = None) -> TargetSet:
@@ -147,6 +206,7 @@ def build_target(part, split: SheetSplit, face: str, station: Station,
         f"({100.0 * contact.mean():.3f}% = {contact.mean() * face_area:.0f} mm2) within "
         f"{distance:.1f} mm and on the outward side")
 
+    direction = dominant_normal(all_samples.normals, all_samples.area_mm2)
     if not contact.any():
         return TargetSet(
             face=face,
@@ -155,16 +215,37 @@ def build_target(part, split: SheetSplit, face: str, station: Station,
                              area_mm2=np.zeros(0), total_area_mm2=0.0,
                              reasons=np.zeros(0, dtype=object)),
             face_area_mm2=face_area,
+            features=_features(all_samples, station, params, dominant=direction),
+            dominant_normal=direction,
         )
 
     kept = _select(all_samples, ~contact)
     exempt = _select(all_samples, contact)
+    direction = dominant_normal(kept.normals, kept.area_mm2)
+    keeping = _features(kept, station, params, dominant=direction)
+    say(f"  hard features: {int(keeping.sum())} samples "
+        f"({100.0 * keeping.mean():.1f}% of the face, "
+        f"{kept.area_mm2[keeping].sum() / 1e6:.4f} m2) - walls beyond "
+        f"{params.feature_wall_deg:g} deg or within {params.feature_clearance_mm:g} mm of "
+        "the fixture")
     return TargetSet(
         face=face,
         samples=_with_reasons(kept, "target"),
         exempt=_with_reasons(exempt, "fixture_contact"),
         face_area_mm2=face_area,
+        features=keeping,
+        dominant_normal=direction,
     )
+
+
+def _features(samples: SampleSet, station: Station, params: TargetParams, *,
+              dominant=None) -> np.ndarray:
+    """`feature_mask` with the configured thresholds, or all-False when switched off."""
+    if params.feature_coverage_pct is None:
+        return np.zeros(len(samples.points), dtype=bool)
+    return feature_mask(samples.points, samples.normals, station,
+                        wall_deg=params.feature_wall_deg,
+                        clearance_mm=params.feature_clearance_mm, dominant=dominant)
 
 
 def _select(samples: SampleSet, mask: np.ndarray) -> SampleSet:

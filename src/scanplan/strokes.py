@@ -45,7 +45,7 @@ from .config import PlannerConfig
 from .coverage import CoverageResult
 from .geometry import tangents, unit
 from .rolls import roll_for_axis
-from .scanner_model import ScannerModel, ScannerPose, measure_mask
+from .scanner_model import ScannerModel, ScannerPose, measure_near
 from .scene import Station
 from .target_surface import SampleSet
 
@@ -303,9 +303,24 @@ class StrokeBuilder:
     # -- coverage primitives -------------------------------------------------
 
     def mask_at(self, pose: ScannerPose) -> np.ndarray:
-        """Which samples this one pose covers, all six conditions applied."""
-        return measure_mask(self.model, pose, self.points, self.normals, self.obstacles,
-                            occlusion_tol_mm=self.cfg.occlusion_tol_mm)
+        """Which samples this one pose covers, all six conditions applied.
+
+        Restricted to the samples the pose could reach at all (a KD-tree ball of the
+        scanner's far range), which is an exact optimisation and not a coarser one: a sample
+        beyond that range fails the range test anyway. Growth calls this for every seed and
+        every coverage step, so on a real part it is the stage's hot spot.
+        """
+        return measure_near(self.model, pose, self.points, self.normals, self.obstacles,
+                            occlusion_tol_mm=self.cfg.occlusion_tol_mm, tree=self.tree)
+
+    @property
+    def tree(self):
+        """The sample KD-tree, built once (it is also what `_neighbourhood` queries)."""
+        if self._tree is None and len(self.points):
+            from scipy.spatial import cKDTree
+
+            self._tree = cKDTree(self.points)
+        return self._tree
 
     def fits_at(self, positions) -> tuple[bool, float]:
         """Condition 5 over a set of positions: `(all fit, smallest margin in mm)`."""
@@ -396,14 +411,11 @@ class StrokeBuilder:
 
     def _neighbourhood(self, position) -> np.ndarray:
         """Indices of the samples close enough to be inside the scanner's range."""
-        if self._tree is None:
-            from scipy.spatial import cKDTree
-
-            self._tree = cKDTree(self.points) if len(self.points) else None
-        if self._tree is None:
+        tree = self.tree
+        if tree is None:
             return np.zeros(0, dtype=np.int64)
-        found = self._tree.query_ball_point(np.asarray(position, dtype=float).reshape(3),
-                                            float(self.cfg.scanner.range_mm[1]) + 1e-6)
+        found = tree.query_ball_point(np.asarray(position, dtype=float).reshape(3),
+                                      float(self.cfg.scanner.range_mm[1]) + 1e-6)
         return np.asarray(found, dtype=np.int64)
 
     # -- generation ---------------------------------------------------------
@@ -655,8 +667,73 @@ class StrokeBuilder:
             f"{len(unique)} kept (<= {self.params.max_stroke_mm:g} mm each)")
         return unique
 
-    # -- evaluation ---------------------------------------------------------
+    def feature_seeds(self, points, normals, *, spacing_mm: float,
+                      seed_offset: int = 0) -> list[tuple[ScannerPose, int]]:
+        """Seeds for the hard-feature pass: tilted almost to the limit, from a few sides.
 
+        A head-on seed cannot sweep a wall - the footprint lies parallel to it - and the
+        existing side-scan family tilts about ONE tangent only, which is the right guess for
+        a wall whose free side happens to be that way and the wrong one for a wall beside a
+        clamp. Here the tilt is swept all the way round the normal.
+
+        Deliberately smaller than the candidate pass: every third azimuth and the widest
+        configured tilt, at the widest configured spacing. Each seed costs a growth (a
+        handful of footprint evaluations plus the extension walk), and growth itself throws
+        away every seed whose sweep does not pay - so a dozen seeds per aim is the useful
+        density, not a hundred.
+
+        The roll is 0 for the same reason as in `candidates.feature_ladder`: a tilted pose is
+        already a compromise, and a quarter turn about its axis would add a 90 degree J6 turn
+        to the re-positioning moves.
+        """
+        from .candidates import aim_indices
+        from .geometry import tilt_axis
+
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        normals = np.asarray(normals, dtype=float).reshape(-1, 3)
+        tilts = tuple(float(value) for value in self.cfg.scanner.feature_tilts_deg)
+        if len(points) == 0 or not tilts or float(spacing_mm) <= 0.0:
+            return []
+        tilt = max(tilts)
+        azimuths = max(1, int(self.cfg.scanner.feature_tilt_azimuths))
+        stride = max(1, azimuths // 4)
+        distance = float(self.cfg.scanner.standoff_mm)
+        chosen: list[tuple[ScannerPose, int]] = []
+        for index in aim_indices(points, float(spacing_mm)):
+            normal = unit(normals[index])
+            first, second = tangents(normal)
+            for step in range(0, azimuths, stride):
+                turn = np.pi * step / azimuths
+                tangent = np.cos(turn) * first + np.sin(turn) * second
+                for sign in (1.0, -1.0):
+                    axis = -tilt_axis(-normal, tangent, sign * tilt)
+                    # Same roll convention as every other seed family: a tilted sweep that
+                    # arrives 90 deg twisted is a 90 deg J6 turn for nothing.
+                    roll = roll_for_axis(axis) if self.params.lock_roll else 0.0
+                    chosen.append((ScannerPose(
+                        position=points[index] + normal * distance,
+                        axis=axis, roll_deg=roll), int(index) + int(seed_offset)))
+        return chosen
+
+    def generate_feature(self, points, normals, *, spacing_mm: float,
+                         seed_offset: int = 0,
+                         progress: Callable[[int, int], None] | None = None,
+                         log: Callable[[str], None] | None = None) -> list[Stroke]:
+        """Grow the hard-feature seeds into strokes, by the same rule as every other family."""
+        say = log or (lambda _message: None)
+        seeds = self.feature_seeds(points, normals, spacing_mm=spacing_mm,
+                                   seed_offset=seed_offset)
+        grown: list[Stroke] = []
+        for done, (seed, index) in enumerate(seeds):
+            grown.extend(self.grow(seed, index))
+            if progress is not None:
+                progress(done + 1, len(seeds))
+        unique = dedupe(grown, self.params.dedupe_mm)
+        say(f"  feature stroke generation: {len(seeds)} seeds -> {len(grown)} grown -> "
+            f"{len(unique)} kept")
+        return unique
+
+    # -- evaluation ---------------------------------------------------------
     def evaluate(self, strokes: Sequence[Stroke], *,
                  progress: Callable[[int, int], None] | None = None,
                  log: Callable[[str], None] | None = None) -> StrokeCoverage:
@@ -799,4 +876,8 @@ def combine(pool: CoverageResult, strokes_cov: StrokeCoverage) -> CoverageResult
                                    np.asarray(strokes_cov.tracker_ok, dtype=bool)]),
         counters=counters, n_targets=pool.n_targets, area_mm2=pool.area_mm2,
         target_area_mm2=pool.target_area_mm2,
+        # The hard-feature mask indexes TARGET samples, so it survives the merge unchanged -
+        # but it has to be carried explicitly, or the grouped selection silently loses the
+        # criterion and the report cannot say how much of the wall was covered.
+        feature=pool.feature,
     )

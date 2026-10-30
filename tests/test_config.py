@@ -27,6 +27,45 @@ def test_shipped_config_loads_with_placeholder_incidence():
     assert cfg.seed == 7
 
 
+def test_the_hard_feature_and_motion_knobs_are_shipped_with_their_values():
+    """The second acceptance figure and the two motion limits, pinned as shipped."""
+    cfg = load_config()
+    assert cfg.target.feature_coverage_pct == 95.0
+    assert cfg.target.feature_wall_deg == 45.0
+    assert cfg.target.feature_clearance_mm == 15.0
+    # a tilt AT the incidence limit cannot see the sample it is aimed at
+    assert max(cfg.scanner.feature_tilts_deg) < cfg.scanner.max_incidence_deg
+    assert cfg.scanner.feature_tilt_azimuths == 12
+    assert cfg.scanner.feature_rounds == 1
+    assert cfg.stroke.j6_step_weight == 1.5
+    assert cfg.stroke.max_j6_step_deg == 60.0
+    assert cfg.robot.motion_check_step_mm == 50.0
+    assert cfg.robot.motion_check_step_deg == 10.0
+    # a collinear elbow is the posture the controller refuses (MOTN-018), so room is kept
+    assert cfg.robot.elbow_margin_deg == 10.0
+    # the non-scanning joint moves turn the wrist, so they have their own slow speed
+    assert cfg.motion.joint_speed == "5%"
+
+
+def test_a_feature_tilt_at_the_incidence_limit_is_refused(tmp_path):
+    bad = tmp_path / "tilt.json"
+    bad.write_text(json.dumps({"scanner": {"feature_tilts_deg": [45.0]}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="feature_tilts_deg"):
+        load_config(bad)
+
+
+def test_a_joint_speed_must_be_a_percentage(tmp_path):
+    """FANUC refuses a mm/sec rate on a joint instruction, so a rate is refused here."""
+    for value in ("100 mm/sec", "0%", "120%", "fast"):
+        bad = tmp_path / "speed.json"
+        bad.write_text(json.dumps({"motion": {"joint_speed": value}}), encoding="utf-8")
+        with pytest.raises(ValueError, match="joint_speed"):
+            load_config(bad)
+    good = tmp_path / "ok.json"
+    good.write_text(json.dumps({"motion": {"joint_speed": "2.5%"}}), encoding="utf-8")
+    assert load_config(good).motion.joint_speed == "2.5%"
+
+
 def test_override_file_replaces_only_what_it_names(tmp_path):
     override = tmp_path / "c.json"
     override.write_text(json.dumps({"scanner": {"max_incidence_deg": 55.0}}), encoding="utf-8")
@@ -67,10 +106,7 @@ def test_a_typo_in_a_key_name_is_rejected(tmp_path):
 
 def test_the_acceptance_threshold_is_a_configurable_nullable_setting(tmp_path):
     cfg = load_config()
-    # 97 is the shipped bar: it is the highest target the MIXED deliverable (sweeps plus
-    # poses) reaches on the site station - 97.75% in 28 corners, the shape of the program
-    # that ran on the cell. A 99% bar buys 1.3 more points for 43 extra corners and no sweep.
-    assert cfg.target.coverage_target_pct == 97.0
+    assert cfg.target.coverage_target_pct == 99.0
     assert cfg.target.delivery_mode == "path"
     # null is the switch back to "run until nothing new is covered", so it must survive
     # the loader rather than being coerced
@@ -136,7 +172,7 @@ def test_a_runtime_override_is_validated_like_a_file():
     cfg = load_config()
     tightened = override(cfg, target={"coverage_target_pct": 97.5})
     assert tightened.target.coverage_target_pct == pytest.approx(97.5)
-    assert cfg.target.coverage_target_pct == 97.0          # the original is untouched
+    assert cfg.target.coverage_target_pct == 99.0          # the original is untouched
     with pytest.raises(ValueError, match="coverage_target_pct"):
         override(cfg, target={"coverage_target_pct": 0.0})
 

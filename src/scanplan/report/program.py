@@ -13,6 +13,10 @@ def program_block(config: PlannerConfig, viewpoints, path: PathPlan | None) -> d
         "motion": config.motion.type,
         "termination": config.motion.termination,
         "speed_mm_s": config.motion.speed_mm_s,
+        "joint_speed": config.motion.joint_speed,
+        "joint_speed_note": (
+            "speed of the joint (J) moves that do not scan - the instructions that turn the "
+            "wrist between sweeps, up to 180 deg of J6 in one move"),
         "speed_note": ("set on the floor and deliberately not optimised here: scan speed "
                        "is a site setting, not a planning variable"),
         "delivery_mode": config.target.delivery_mode,

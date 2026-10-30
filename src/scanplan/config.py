@@ -16,6 +16,7 @@ mistyped parameter would otherwise leave a placeholder silently in force.
 from __future__ import annotations
 
 import json
+import re
 import types
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
@@ -60,6 +61,15 @@ class ScannerParams:
     max_candidates: int
     refine_rounds: int
     refine_aim_grid_mm: float
+    # The hard-feature pass. A wall, a bend and the rim beside a clamp are not scanned by
+    # the head-on ladder at all: its footprint lies parallel to the wall and the incidence
+    # limit bites within a few millimetres. What reaches them is a head tilted almost to
+    # that limit from the free side, so this family is generated on its own, aimed only at
+    # the leftovers, and never competes with the head-on ladder for area it already covers.
+    feature_tilts_deg: tuple[float, ...]
+    feature_tilt_azimuths: int
+    feature_aim_grid_mm: float
+    feature_rounds: int
 
 
 @dataclass(frozen=True)
@@ -96,6 +106,17 @@ class TargetParams:
     delivery_mode: str
     surface_bias: float
     max_points: int | None
+    # The second acceptance figure, and it exists because the area target cannot express
+    # it: a wall is a fraction of a percent of a 1 m2 panel, so a 97 % area plan can leave
+    # every side wall unscanned and still meet its number. `feature_coverage_pct` is the
+    # share of the hard features - walls, bends and the rim beside a clamp - that must be
+    # covered for the run to count as done. null switches the criterion off.
+    feature_coverage_pct: float | None
+    # What counts as a hard feature: a surface whose normal leans further than this off the
+    # face's dominant normal, or a sample closer than `feature_clearance_mm` to the fixture
+    # or base (the region a clamp shades).
+    feature_wall_deg: float
+    feature_clearance_mm: float
 
 
 @dataclass(frozen=True)
@@ -200,6 +221,15 @@ class StrokeParams:
     pool_mode: str
     side_scan_tilt_deg: float
     require_sweeps: bool
+    # J6 is the axis that turns the head about its own optical axis. It is constant inside
+    # a sweep by construction (one pose), and between sweeps the branch search is what
+    # decides how much of the turn to spend there. `j6_step_weight` is what one degree of
+    # J6 costs next to a degree of the worst other axis, and `max_j6_step_deg` is the turn
+    # a repositioning move should stay under - a review trigger like `robot.max_step_deg`,
+    # weighted hard in the search (so it is avoided whenever a branch exists) and reported
+    # when it cannot be.
+    j6_step_weight: float
+    max_j6_step_deg: float
 
 
 @dataclass(frozen=True)
@@ -208,11 +238,17 @@ class MotionParams:
 
     Speed is a floor setting, not a planning variable; it is carried here only so the
     program has one source for it instead of a flag and a config that can disagree.
+
+    `joint_speed` is the speed of the moves that do NOT scan. In a stroke plan those are
+    joint (`J`) moves, and they are the ones that turn the wrist between sweeps - a 90 deg
+    J6 turn at 50 % is a violent move that no scan needs, so it has its own setting. A
+    percentage is required: FANUC refuses a mm/sec rate on a joint instruction.
     """
 
     type: str
     termination: str
     speed_mm_s: float
+    joint_speed: str = "5%"
 
 
 def usable_limits(mechanical_deg, soft_deg, usage_frac: float = 1.0):
@@ -311,6 +347,20 @@ class RobotParams:
     j5_min_abs_deg: float
     max_step_deg: float
     wrist_identified: bool
+    # How finely an interpolated MOVE is sampled when it is checked against the envelope.
+    # `max_step_deg` judges the corners; a move between two legal corners can still leave
+    # the envelope in between (a wrist that unwinds, a reach that straightens), and the
+    # controller interpolates the whole segment whatever the corners look like. Sampled at
+    # both steps - the Cartesian length and the rotation angle - and the tighter of the two
+    # counts, because an in-place 180 deg turn covers no millimetres at all.
+    motion_check_step_mm: float = 50.0
+    motion_check_step_deg: float = 10.0
+    # How far the elbow may be from fully straight or fully folded. `bend -> 0` (and
+    # `bend -> 180`) is where the two links are collinear: the closed form still returns a
+    # number, but it is the posture our fitted geometry describes worst, and the controller
+    # refuses it with MOTN-018 rather than solving it. The 2026-10-29 program carried a
+    # point at `bend = 8.4 deg` and ROBOGUIDE stopped there.
+    elbow_margin_deg: float = 10.0
     # The third letter of every CONFIG string: "auto" follows the measured rule (`T` for
     # J5 < 0, 8 pendant-labelled poses on 2026-10-23), "T"/"F" pins it. This cell needs "T":
     # its ROBOGUIDE refuses an `N U F, ...` block at import with ASBN-023 "Configuration
@@ -348,6 +398,11 @@ class RobotParams:
                              (-360.0, 360.0), (-125.0, 125.0), (-360.0, 360.0)),
             limits_usage_frac=1.0,
             joint_margin_deg=5.0, j5_min_abs_deg=8.0, max_step_deg=40.0,
+            # A gate that is off applies no delivery filters, and this one is a filter
+            # (`Robot.solutions` uses it to throw away collinear-elbow postures). The shipped
+            # configuration sets 10 deg; leaving it at 0 here keeps `Robot` a pure geometry
+            # model for callers that asked for no gating.
+            elbow_margin_deg=0.0,
             wrist_identified=True,
             config_wrist_letter="auto",
             allowed_configs=(),
@@ -671,6 +726,18 @@ def _validate(config: PlannerConfig) -> None:
                          "the ladder unable to tilt at all")
     if scanner.refine_rounds < 0:
         raise ValueError("'refine_rounds' cannot be negative")
+    if scanner.feature_rounds < 0:
+        raise ValueError("'feature_rounds' cannot be negative")
+    if scanner.feature_tilt_azimuths < 1:
+        raise ValueError("'feature_tilt_azimuths' must be at least 1")
+    if scanner.feature_aim_grid_mm <= 0.0:
+        raise ValueError("'feature_aim_grid_mm' must be positive")
+    for tilt in scanner.feature_tilts_deg:
+        if not 0.0 <= tilt < scanner.max_incidence_deg:
+            raise ValueError(
+                f"'feature_tilts_deg' entry {tilt:g} is outside [0, "
+                f"{scanner.max_incidence_deg:g}): a tilt at or past the incidence limit "
+                "cannot see the sample it is aimed at, so it would only cost rays")
     if scanner.standoff_mm <= 0.0 or target.sample_grid_mm <= 0.0:
         raise ValueError("'standoff_mm' and 'sample_grid_mm' must be positive")
     if scanner.fov_anchor_distance_mm <= 0.0:
@@ -700,6 +767,12 @@ def _validate(config: PlannerConfig) -> None:
                          f"not {config.motion.termination!r}")
     if config.motion.speed_mm_s <= 0.0:
         raise ValueError("'motion.speed_mm_s' must be positive")
+    joint_speed = str(config.motion.joint_speed).strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)?%", joint_speed) \
+            or not 0.0 < float(joint_speed[:-1]) <= 100.0:
+        raise ValueError(f"'motion.joint_speed' must be a percentage in (0, 100] such as "
+                         f"'5%', not {config.motion.joint_speed!r}: a joint instruction "
+                         "cannot take a mm/sec rate")
 
 
 def _validate_strokes(stroke: StrokeParams) -> None:
@@ -742,6 +815,11 @@ def _validate_strokes(stroke: StrokeParams) -> None:
     if not 0.0 <= stroke.side_scan_tilt_deg < 90.0:
         raise ValueError("'side_scan_tilt_deg' must be in [0, 90): it is the angle between "
                          "the optical axis and the surface normal")
+    if stroke.j6_step_weight < 0.0:
+        raise ValueError("'j6_step_weight' cannot be negative")
+    if not 0.0 < stroke.max_j6_step_deg <= 360.0:
+        raise ValueError("'max_j6_step_deg' must be in (0, 360]: it is the J6 turn a "
+                         "repositioning move should stay under")
 
 
 def _validate_surface(target: TargetParams) -> None:
@@ -753,6 +831,15 @@ def _validate_surface(target: TargetParams) -> None:
     if target.max_points is not None and target.max_points < 2:
         raise ValueError("'max_points' must be at least 2, or null to skip the budget "
                          "layer - one point cannot describe a path")
+    if target.feature_coverage_pct is not None \
+            and not 0.0 < target.feature_coverage_pct <= 100.0:
+        raise ValueError("'feature_coverage_pct' must be in (0, 100], or null to drop the "
+                         "hard-feature criterion")
+    if not 0.0 < target.feature_wall_deg <= 90.0:
+        raise ValueError("'feature_wall_deg' must be in (0, 90]: it is the angle a surface "
+                         "may lean off the face's dominant normal and still count as flat")
+    if target.feature_clearance_mm < 0.0:
+        raise ValueError("'feature_clearance_mm' cannot be negative")
 
 
 def _validate_robot(robot: RobotParams) -> None:
@@ -788,6 +875,13 @@ def _validate_robot(robot: RobotParams) -> None:
                     "cannot be more permissive than the arm")
     if robot.joint_margin_deg < 0.0:
         raise ValueError("'robot.joint_margin_deg' cannot be negative")
+    if robot.motion_check_step_mm <= 0.0:
+        raise ValueError("'robot.motion_check_step_mm' must be positive")
+    if robot.motion_check_step_deg <= 0.0:
+        raise ValueError("'robot.motion_check_step_deg' must be positive")
+    if not 0.0 <= robot.elbow_margin_deg < 90.0:
+        raise ValueError("'robot.elbow_margin_deg' must be in [0, 90): it is the room kept "
+                         "at each end of the elbow's own range")
     if robot.max_step_deg <= 0.0:
         raise ValueError("'robot.max_step_deg' must be positive")
     if str(robot.config_wrist_letter).upper() not in WRIST_LETTERS:

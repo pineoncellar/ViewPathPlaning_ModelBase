@@ -29,14 +29,23 @@ New-NetFirewallRule -DisplayName "ScanPlan Web 8765" -Direction Inbound `
 ### 1. 模型、扫描面与定位（第 01 步）
 
 - **本次运行名称**：留空则按时间自动命名。
-- **工位模型**：零件模型与夹具模型必填，底座可选（留空时服务自动生成一块位于零件下方的
-  参考平板作遮挡基准）。可直接上传 STL / OBJ / PLY / OFF / 3MF / GLB，以及 STEP（`.stp`、
-  `.step`）、IGES（`.igs`、`.iges`）、BREP——后三种由服务端调用 OpenCASCADE 三角化，需要可选
-  依赖（`uv sync --extra cad`，或 `pip install cadquery-ocp`），没装时页面只接受网格格式。
+- **工位模型**：零件模型与夹具模型必填，底座可选。底座留空时按下面的顺序取：
+  先用仓库里的 `input/base.stl`（工位自带的底座，最接近实际遮挡），该文件不存在或读不出来时
+  才生成一块**位于主扫描面背后**的参考平板。平板是按「主扫描面法向」摆的，不是按整车 `+Z`：
+  2026-10-29 那台工位的扫描面法向是 `+Y`，按 `+Z` 铺会落到零件**前面**挡住整个面。本次运行实际
+  用了哪一个底座写在 `registration_report.json` 的 `base_source` 里（`uploaded` /
+  `input/base.stl` / `reference plate behind the scan face`）。可直接上传 STL / OBJ / PLY /
+  OFF / 3MF / GLB，以及 STEP（`.stp`、`.step`）、IGES（`.igs`、`.iges`）、BREP——后三种由服务端
+  调用 OpenCASCADE 三角化，需要可选依赖（`uv sync --extra cad`，或 `pip install cadquery-ocp`），
+  没装时页面只接受网格格式。
   PRT / SLDPRT / CATPart 等原生格式没有免费读取器，会提示先在 CAD 里导出 STEP 或 IGES。
   导入的模型**当前坐标直接当整车坐标**，所以三份数模要先在 CAD 里按装配关系摆好，单位毫米。
 - **整车主扫描面**：`±X` / `±Y` / `±Z` 六选一；也可以按「根据模型自动推荐扫描面」（统计模型
   主平整面面积）或「在模型上点选扫描面」。整车轴固定为 X 前−后+、Y 左−右+、Z 下−上+。
+  **这个选择决定规划哪一面**：网页端把它换算到测量坐标系后交给规划器（`plan(face_axis=...)`），
+  由它用「两个分面的带符号投影面积」判定要扫的是哪一侧，而不是靠 `upper` / `lower` 这个名字
+  （那两个名字只表示分面种子给出的几何顺序，符号是任意的）。本次判定的轴向、两个候选的投影面积
+  和最终选中哪一侧写在 `coverage_report.json` 的 `target_face_selection` 里。
 - **现场测量坐标系**：`机器人 UFRAME 1` 或 `机器人基坐标 / UFRAME 0`。它同时决定第二步现场
   坐标以哪个坐标系量、以及导出的 `.LS` 写哪个 `UFRAME`。
 - **交付模式**：`扫掠模式 · 连续扫描带`（默认，`L` + `CNT0` 一路扫过去）或

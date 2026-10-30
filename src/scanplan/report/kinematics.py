@@ -62,10 +62,27 @@ def kinematics_block(config: PlannerConfig, viewpoints, path, kinematics=None) -
         "max_step_deg": getattr(assignment, "max_step_deg", None),
         "max_step_at": getattr(assignment, "max_step_at", None),
         "max_j6_step_deg": getattr(assignment, "max_j6_step_deg", None),
+        "max_j6_step_deg_limit": config.stroke.max_j6_step_deg,
+        "max_j6_step_at": getattr(assignment, "max_j6_step_at", None),
+        "j6_steps_over_limit": len(getattr(assignment, "j6_over", [])),
+        "j6_step_weight": config.stroke.j6_step_weight,
         "j6_note": (
             "a sweep is written as one L move between two points of the same constant pose, "
             "so J6 does not turn while the head scans; max_j6_step_deg is the largest J6 turn "
-            "asked of a J (repositioning) move"),
+            "asked of a single re-positioning move, and j6_steps_over_limit counts the moves "
+            "above stroke.max_j6_step_deg (a review trigger, not a drop rule)"),
+        "motion_check": {
+            "step_mm": config.robot.motion_check_step_mm,
+            "step_deg": config.robot.motion_check_step_deg,
+            "moves_checked": (kinematics.summary().get("moves_checked")
+                              if kinematics is not None else None),
+            "samples": (kinematics.summary().get("move_samples")
+                        if kinematics is not None else None),
+            "note": (
+                "every move is sampled between its corners and the IK is followed from the "
+                "branch the previous point ended on: a legal corner pair can still leave the "
+                "travel in the middle, and the controller flies the segment, not the corners"),
+        },
         "points_without_solution": len(getattr(assignment, "failed", [])),
         "steps_over_limit": len(getattr(assignment, "broken", [])),
         "cache": (kinematics.summary() if kinematics is not None else None),

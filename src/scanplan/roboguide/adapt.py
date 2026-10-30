@@ -49,7 +49,10 @@ _COMMENT = "scan viewpoints"
 # honest way to turn the wrist: an L move would drag the tool along an arc through the part
 # to achieve the same rotation.
 _TRANSITION_MOTION = "J"
-_TRANSITION_SPEED = "50%"
+# Default speed of those moves. They are the ones that turn the wrist - up to 180 deg of J6
+# in one instruction - so they are flown slowly unless the configuration says otherwise
+# (`motion.joint_speed`, carried into `export(joint_speed=...)`).
+_TRANSITION_SPEED = "5%"
 
 
 def _field(item, key: str, default=_MISSING):
@@ -328,6 +331,7 @@ def _contract_blocks(
     ordering: dict,
     point_count: int,
     extents: dict,
+    joint_speed: str | None = None,
 ) -> dict:
     """The frame contract: everything the workshop has to reproduce in ROBOGUIDE."""
     return {
@@ -401,6 +405,7 @@ def _contract_blocks(
             "prog_name": prog_name,
             "motion": motion.upper(),
             "speed": speed,
+            "joint_speed": joint_speed or _TRANSITION_SPEED,
             "config_string": config,
             "config_note": (
                 "the CONFIG string hints which posture solution to take; if ROBOGUIDE "
@@ -440,6 +445,7 @@ def export(
     joint_blocks: bool = False,
     order=True,
     robot=None,
+    joint_speed: str | None = None,
 ) -> dict:
     """Write `<NAME>.LS`, `<NAME>_points.csv`, `<NAME>_frame.json` and return the contract.
 
@@ -481,7 +487,7 @@ def export(
                 point["motion"] = motion
             else:
                 point["motion"] = _TRANSITION_MOTION
-                point["speed"] = _TRANSITION_SPEED
+                point["speed"] = joint_speed or _TRANSITION_SPEED
             previous_stroke = (point["stroke_id"]
                                if point["role"] == "coverage" else None)
 
@@ -558,6 +564,7 @@ def export(
         ordering=ordering,
         point_count=len(points),
         extents=_extents(points),
+        joint_speed=joint_speed,
     )
     contract["program"]["termination"] = str(termination).upper()
     contract["program"]["strokes"] = sorted(strokes) if strokes else []

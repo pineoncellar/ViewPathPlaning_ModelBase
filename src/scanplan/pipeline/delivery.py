@@ -14,13 +14,13 @@ import numpy as np
 from ..config import PlannerConfig
 from ..coverage import CoverageResult, evaluate
 from ..geometry import unit
-from ..path import PathPlan, assign_branches, build_path, prune, transition_poses
+from ..path import PathPlan, assign_branches, build_path, move_failures, prune, transition_poses
 from ..scanner_model import ScannerModel
 from ..scene import Station
-from ..selection import Selection, select_groups
+from ..selection import Selection, feature_percent, select, select_groups
 from ..strokes import Stroke, StrokeBuilder, StrokeCoverage, pose_stroke
 from ..target_surface import TargetSet
-from .ranking import _rank_plan
+from .ranking import _rank_plan, meets_targets
 
 # Pruning keeps the requirement, not the achieved peak: pruning against the peak can
 # never remove anything, which would make the stage pointless by construction.
@@ -71,6 +71,7 @@ def _group_selection(combined: CoverageResult, coverage: CoverageResult,
     repair_ok = [True] * n_poses + [False] * len(stroke_cov.strokes)
     return select_groups(combined, costs, repair_ok=repair_ok,
                          coverage_target_pct=cfg.target.coverage_target_pct,
+                         feature_target_pct=cfg.target.feature_coverage_pct,
                          tie=tie, weight=weight, lam=lam, exclude=exclude, log=log)
 
 
@@ -83,6 +84,36 @@ def _exclusion_mask(combined: CoverageResult, coverage: CoverageResult,
         if 0 <= index < len(mask):
             mask[index] = True
     return mask
+
+
+def _shortfall_text(selection: Selection, target_pct: float | None) -> str:
+    """Which acceptance figure a plan misses, in words - both of them, when both are short."""
+    parts: list[str] = []
+    if target_pct is not None and selection.coverage_pct + 1e-9 < float(target_pct):
+        parts.append(f"{selection.coverage_pct:.2f}% against a {float(target_pct):g}% area "
+                     "target")
+    feature_target = selection.feature_target_pct
+    if (feature_target is not None and selection.feature_coverage_pct is not None
+            and selection.feature_coverage_pct + 1e-9 < float(feature_target)):
+        parts.append(f"{selection.feature_coverage_pct:.2f}% of the hard features against "
+                     f"{float(feature_target):g}%")
+    return " and ".join(parts) if parts else "neither target's figure"
+
+
+def _owning_point(points, index: int) -> int:
+    """The delivered point whose ITEM pays for a move that ends at `index`.
+
+    A failing move runs from `index - 1` to `index`. If neither end belongs to an item (a
+    transfer between two transition corners), the next item down the path is the one that
+    needs the move, so it is the one dropped and re-selected.
+    """
+    for cursor in range(min(index, len(points)), -1, -1):
+        if points[cursor].stroke_id is not None:
+            return cursor
+    for cursor in range(max(index, 0), len(points)):
+        if points[cursor].stroke_id is not None:
+            return cursor
+    return index
 
 
 def _skeleton_axis(strokes) -> np.ndarray | None:
@@ -190,7 +221,9 @@ def _one_delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[i
     else:
         kept = prune(items, item_sets, list(range(len(items))), combined.area_mm2,
                      combined.target_area_mm2, target_pct=limit_pct,
-                     max_rounds=cfg.stroke.max_prune_rounds)
+                     max_rounds=cfg.stroke.max_prune_rounds,
+                     feature=combined.feature,
+                     feature_target_pct=cfg.target.feature_coverage_pct)
     if len(kept) < len(items):
         say(f"  pruning: {len(items)} selected items -> {len(kept)} while staying at "
             f"{limit_pct:g}%")
@@ -204,7 +237,8 @@ def _one_delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[i
     # would make the headline figure describe a sweep that never happens. That is the same
     # defect the stroke accounting was introduced to remove, one layer down.
     delivered = [row for index, row in enumerate(kept_rows) if index not in set(path.dropped)]
-    rebuilt = _rebuild_selection(combined, delivered, sources, None)
+    rebuilt = _rebuild_selection(combined, delivered, sources, None,
+                                 feature_target_pct=cfg.target.feature_coverage_pct)
     return rebuilt, path, kept_rows
 
 
@@ -241,7 +275,8 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
     forbidden: set[int] = set()
     rejected: list[int] = []
     joint_rows: set[int] = set()
-    rebuilt = _rebuild_selection(combined, current, current_sources, None)
+    rebuilt = _rebuild_selection(combined, current, current_sources, None,
+                                 feature_target_pct=cfg.target.feature_coverage_pct)
     path = PathPlan(points=[], ordering="empty")
     for _round in range(max(1, int(rounds))):
         rebuilt, path, kept_rows = _one_delivery(
@@ -252,10 +287,21 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
         if kin is not None and kin.active and path.points:
             # Solved here, inside the loop, because the answer decides whether this
             # delivery is legal at all - not after it has been accepted.
-            assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg))
+            assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg),
+                                         j6_step_weight=cfg.stroke.j6_step_weight,
+                                         max_j6_step_deg=cfg.stroke.max_j6_step_deg)
             unsolvable = {int(point.stroke_id) for point in
                           (path.points[index] for index in assignment.failed)
                           if point.stroke_id is not None}
+            # A move whose interpolated joints leave the envelope is not a warning either:
+            # the site's rule is that nothing in the program may leave the travel, and the
+            # controller flies the segment, not the corners. The owning item is dropped and
+            # the selection re-run without it, exactly like an unreachable corner.
+            mid_move = move_failures(path.points, assignment.solutions, kin, cfg)
+            unsolvable |= {int(path.points[_owning_point(path.points, index)].stroke_id)
+                           for index in mid_move
+                           if path.points[_owning_point(path.points, index)].stroke_id
+                           is not None}
         if not unrouted and not unsolvable:
             break
         illegal = unrouted | unsolvable
@@ -286,9 +332,23 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
         # Re-solved on the path that survived: dropping an item changes its neighbours, so
         # an assignment computed for the rejected delivery would describe a program that is
         # no longer being delivered.
-        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg))
+        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg),
+                                     j6_step_weight=cfg.stroke.j6_step_weight,
+                                     max_j6_step_deg=cfg.stroke.max_j6_step_deg)
         path.branches = assignment
         path.max_step_deg = assignment.max_step_deg
+        mid_move = move_failures(path.points, assignment.solutions, kin, cfg)
+        if mid_move:
+            path.violations.append(
+                f"{len(mid_move)} delivered move(s) leave the joint travel between their "
+                "two corners; the points at " + ", ".join(
+                    str(index + 1) for index in mid_move[:8]) + " are the far ends of them")
+        if assignment.j6_over:
+            path.violations.append(
+                f"{len(assignment.j6_over)} move(s) turn J6 more than "
+                f"{cfg.stroke.max_j6_step_deg:g} deg (worst "
+                f"{assignment.max_j6_step_deg:.1f} deg at point {assignment.max_j6_step_at}); "
+                "the scan itself never turns J6, so these are re-positioning moves to review")
         if assignment.failed:
             # Only reachable when the round cap is exhausted (or a caller passes
             # rounds=1). It stays a violation AND is refused at export time - the point is
@@ -301,6 +361,38 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
                 f"{len(assignment.broken)} joint step(s) exceed max_step_deg "
                 f"({assignment.max_step_deg:.1f} > {cfg.robot.max_step_deg:g} deg)")
     return rebuilt, path
+
+
+def _pose_reselect(coverage: CoverageResult, cfg: PlannerConfig, tie, *, log=None):
+    """A re-selection for the pose-only deliverable, with the gated rows banned.
+
+    The pose-only plan used to be filtered instead: a refused pose was deleted from the
+    list and the rest delivered as they were. That is exactly the mistake the mixed plan
+    was already fixed against - dropping one pose does not redistribute what it covered,
+    it just loses it. On the 2026-10-29 station the single refused pose carried 0.92 of a
+    percentage point, which is the difference between 98.59% and the 99% requirement while
+    the pool itself reached 99.51%.
+
+    Pose rows keep their index in the combined matrix (every pose is written before every
+    stroke), so the banned set and the returned rows need no translation.
+    """
+    say = log or (lambda _message: None)
+    pose_tie = None if tie is None else list(tie)[:len(coverage.poses)]
+
+    def reselect(forbidden):
+        mask = np.zeros(len(coverage.poses), dtype=bool)
+        for row in forbidden:
+            index = int(row)
+            if 0 <= index < len(mask):
+                mask[index] = True
+        again = select(coverage, coverage.area_mm2,
+                       coverage_target_pct=cfg.target.coverage_target_pct,
+                       feature_target_pct=cfg.target.feature_coverage_pct,
+                       tie=pose_tie, exclude=mask, log=say)
+        return again.chosen, {int(row): str(label) for row, label
+                              in zip(again.chosen, again.sources, strict=True)}
+
+    return reselect
 
 
 def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
@@ -379,7 +471,8 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
 
     pose_sel, pose_path = _delivery(combined, pose_selection.chosen, pose_sources,
                                     stroke_cov, coverage, cfg, station, model, gate,
-                                    kin=kin, log=log)
+                                    kin=kin, reselect=_pose_reselect(
+                                        coverage, cfg, tie, log=log), log=log)
     pose_sel.corners = pose_path.turns
     if progress is not None:
         progress(0.85, "building the pose-only reference")
@@ -394,8 +487,8 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
                                kin=kin, tie=tie, weight=weight, log=log)
         verdict = "budget_bound"
     elif budget is not None:
-        met = (target_pct is not None
-               and best[0].coverage_pct + 1e-9 >= float(target_pct))
+        met = meets_targets(best[0].coverage_pct, target_pct,
+                            best[0].feature_coverage_pct, best[0].feature_target_pct)
         verdict = "target_bound" if met else (
             "budget_bound" if lam_used > 0.0 else "exhausted")
 
@@ -407,17 +500,21 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
         f"lambda {lam_used:g}, {len(history)} trial(s)")
 
     mixed_rank = _rank_plan(mixed_sel.coverage_pct, mixed_path.turns,
-                            mixed_path.path_length_mm, target_pct)
+                            mixed_path.path_length_mm, target_pct,
+                            mixed_sel.feature_coverage_pct, mixed_sel.feature_target_pct)
     pose_rank = (_rank_plan(pose_sel.coverage_pct, pose_path.turns,
-                            pose_path.path_length_mm, target_pct)
+                            pose_path.path_length_mm, target_pct,
+                            pose_sel.feature_coverage_pct, pose_sel.feature_target_pct)
                  if pose_sel is not None else None)
     if bool(getattr(cfg.stroke, "require_sweeps", False)):
         # A scanning cell is bought to sweep. When the configuration says so, the pose-only
         # plan stops being an alternative deliverable and goes back to being a reference
         # figure: it is used only when the sweeps cannot reach the target, because a
         # program that scans nothing is worse than one that stops between passes.
-        met = (target_pct is None
-               or mixed_sel.coverage_pct + 1e-9 >= float(target_pct))
+        met = (target_pct is None and mixed_sel.feature_target_pct is None) or \
+            meets_targets(mixed_sel.coverage_pct, target_pct,
+                          mixed_sel.feature_coverage_pct,
+                          mixed_sel.feature_target_pct)
         if met:
             say("  sweeps required by the configuration: keeping the mixed plan "
                 f"({mixed_sel.coverage_pct:.2f}%, {mixed_path.turns} corners) even though "
@@ -429,8 +526,8 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
             return mixed_sel, mixed_path, _swept_pct(mixed_sel, mixed_path, target, station,
                                                      model, cfg, combined, gate, log=log)
         say("  sweeps are required but only reach "
-            f"{mixed_sel.coverage_pct:.2f}% against a {target_pct:g}% target: "
-            "delivering the pose-only plan instead")
+            + _shortfall_text(mixed_sel, target_pct)
+            + ": delivering the pose-only plan instead")
     if pose_rank is not None and pose_rank >= mixed_rank:
         say(f"  the mixed plan ({mixed_sel.coverage_pct:.2f}%, {mixed_path.turns} corners, "
             f"{mixed_path.path_length_mm:.0f} mm) does not beat the pose-only plan "
@@ -513,7 +610,8 @@ def _swept_pct(rebuilt: Selection, path: PathPlan, target: TargetSet, station: S
 
 
 def _rebuild_selection(combined: CoverageResult, rows, sources: dict[int, str],
-                       previous: Selection | None = None) -> Selection:
+                       previous: Selection | None = None,
+                       feature_target_pct: float | None = None) -> Selection:
     """A `Selection` over an explicit row list, after pruning removed some rows."""
     covered = np.zeros(combined.n_targets, dtype=bool)
     for row in rows:
@@ -529,4 +627,6 @@ def _rebuild_selection(combined: CoverageResult, rows, sources: dict[int, str],
         covered=covered, curve=[] if previous is None else list(previous.curve),
         coverage_area_mm2=float(area[covered].sum()),
         target_area_mm2=combined.target_area_mm2,
-        sources=np.array(labels, dtype=object))
+        sources=np.array(labels, dtype=object),
+        feature_coverage_pct=feature_percent(combined, area, covered),
+        feature_target_pct=feature_target_pct)

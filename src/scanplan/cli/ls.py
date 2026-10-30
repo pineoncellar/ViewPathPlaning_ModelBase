@@ -43,6 +43,9 @@ def configure(subparsers) -> None:
                           help="J is the permissive default for a reachability review; a "
                                "stroke plan ignores this and uses the configuration")
     exporter.add_argument("--speed", default="100%")
+    exporter.add_argument("--joint-speed", dest="joint_speed", default=None,
+                          help="speed of the non-scanning joint moves (a percentage such "
+                               "as '5%'); defaults to the configuration's motion.joint_speed")
     exporter.add_argument("--termination", default="FINE", choices=["FINE", "CNT0", "CNT100"],
                           help="a stroke plan ignores this and uses the configuration")
     exporter.add_argument("--config", help="configuration override (JSON); it is authoritative "
@@ -123,6 +126,7 @@ def run(args, parser: argparse.ArgumentParser) -> int:
                                      else args.uframe),
                              utool=args.utool,
                              motion=motion, speed=speed, termination=termination,
+                             joint_speed=args.joint_speed or cfg.motion.joint_speed,
                              joint_blocks=bool(args.joint_blocks),
                              order=order,
                              robot=cfg.robot)

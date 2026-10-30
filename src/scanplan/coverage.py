@@ -31,10 +31,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
 
 from .config import PlannerConfig
 from .raycast import nearest_across
-from .scanner_model import ScannerModel, ScannerPose, measure_mask
+from .scanner_model import ScannerModel, ScannerPose, measure_near
 from .scene import Station
 from .target_surface import SampleSet
 
@@ -43,6 +44,8 @@ REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by
            "candidate_found")
 _COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_kinematics",
                  "rejected_no_points", "rays")
+# Below this many target samples the ball query costs more than it saves.
+_TREE_MIN_TARGETS = 5_000
 
 
 @dataclass
@@ -62,6 +65,10 @@ class CoverageResult:
     n_targets: int
     area_mm2: np.ndarray
     target_area_mm2: float
+    # Which samples are HARD FEATURES - walls, bends and the rim beside a clamp. Carried
+    # here rather than recomputed per stage so that "how much of the wall is covered" means
+    # the same set of samples in the selection, the report and the delivery.
+    feature: np.ndarray | None = None
     _matrix: csr_matrix | None = field(default=None, repr=False, compare=False)
 
     def matrix(self) -> csr_matrix:
@@ -97,6 +104,7 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
              visible: Callable[[np.ndarray], np.ndarray] | None = None,
              obstacles: dict | None = None,
              gate=None,
+             feature=None,
              progress: Callable[[int, int], None] | None = None,
              log: Callable[[str], None] | None = None) -> CoverageResult:
     """Evaluate every pose against the target samples, returning sparse coverage sets.
@@ -122,6 +130,11 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
     if len(areas) != n_targets:
         raise ValueError("every sample needs an area")
     casters = station.obstacles() if obstacles is None else obstacles
+    # A pose cannot measure a sample further away than the scanner's far range, so only that
+    # ball is worth testing. On a real part this is 90 % of the samples per pose, and the
+    # ball query is EXACT - not a coarser approximation - because `geometry_mask` applies
+    # the same range limit to whatever it is given.
+    tree = cKDTree(points) if n_targets >= _TREE_MIN_TARGETS else None
 
     positions = (np.array([pose.position for pose in poses], dtype=float)
                  if poses else np.zeros((0, 3)))
@@ -150,8 +163,8 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
                 progress(index + 1, len(poses))
             continue
 
-        mask = measure_mask(model, pose, points, normals, casters,
-                            occlusion_tol_mm=cfg.occlusion_tol_mm)
+        mask = measure_near(model, pose, points, normals, casters,
+                            occlusion_tol_mm=cfg.occlusion_tol_mm, tree=tree)
         chosen = np.flatnonzero(mask)
         counters["rays"] += len(chosen)
         if len(chosen) == 0:
@@ -175,7 +188,9 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
     return CoverageResult(poses=list(poses), sets=sets, quality=quality,
                           tracker_ok=tracker_ok, counters=counters, n_targets=n_targets,
                           area_mm2=areas,
-                          target_area_mm2=float(samples.total_area_mm2))
+                          target_area_mm2=float(samples.total_area_mm2),
+                          feature=None if feature is None
+                          else np.asarray(feature, dtype=bool))
 
 
 def merge(first: CoverageResult, second: CoverageResult) -> CoverageResult:
@@ -190,7 +205,7 @@ def merge(first: CoverageResult, second: CoverageResult) -> CoverageResult:
         quality=first.quality + second.quality,
         tracker_ok=np.concatenate([first.tracker_ok, second.tracker_ok]),
         counters=counters, n_targets=first.n_targets, area_mm2=first.area_mm2,
-        target_area_mm2=first.target_area_mm2,
+        target_area_mm2=first.target_area_mm2, feature=first.feature,
     )
 
 

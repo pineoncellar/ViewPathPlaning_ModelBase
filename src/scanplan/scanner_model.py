@@ -152,3 +152,33 @@ def measure_mask(model: ScannerModel, pose: ScannerPose, points, normals, obstac
     blocked = nearest < distance - occlusion_tol_mm
     candidates[index[blocked]] = False
     return candidates
+
+
+def measure_near(model: ScannerModel, pose: ScannerPose, points, normals, obstacles, *,
+                 occlusion_tol_mm: float, tree=None) -> np.ndarray:
+    """`measure_mask` restricted to the samples this pose could reach at all.
+
+    A sample further from the pose than the scanner's far range is rejected by the range
+    test, so testing it is pure cost - and on a real panel that is most of the samples for
+    every pose. `tree` is a KD-tree over the same `points`; passing None keeps the plain
+    whole-array call, which is what small test fixtures want.
+
+    This is an exact optimisation, not a coarser one: the subset it builds is a superset of
+    what `geometry_mask` could ever accept, so the returned mask is identical to the
+    unrestricted one. It is worth the explicit helper because the candidate loop is the run's
+    hot spot and a ball query per pose is a rounding error next to the rays it saves.
+    """
+    if tree is None:
+        return measure_mask(model, pose, points, normals, obstacles,
+                            occlusion_tol_mm=occlusion_tol_mm)
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    near = tree.query_ball_point(np.asarray(pose.position, dtype=float).reshape(3),
+                                 float(model.max_distance_mm) + 1e-6)
+    result = np.zeros(len(points), dtype=bool)
+    if not near:
+        return result
+    index = np.asarray(sorted(near), dtype=np.int64)
+    normals = np.asarray(normals, dtype=float).reshape(-1, 3)
+    result[index] = measure_mask(model, pose, points[index], normals[index], obstacles,
+                                 occlusion_tol_mm=occlusion_tol_mm)
+    return result
