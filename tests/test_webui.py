@@ -409,6 +409,25 @@ def test_the_page_remembers_the_last_field_coordinates():
     assert "scheduleDatumMemorySave" in script
 
 
+def test_a_new_project_keeps_the_field_coordinates_and_asks_for_no_confirmation():
+    root = Path(scanweb.__file__).parent
+    script = (root / "app.js").read_text(encoding="utf-8")
+
+    # 「创建项目」= 新建项目：清掉其他记录，但现场坐标沿用上次填写的值
+    start = script.split("function startNewProject()", 1)
+    assert len(start) == 2, "缺少 startNewProject()"
+    body = start[1].split("\n}", 1)[0]
+    assert "resetWorkspace()" in body
+    assert 'toast("已新建项目")' in body
+    # 现场操作不该被打断：新建项目不弹确认框
+    assert "confirm" not in body
+    # 刚敲进去的坐标先落盘再重置，否则会被新项目的空表冲掉
+    assert "saveDatumMemory()" in body
+    # 重置本身要回填这份记忆
+    reset = script.split("function resetWorkspace()", 1)[1].split("\n}", 1)[0]
+    assert "restoreDatumMemory()" in reset
+
+
 def test_vehicle_frame_base_inverts_the_installation_transform(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

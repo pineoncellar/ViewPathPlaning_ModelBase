@@ -1866,9 +1866,9 @@ function bindEvents() {
   document.querySelectorAll(".nav-btn[data-view]").forEach((button) => {
     button.addEventListener("click", () => {
       const name = button.dataset.view;
-      if (name === "workspace" && state.resultSource === "history") {
-        resetWorkspace();
-        toast("已新建项目");
+      if (name === "workspace") {
+        startNewProject();
+        return;
       }
       showView(name);
     });
@@ -2098,12 +2098,24 @@ async function openHistoryRun(runId) {
   }
 }
 
+// 「创建项目」就是新建项目：清空模型、选点、结果等上一次的记录，从头开始。唯一的例外是
+// 现场实测坐标——这些数值重测一次代价很高，所以沿用上一次填写的输入（浏览器本地记忆）。
+// 现场操作讲究节奏，这里不弹二次确认，只提示一句「已新建项目」。
+function startNewProject() {
+  // 先把刚敲进去、还在防抖队列里的坐标落盘，再重置，避免新项目的空表把它冲掉
+  if (datumMemoryTimer) saveDatumMemory();
+  resetWorkspace();
+  showView("workspace");
+  toast("已新建项目");
+}
+
 function resetWorkspace() {
   state.models = {};
   state.picked = [];
   state.pointCount = 3;
   // 新项目同样沿用上一次填写的现场坐标，省掉重复录入
   restoreDatumMemory();
+  window.clearTimeout(datumMemoryTimer);
   state.autoFace = false;
   state.registration = null;
   state.result = null;
@@ -2152,6 +2164,7 @@ function resetWorkspace() {
   $("resultSubtitle").textContent = "规划完成";
   $("stageEmpty").style.display = "";
   $("formFeedback").textContent = "";
+  $("runName").value = "";
   $("scanAxis").value = "+Z";
   setRegistrationStatus(
     "选够定位点并填写现场坐标后，会自动计算整车 CAD 坐标到现场测量坐标系的安装变换。"
