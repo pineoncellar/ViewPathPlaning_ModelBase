@@ -331,6 +331,9 @@ uv run scanplan plan --station input/<工位>.json --config configs/fast.json --
 第三张表里的"拒绝"**不等于**丢失：关节直连被拒之后走退刀兜底，条目照样交付。把三者混成一句
 话，就是原来那句 `no route into it keeps clearance and rate` 的毛病。
 
+`sample_reasons` 里的 `unreachable_joint_limit` 只在关节门开着时才会出现：门关着时归因不问机械臂，
+"只有臂托不住的位姿能看见"的采样点会落进 `candidate_found`，那是"选带没选它"，改法完全相反。
+
 **`program.cost` —— 能换成秒的和不能换的分开报。**
 
 | 键 | 实测 |

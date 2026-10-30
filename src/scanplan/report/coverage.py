@@ -50,8 +50,15 @@ def cluster_points(points, area_mm2, *, cell_mm: float = 30.0,
 
 def coverage_block(*, config: PlannerConfig, model: ScannerModel, station: Station,
                    target: TargetSet, coverage: CoverageResult, selection: Selection,
-                   say) -> dict:
-    """Every number between "how much" and "what is left"; keys stay in report order."""
+                   gate=None, say) -> dict:
+    """Every number between "how much" and "what is left"; keys stay in report order.
+
+    `gate` is the same kinematic gate `evaluate` rejected candidates with, and passing it is
+    not decoration: without it a sample that only joint-infeasible poses can see is blamed on
+    the selection (`candidate_found`), and `unreachable_joint_limit` can never appear at all.
+    The two readings point at opposite fixes - "change the arm policy" versus "change the
+    stroke scoring" - so the wrong label sends the next change the wrong way.
+    """
     uncovered = ~selection.covered
     leak_points = np.asarray(target.samples.points)[uncovered]
     leak_normals = np.asarray(target.samples.normals)[uncovered]
@@ -65,7 +72,7 @@ def coverage_block(*, config: PlannerConfig, model: ScannerModel, station: Stati
         say(f"  attributing {len(leak_points)} uncovered samples")
         leak_reasons = attribute_uncovered(leak_points, leak_normals, coverage.poses,
                                           station, model, config,
-                                          tracker_ok=coverage.tracker_ok)
+                                          tracker_ok=coverage.tracker_ok, gate=gate)
 
     counts: dict[str, int] = {}
     for reason in leak_reasons:

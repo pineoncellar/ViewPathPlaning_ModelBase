@@ -18,7 +18,9 @@ import numpy as np
 import pytest
 
 from scanplan.candidates import generate
+from scanplan.config import RobotParams
 from scanplan.coverage import attribute_uncovered, evaluate
+from scanplan.kinematics import KinematicGate
 from scanplan.report import (
     build_report,
     cluster_points,
@@ -274,6 +276,34 @@ def test_the_failure_attribution_keeps_the_three_layers_apart(planned):
     assert set(block["layers_note"]) == {"sample_reasons", "item_drop_reasons",
                                         "connector_primitive_refusals"}
     assert block["joint_gate_enabled"] is False
+
+
+def _refusing_gate():
+    """A gate over an arm too small to hold any pose in the fixture, so it refuses them all."""
+    params = RobotParams.disabled()
+    return KinematicGate(RobotParams(**{**params.__dict__, "enabled": True,
+                                       "upper_arm_mm": 1.0, "forearm_mm": 2.0,
+                                       "forearm_offset_mm": 1.0}))
+
+
+def test_samples_only_a_joint_infeasible_pose_can_see_are_blamed_on_the_arm(planned):
+    """The report must ask the gate the planner used, or the bucket names the wrong fix.
+
+    Selection is stopped at 1% so plenty of visible samples stay uncovered, and every pose is
+    refused by the gate. None of those samples may then be reported as `candidate_found`,
+    which means "a usable candidate exists and was not picked" - a scoring problem - while
+    the truth here is reachability, whose fix is the arm policy or the layout.
+    """
+    coverage = planned["coverage"]
+    selection = select(coverage, coverage.area_mm2, coverage_target_pct=1.0)
+    report = build_report(config=planned["config"], model=planned["model"],
+                          station=planned["station"], split=planned["split"],
+                          target=planned["target"], coverage=coverage,
+                          selection=selection, viewpoints=[],
+                          kinematics=_refusing_gate())
+    reasons = report["uncovered_by_reason"]
+    assert reasons.get("unreachable_joint_limit", 0) > 0
+    assert reasons.get("candidate_found", 0) == 0
 
 
 def test_the_report_says_which_deliverable_it_is(planned):

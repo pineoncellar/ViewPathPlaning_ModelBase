@@ -99,11 +99,17 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
                  swept_coverage_pct: float | None = None,
                  pose_only_coverage_pct: float | None = None,
                  runtime: dict | None = None, log=None) -> dict:
-    """The report that has to accompany any viewpoint set (spec 7.2)."""
+    """The report that has to accompany any viewpoint set (spec 7.2).
+
+    `kinematics` is the run's `KinematicGate` when one was in force. It is read twice: for
+    the joint figures, and as the gate the uncovered-sample attribution must ask, so that
+    "the arm cannot hold that pose" is named as such instead of being reported as "a
+    candidate exists but was not selected".
+    """
     say = log or (lambda _message: None)
     coverage_stats = coverage_block(config=config, model=model, station=station,
                                     target=target, coverage=coverage, selection=selection,
-                                    say=say)
+                                    gate=kinematics, say=say)
     report = {
         **definition_block(config=config, target=target, split=split, coverage=coverage),
         "viewpoints": len(viewpoints),
