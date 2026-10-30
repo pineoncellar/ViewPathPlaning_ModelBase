@@ -71,6 +71,9 @@ def refine_rounds(state: RefineState, builder: StrokeBuilder | None, target: Tar
             round_rep(0.05, f"refinement round {round_index + 1}: aiming at the leaks")
         extra = refine(target.samples.points[leftover], target.samples.normals[leftover],
                        cfg.scanner, seed=cfg.seed + round_index, log=log,
+                       keep=(lambda pose: kin.check(pose.position, pose.axis,
+                                                    pose.roll_deg).ok)
+                       if kin is not None and kin.active else None,
                        progress=round_rep.band("strokes", 0.0, 0.25).tick("aims")
                        if round_rep is not None else None)
         if not extra:

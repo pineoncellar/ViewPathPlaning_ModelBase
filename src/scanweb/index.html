@@ -77,10 +77,9 @@
             </div>
             <div class="axis-row">
               <button class="secondary-button" id="recommendAxis" type="button">根据模型自动推荐扫描面</button>
-              <button class="secondary-button" id="pickAxis" type="button">在模型上点选扫描面</button>
-              <span id="axisBadge" class="recommend-badge">尚未导入零件</span>
+              <button class="secondary-button" id="pickAxis" type="button">在下方 3D 视图补充点选扫描面</button>              <span id="axisBadge" class="recommend-badge">尚未导入零件</span>
             </div>
-            <p class="inline-hint">整车轴：X 前−后+，Y 左−、右+，Z 下−上+。自动推荐会统计模型主平整面的面积；推荐结果可随时手动修改。</p>
+            <p class="inline-hint">整车轴：X 前−后+，Y 左−、右+，Z 下−上+。自动推荐会统计模型主平整面的面积；推荐结果可随时手动修改。<b>这一项就是主扫描面</b>（要扫的那一侧），下面的补充点选是在它之外再加几块。</p>
 
             <div class="form-row">
               <div><label class="field-label" for="scanMode">交付模式</label>
@@ -107,22 +106,53 @@
               <span class="inline-hint" style="margin:0">超过该值将拒绝规划</span>
             </div>
             <p class="inline-hint">在下方 3D 模型上依次点击零件表面的定位特征；右键或「撤销最后一点」可回退。选点完成后，在模型下方的表格中填写对应的现场坐标。</p>
-            <p class="inline-hint">定位与现场坐标填写完整后，在第 3 个模块「路径规划」中填写 LS 程序名并开始规划。</p>
+            <p class="inline-hint">现场坐标会记在本机浏览器里，下次打开页面时自动回填上一次的输入，确认与本次定位点对应即可；不需要时可点表格上方的「清空现场坐标」。</p>
+            <p class="inline-hint">定位与现场坐标填写完整后，在第 4 个模块「路径规划」中填写 LS 程序名并开始规划。</p>
           </section>
 
           <aside class="workflow-column">
             <section class="panel workflow-panel"><p class="eyebrow">WORKFLOW</p><h2>规划流程</h2><ol class="workflow-list" id="workflowList">
-              <li class="current"><i>1</i><span><b>模型与扫描面</b><small>零件 · 夹具 · 底座可选</small></span></li>
-              <li><i>2</i><span><b>3D 模型定位</b><small>3–4 点 · 现场坐标 · 配准</small></span></li>
-              <li><i>3</i><span><b>路径规划与导出</b><small>.LS · 报告 · 3D 视图</small></span></li>
+              <li class="current"><i>1</i><span><b>模型与主扫描面</b><small>零件 · 夹具 · 底座可选</small></span></li>
+              <li><i>2</i><span><b>补充扫描面</b><small>独立 3D 视图 · 可选</small></span></li>
+              <li><i>3</i><span><b>3D 模型定位</b><small>3–4 点 · 现场坐标 · 配准</small></span></li>
+              <li><i>4</i><span><b>路径规划与导出</b><small>.LS · 报告 · 3D 视图</small></span></li>
             </ol></section>
             <section class="panel info-panel"><span class="info-symbol">i</span><h3>规划范围说明</h3><p>覆盖率表示几何可达性，不包含机器人逆解、关节限位和机械臂碰撞。扫描仪参数仍为占位值时，覆盖率只作指示性参考。</p></section>
             <section class="panel info-panel"><span class="info-symbol">◎</span><h3>3D 分析</h3><p>规划完成后可打开 <b>viewer.html</b>，查看目标面、漏扫点、视点视场锥，并逐点分析哪些视点覆盖了零件上的某一点。</p></section>
           </aside>
         </div>
 
+        <section class="panel viewer-panel" id="scanFacePanel">
+          <div class="panel-heading"><div><span class="step-number">02</span><div><p class="eyebrow">SUPPLEMENTARY SCAN FACES</p><h2>补充扫描面</h2></div></div><span class="live-badge"><i></i> OPTIONAL</span></div>
+          <p class="inline-hint"><b>主扫描面</b>由第 01 步的整车方向决定（例如 −Y），本视图里点选的面是<b>补充扫描面</b>——它们<b>加在</b>主扫描面之外，不会缩小主扫描面。点一下即选中<b>整块平面</b>（沿相连曲面生长、与点击面法向相差不超过 15°，不会切成一堆小碎块），可连续点选多块（例如另一侧的面、翻边、凹腔外壁）；右键撤销上一块。补充面的面积会单列在报告里（<b>supplementary_area_mm2</b>），覆盖率按「主扫描面 + 补充面」一起计算。</p>
+          <div class="viewer-toolbar">
+            <div class="toolbar-group">
+              <button class="secondary-button" id="fitScanView" type="button">适配视图</button>
+              <button class="secondary-button" id="lookScanAxis" type="button">沿扫描面观察</button>
+              <button class="secondary-button" id="undoScanFace" type="button">撤销上一块</button>
+              <button class="secondary-button" id="clearScanFaces" type="button">清空补充面</button>
+            </div>
+            <div class="toolbar-group">
+              <label class="check-row"><input id="scanShowFixture" type="checkbox" checked>夹具</label>
+              <label class="check-row"><input id="scanShowBase" type="checkbox" checked>底座</label>
+            </div>
+          </div>
+          <div class="model-stage" id="faceStage">
+            <canvas id="faceCanvas"></canvas>
+            <canvas id="faceOverlayCanvas" class="stage-overlay"></canvas>
+            <div class="stage-empty" id="faceStageEmpty"><b>等待导入 3D 模型</b><span>导入零件后，在这里点击零件表面即可选中整块扫描面</span></div>
+            <div class="stage-corner">左键旋转 · 滚轮缩放 · 右键撤销上一块</div>
+          </div>
+          <div class="legend">
+            <span><i class="front"></i>主扫描面方向</span><span><i class="back"></i>背面</span><span><i class="other"></i>侧壁/边缘</span>
+            <span><i class="picked"></i>补充扫描面</span>
+            <span><i class="fixture"></i>夹具</span><span><i class="base"></i>底座</span>
+          </div>
+          <div class="canvas-note"><span id="scanFaceNote">点一下选中整块面，作为主扫描面之外的补充（已补充 0 块）；右键撤销上一块。</span><span id="scanFaceBadge">—</span></div>
+        </section>
+
         <section class="panel viewer-panel">
-          <div class="panel-heading"><div><span class="step-number">02</span><div><p class="eyebrow">3D MODEL / DATUM PICKING</p><h2>3D 模型与定位点</h2></div></div><span class="live-badge"><i></i> INTERACTIVE</span></div>
+          <div class="panel-heading"><div><span class="step-number">03</span><div><p class="eyebrow">3D MODEL / DATUM PICKING</p><h2>3D 模型与定位点</h2></div></div><span class="live-badge"><i></i> INTERACTIVE</span></div>
           <div class="viewer-toolbar">
             <div class="toolbar-group">
               <button class="secondary-button" id="fitView" type="button">适配视图</button>
@@ -138,7 +168,7 @@
           </div>
           <div class="model-stage" id="modelStage">
             <canvas id="modelCanvas"></canvas>
-            <canvas id="overlayCanvas"></canvas>
+            <canvas id="overlayCanvas" class="stage-overlay"></canvas>
             <div class="stage-empty" id="stageEmpty"><b>等待导入 3D 模型</b><span>导入零件与夹具后，可旋转、缩放并在表面点选定位点</span></div>
             <div class="stage-corner">左键旋转 · 滚轮缩放 · 右键/Shift 平移</div>
           </div>
@@ -148,6 +178,12 @@
           </div>
           <div class="canvas-note"><span id="pickInstruction">先在 3D 模型上点选定位点；点击零件表面即可拾取。</span><span id="canvasCounter">0 / 3</span></div>
 
+          <div class="datum-memory" id="datumMemoryNote" hidden>
+            <span class="datum-memory-icon">↺</span>
+            <span id="datumMemoryText">已载入上次填写的现场坐标。</span>
+            <button class="secondary-button" id="clearDatumMemory" type="button">清空现场坐标</button>
+          </div>
+
           <table class="datum-table" aria-label="定位点坐标">
             <thead><tr><th>点</th><th>CAD / 整车坐标 (mm)</th><th>现场 X</th><th>现场 Y</th><th>现场 Z</th></tr></thead>
             <tbody id="datumRows"></tbody>
@@ -156,7 +192,7 @@
         </section>
 
         <section class="panel result-panel" id="resultPanel" style="margin-top:14px">
-          <div class="panel-heading"><div><span class="step-number">03</span><div><p class="eyebrow">PATH PLANNING / EXPORT / DELIVERABLES</p><h2>路径规划</h2></div></div><span class="live-badge"><i></i> PLANNING</span></div>
+          <div class="panel-heading"><div><span class="step-number">04</span><div><p class="eyebrow">PATH PLANNING / EXPORT / DELIVERABLES</p><h2>路径规划</h2></div></div><span class="live-badge"><i></i> PLANNING</span></div>
 
           <div class="planning-controls">
             <div>

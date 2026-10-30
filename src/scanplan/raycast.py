@@ -103,6 +103,19 @@ def _as_rays(origins, directions) -> tuple[np.ndarray, np.ndarray]:
     return origins, directions
 
 
+def _queryable(origins, directions) -> np.ndarray:
+    """Rays the intersector can answer: finite, with a direction that is not zero.
+
+    A degenerate triangle has a zero face normal, so the `-normal` cast that looks for
+    its mirror partner is a zero-length ray. trimesh's intersector builds the ray's
+    bounding box by dividing by the direction, which turns such a ray into NaN bounds -
+    rtree then raises `Coordinates must not have minimums more than maximums` and one
+    degenerate face takes the whole plan down. Such a ray cannot hit anything anyway.
+    """
+    return (np.isfinite(origins).all(axis=1) & np.isfinite(directions).all(axis=1)
+            & (np.linalg.norm(directions, axis=1) > 0.0))
+
+
 class RayCaster:
     """Nearest-hit queries against one mesh, in chunks so memory stays bounded."""
 
@@ -120,19 +133,43 @@ class RayCaster:
         if count == 0:
             return distance, triangle
 
-        for start in range(0, count, self.chunk):
-            stop = min(start + self.chunk, count)
+        queryable = np.flatnonzero(_queryable(origins, directions))
+        for start in range(0, len(queryable), self.chunk):
+            rows = queryable[start:start + self.chunk]
             index_tri, index_ray, locations = self._intersector.intersects_id(
-                origins[start:stop], directions[start:stop],
+                origins[rows], directions[rows],
                 multiple_hits=False, return_locations=True,
             )
             if len(index_ray) == 0:
                 continue
             hits = np.asarray(locations, dtype=float).reshape(-1, 3)
-            rows = start + np.asarray(index_ray, dtype=np.int64)
-            distance[rows] = np.linalg.norm(hits - origins[rows], axis=1)
-            triangle[rows] = np.asarray(index_tri, dtype=np.int64)
+            hit_rows = rows[np.asarray(index_ray, dtype=np.int64)]
+            distance[hit_rows] = np.linalg.norm(hits - origins[hit_rows], axis=1)
+            triangle[hit_rows] = np.asarray(index_tri, dtype=np.int64)
         return distance, triangle
+
+    def hit_count(self, origins, directions) -> np.ndarray:
+        """How many surfaces of the mesh each ray meets.
+
+        Odd means the origin is INSIDE a closed shell, which is the parity test behind
+        "no position may sit in the part". Rays with no usable direction count as zero,
+        and the Embree bridge stops after 20 hits per ray - an even number, so a truncated
+        count still reads as "outside", the safe direction for a veto.
+        """
+        origins, directions = _as_rays(origins, directions)
+        count = np.zeros(len(origins), dtype=np.int64)
+        queryable = np.flatnonzero(_queryable(origins, directions))
+        for start in range(0, len(queryable), self.chunk):
+            rows = queryable[start:start + self.chunk]
+            _, index_ray = self._intersector.intersects_id(
+                origins[rows], directions[rows],
+                multiple_hits=True, return_locations=False,
+            )
+            if len(index_ray) == 0:
+                continue
+            count[rows] += np.bincount(np.asarray(index_ray, dtype=np.int64),
+                                       minlength=len(rows))
+        return count
 
 
 def nearest_across(casters: Mapping[str, RayCaster], origins, directions,

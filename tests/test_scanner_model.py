@@ -46,14 +46,14 @@ def test_field_of_view_shrinks_towards_the_standoff_and_is_capped_above_it(model
     far_width, far_height = model_placeholder.footprint_mm(900.0)
     assert pytest.approx(float(near_width), rel=1e-9) == 0.5 * float(stand_width)
     assert pytest.approx(float(near_height), rel=1e-9) == 0.5 * float(stand_height)
-    assert pytest.approx(float(far_width)) == 600.0
-    assert pytest.approx(float(far_height)) == 500.0
+    assert pytest.approx(float(far_width)) == 200.0
+    assert pytest.approx(float(far_height)) == 300.0
 
 
 def test_the_footprint_is_elementwise_so_a_vector_of_distances_works(model_placeholder):
     widths, heights = model_placeholder.footprint_mm(np.array([150.0, 300.0, 900.0]))
     assert widths.shape == (3,) and heights.shape == (3,)
-    assert pytest.approx(float(widths[0]), rel=1e-9) == 300.0
+    assert pytest.approx(float(widths[0]), rel=1e-9) == 100.0
 
 
 def test_range_limits_are_inclusive(model_placeholder):
@@ -70,8 +70,8 @@ def test_range_limits_are_inclusive(model_placeholder):
 
 def test_a_point_outside_the_footprint_is_rejected(model_placeholder):
     normal = np.array([[0.0, 0.0, 1.0]])
-    inside = np.array([[250.0, 0.0, 0.0]])          # 250 < 300 mm half-width at 300 mm
-    outside = np.array([[400.0, 0.0, 0.0]])
+    inside = np.array([[90.0, 0.0, 0.0]])          # 90 < the narrower 100 mm half-width
+    outside = np.array([[250.0, 0.0, 0.0]])        # beyond both half-widths (100 and 150)
     pose = pose_aiming_at_origin(300.0)
     assert model_placeholder.geometry_mask(pose, inside, normal).all()
     assert not model_placeholder.geometry_mask(pose, outside, normal).any()

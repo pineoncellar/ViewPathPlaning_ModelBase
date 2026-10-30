@@ -56,6 +56,7 @@
     "scan_gate": false,
     "hard_gate": false,
     "pool_mode": "grid",
-    "side_scan_tilt_deg": 0.0
+    "side_scan_tilt_deg": 0.0,
+    "require_sweeps": false
   }
 }

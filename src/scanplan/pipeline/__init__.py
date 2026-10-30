@@ -25,7 +25,7 @@ running order, so a change to one stage does not rewrite the others.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from ..candidates import generate
@@ -45,7 +45,7 @@ from ..scene import Station
 from ..selection import Selection, select
 from ..sheet_split import SheetSplit, split_sheet
 from ..strokes import StrokeCoverage, combine
-from ..target_surface import TargetSet, build_target
+from ..target_surface import ScanRegion, TargetSet, build_target
 from ..tracker import Tracker, visible_mask
 from .delivery import _finish_stroke_plan, _group_selection, _stroke_builder
 from .outputs import write_outputs
@@ -80,6 +80,7 @@ class PlanResult:
 
 def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
          tracker: Tracker | None = None, split: SheetSplit | None = None,
+         regions: Sequence[ScanRegion] | None = None,
          log: Callable[[str], None] | None = None,
          progress: ProgressHook | None = None) -> PlanResult:
     """Plan the scan of one face of the blank, and report what was missed.
@@ -87,6 +88,9 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
     `face` defaults to the configuration; `"auto"` plans both faces and keeps the one
     with the higher coverage, which is the only reliable way to answer "which side is
     up", and records both figures in `face_candidates`.
+
+    `regions` are the supplementary scan faces picked in the 3D view: they are ADDED to the
+    target face, never subtracted from it.
 
     `progress(stage, fraction, detail)` is optional and reports where the run actually
     is. The bands below are the run's real stages, not a time estimate; a caller that
@@ -124,7 +128,8 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
             face_rep(0.0, f"planning the {option} face")
             try:
                 candidates[option] = _plan_face(station, cfg, split, option, tracker,
-                                               checks, started, log, progress=face_rep)
+                                               checks, started, log, progress=face_rep,
+                                               regions=regions)
             except ValueError as error:
                 say(f"  {option} face cannot be planned: {error}")
         if not candidates:
@@ -144,7 +149,7 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
     face_rep = reporter.band("segmentation", 0.10, 1.0)
     face_rep(0.0, f"planning the {requested} face")
     return _plan_face(station, cfg, split, requested, tracker, checks, started, log,
-                      progress=face_rep)
+                      progress=face_rep, regions=regions)
 
 
 def _pose_tie(coverage: CoverageResult, kin) -> list[float] | None:
@@ -164,17 +169,34 @@ def _pose_tie(coverage: CoverageResult, kin) -> list[float] | None:
     return values
 
 
+def _joint_keep(kin):
+    """The joint gate as a predicate for candidate generation, or None when it is off.
+
+    Passed into `generate`/`refine` so the pool is filtered BEFORE it is capped: the cap is
+    far below the natural pool, so filtering afterwards spends the ray budget on poses the
+    arm can never hold (786 of 4000 on the 2026-10-28 delivery).
+    """
+    if kin is None or not kin.active:
+        return None
+
+    def keep(pose) -> bool:
+        return bool(kin.check(pose.position, pose.axis, pose.roll_deg).ok)
+
+    return keep
+
+
 def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: str,
                tracker: Tracker | None, checks: dict, started: float,
                log: Callable[[str], None] | None,
-               progress: ProgressReporter | None = None) -> PlanResult:
+               progress: ProgressReporter | None = None,
+               regions: Sequence[ScanRegion] | None = None) -> PlanResult:
     """Plan one named face, from target sampling through to the report."""
     say = log or (lambda message: print(message, flush=True))
     base = progress if progress is not None else ProgressReporter()
     model = ScannerModel(cfg.scanner)
     target_rep = base.band("segmentation", 0.0, 0.10)
     target_rep(0.02, f"sampling the {face} target face")
-    target = build_target(station.part, split, face, station, cfg, log=log)
+    target = build_target(station.part, split, face, station, cfg, log=log, regions=regions)
     if len(target.samples.points) == 0:
         raise ValueError(f"the {face} target face produced no samples to scan")
     target_rep(1.0, f"{len(target.samples.points)} target samples")
@@ -184,17 +206,23 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
         obstacles = station.obstacles()
         gate = lambda positions: visible_mask(tracker, positions, obstacles)  # noqa: E731
 
-    # The joint-limit gate. Off by default (`robot.enabled=false`), and when off every call
-    # below is a no-op, which is what keeps the pre-2026-10-22 result reproducible.
+    # The joint-limit gate. ON in the shipped configuration, because a program whose points
+    # the arm cannot hold is not a delivery - and the .LS export refuses such a point rather
+    # than writing it. `robot.enabled=false` makes every call below a no-op, which is how a
+    # pre-2026-10-27 result can still be reproduced.
     kin = KinematicGate(cfg.robot)
     if kin.active:
         say(f"kinematic gate on: {cfg.robot.model}, limits {kin.robot.limits_source}")
+    else:
+        say("WARNING: the joint gate is off - the delivered points are NOT checked against "
+            "the arm's limits, and the .LS export will refuse to verify them")
 
     cand_rep = base.band("candidates", 0.10, 0.22)
     say(f"generating candidates for the {face} face")
     cand_rep(0.0, "aiming the candidate ladder")
     poses = generate(target.samples.points, target.samples.normals, cfg.scanner,
-                     seed=cfg.seed, log=log, progress=cand_rep.tick("aims"))
+                     seed=cfg.seed, log=log, progress=cand_rep.tick("aims"),
+                     keep=_joint_keep(kin))
     cand_rep(1.0, f"{len(poses)} candidates")
 
     occ_rep = base.band("occlusion", 0.22, 0.60)
@@ -278,6 +306,14 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     else:
         viewpoints = viewpoints_from_selection(selection, combined, target.samples)
     say(f"reporting: {len(viewpoints)} points cover {selection.coverage_pct:.2f}%")
+    # The last word on the "every P point sits outside the part" constraint. Candidates and
+    # connectors are vetoed upstream, and this re-checks what is actually written: a point
+    # that made it into the program some other way is a finding, not a rumour.
+    inside_positions = int(station.inside_part(
+        [viewpoint.position for viewpoint in viewpoints]).sum()) if viewpoints else 0
+    if inside_positions:
+        say(f"  WARNING: {inside_positions} of {len(viewpoints)} delivered position(s) lie "
+            "inside the part")
     report_rep = base.band("report", 0.97, 1.0)
     report_rep(0.05, "writing the coverage report")
     report = build_report(config=cfg, model=model, station=station, split=split,
@@ -290,6 +326,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
                           runtime={"seconds": round(time.time() - started, 1),
                                    "ray_backend": backend_name()},
                           log=log)
+    report["program"]["positions_inside_part"] = inside_positions
     report["counters"] = counters
     report_rep(1.0, "report ready")
     return PlanResult(config=cfg, station=station, split=split, target=target,

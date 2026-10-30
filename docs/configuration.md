@@ -4,11 +4,11 @@
 
 [`configs/scanner_trackscan49.json`](../configs/scanner_trackscan49.json) 是唯一的出厂配置。
 参数的出处分四档，文件里的注释与报告里的 `parameter_provenance` 按同一套分档写：
-**数据表直接给出**（基准距、景深、最大面幅、跟踪距离）、**由数据表推导**（量程、
-跟踪器半角 25°）、**仍未实测**（入射角上限、扫描头外形包络、视场锚点距离、标记点朝向）、
+**数据表直接给出**（基准距、景深、跟踪距离）、**现场给定**（扫描面幅 200×300 mm，
+取代数据表的最大面幅）、**由数据表推导**（量程、跟踪器半角 25°）、**仍未实测**
+（入射角上限、扫描头外形包络、视场锚点距离、标记点朝向）、
 **设计取值**（距离/倾角/滚转阶梯、扫描带步长）。读覆盖率数字之前先看**仍未实测**那一档：
-`max_incidence_deg` 的敏感度远高于其他任何一项，而 `fov_anchor_distance_mm` 一动就会
-让视点数变两成。
+`max_incidence_deg` 的敏感度远高于其他任何一项。
 
 ## 怎么改：三层合并
 
@@ -58,6 +58,16 @@
 `scanner.max_incidence_deg` 与 `scanner.range_mm`：让扫描头"看得更远"不是口味问题，用它们
 换覆盖率只会让报告好看、扫描头却扫不到。
 
+## 候选姿态的倾角扇（`scanner.tilt_azimuths`）
+
+每个瞄准点先按 `distances_mm` × `tilts_deg` × `rolls_deg` 生成"梯子"，`tilt_azimuths` 决定
+这架梯子在表面法线周围**转几个方位**（默认 4 → 8 个倾斜方向 + 1 个正对方向）。它存在的理由
+是实测的：2026-10-28 那次交付只覆盖 57.7%，我把未覆盖的采样点逐点反解，**91% 的点其实存在
+合法姿态**——只是旧的单平面梯子（只绕一个切向 ±30°）offer 不了那些方向。
+
+关节门在**截断之前**过滤候选池（`generate(..., keep=门)`），截断本身按"每个瞄准点轮流取一个"
+分配（`candidates._cap`），所以 4000 的预算不会被少数瞄准点吃光、也不会留给手臂端不住的位姿。
+
 改法一：只给 bias，六项跟着走。
 
 ```json
@@ -94,7 +104,7 @@ uv run scanplan plan --station input/<工位>.json \
 ```
 
 覆盖率目标本身是现场旋钮，可以逐次覆盖：`--coverage-target 97.5`，或 `--coverage-target none`
-跑到耗尽（对应配置里的 `target.coverage_target_pct`，默认 99.0）。
+跑到耗尽（对应配置里的 `target.coverage_target_pct`，默认 95.0）。
 
 ## 候选池与扫描带侧的三道门
 
@@ -118,32 +128,50 @@ uv run scanplan plan --station input/<工位>.json \
 `configs/legacy_exhaust.json` 把三项全关、`pool_mode` 设成 `grid`，这是它能继续当回归金标
 的前提。
 
-## 机器人关节门（合并方案 B）
+## 过渡点、退刀与 J 速度（现场要求，2026-10-29）
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `stroke.retract_mode` | `auto` | `auto` = 两个扫描带之间**不插过渡点**，一条 `J` 直接到下一个起点；只有这条直连的采样点穿零件/没间隙时才插 **一个** 侧向等待点（垂直于光轴的八个方向，而不是沿光轴后撤）。`always` = 老行为：每个过渡两个点（退刀 + 横移），只在复现旧程序时用 |
+| `stroke.retract_clearance_mm` | `50.0` | 两种模式下侧让/抬刀的基础距离（auto 模式下是侧向一步的距离） |
+| `motion.joint_speed_pct` | `5.0` | 每条 `J` 指令写的百分比速度（`L` 仍用 `motion.speed_mm_s`）。J 扫描不到任何东西、TCP 轨迹又无法离线验证，所以现场把它压到 5% |
 
-`robot` 段默认 `enabled: false`，关着与合并前逐项一致。打开后规划期就用实测的臂/腕模型
-筛位姿：候选点要在限位里留出余量、过渡点要有逆解，交付点逐点带 CONFIG 与 J5 余量。
+`auto` 模式下 `connector_level` 不参与（没有退刀路线可挑）；`hard_gate` 仍然有效——直连与
+侧让都失败时，硬门下丢条目、非硬门下交付并写一行 violation。报告里
+`program.connector_levels` 会显示 `L0-straight`（直连）与 `L1-retract`（侧让一次）。
+
+## 机器人关节门（合并方案 B）
+`robot` 段默认 `enabled: true`：规划期就用实测的臂/腕模型筛位姿——候选点要在限位里留出余量、
+过渡点要有逆解，交付点逐点带 CONFIG；**解不出关节解的点会被当作“无合法连接”整条丢掉并重选**，
+`.LS` 导出前还会再核一遍，任一点超出可用包络就**直接拒写**（不生成半个程序）。
+想复现 2026-10-27 之前的结果，在覆盖文件里写 `"robot": {"enabled": false}`。
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `robot.enabled` | `false` | 总开关 |
-| `robot.joint_margin_deg` | `5.0` | 每个关节离限位至少留这么多度 |
+| `robot.enabled` | `true` | 总开关。关掉后交付点不再核关节，`.LS` 导出也失去关节证据（只剩一条警告） |
+| `robot.joint_margin_deg` | `5.0` | **每个轴两端各预留多少度**（现场接受 5–10）。硬门要求交付点离限位 ≥ 这个值 |
 | `robot.j5_min_abs_deg` | `8.0` | 腕奇异保护：`\|J5\|` 不小于这个值 |
 | `robot.max_step_deg` | `40.0` | **只报不拦**：相邻交付点的最大关节步，超限计数进报告 |
-| `robot.soft_limits_deg` / `mechanical_limits_deg` | 见文件 | 两套限位取交集，报告写明用了哪套 |
+| `robot.limits_usage_frac` | `1.0` | 可以用数据表包络的多大比例。**现已设 1.0**：不再用“90% 量程”当软限位——那是每轴不同的余量（J1 18.5°、J2 6.8°、J4 36°），机器本身没有这个道理；余量统一交给 `joint_margin_deg`（5–10°） |
+| `robot.soft_limits_deg` / `mechanical_limits_deg` | 见文件 | 数据表限位（R-2000iC/125L，reach 2655）与控制器软限位，两者取交集；报告写明用了哪套、用了多少比例 |
 | `robot.wrist_identified` | `true` | 关掉后禁止输出绝对关节值，门只能做分支排序 |
+| `robot.config_wrist_letter` | `"T"` | CONFIG 第三位。`"auto"` = 按 J5 符号（`T` ↔ J5 < 0，2026-10-23 实测）；`"T"`/`"F"` = 钉死。**本现场必须 `"T"`**：ROBOGUIDE 对 `N U F, 0, 0, 0` 报 `ASBN-023 Configuration error` 并丢掉整份程序。两个腕分支是同一个 TCP 姿态（J5 取反、J4/J6 转 180°），所以钉死不影响扫描几何，只影响能不能导入 |
 | `robot.tool_xyz_mm` / `robot.tool_ypr_deg` | 见文件 | `UTOOL 1`：法兰 → 扫描头参考点。换了工具就重标，流程见 [robot-calibration.md](robot-calibration.md) |
 | `robot.base_offset_mm` / `upper_arm_mm` / `forearm_mm` / `forearm_offset_mm` / `j2_height_mm` | 见文件 | 臂几何，与图纸互证的实测值；新数据只会复现它，不会改写它 |
 
 两条要记住的语义：
 
-- **硬门只对两件事丢条目**：间隙 ≤ 0，或过渡点解不出逆解。`stroke.max_rot_deg_per_mm` 是
-  未标定常数，**只报不拦**——拿它丢带会把覆盖率从 99% 打到 82%。
+- **硬门对三件事丢条目**：间隙 ≤ 0、过渡点解不出逆解、**交付点没有任何落在可用包络内的关节解**。
+  `stroke.max_rot_deg_per_mm` 是未标定常数，**只报不拦**——拿它丢带会把覆盖率从 99% 打到 82%。
 - 丢掉的条目走**排除重选**，不是只过滤；只过滤不重选同样会把覆盖率打下去。
+- 导出端还有一道闸：`roboguide.adapt.export(..., robot=cfg.robot)` 对每个写进 `.LS` 的点
+  复核（优先用规划给的 `joints_deg`，没有就现场逆解），**超限就抛错不写文件**，并在
+  `<NAME>_frame.json` 的 `joint_audit` 段留下证据与所用包络。
 
-`--joint-blocks` 让 `.LS` 的 `P[n]` 直接写关节角，**只对带 `joints_deg` 的点生效**（也就是打开
-`robot.enabled` 跑出来的视点文件），没有关节值的点仍写笛卡尔位姿。三个现场缺口（软限位准确
-值、CONFIG 圈数位的含义、ROBOGUIDE 是否配了数据表限位）没补齐之前，别把 `enabled`
-打开当验收用；`T/F` 字母已在 2026-10-23 那批 8 组数据上核对过（`T` ↔ J5 < 0）。
+`--joint-blocks` 让 `.LS` 的 `P[n]` 直接写关节角，**只对带 `joints_deg` 的点生效**（也就是开过
+关节门的视点文件），没有关节值的点仍写笛卡尔位姿。CONFIG 的三个圈数位现在**恒为 0**（只在轴
+自身行程之外才计圈），负圈位会被 `roboguide.ls.check_config()` 直接拒绝——2026-10-27 之前就是它
+让 ROBOGUIDE 以 `ASBN-009 Configuration error` 拒收整份 `T1.LS`。`T/F` 字母已在 2026-10-23 那批
+8 组数据上核对过（`T` ↔ J5 < 0）；ROBOGUIDE 是否配了数据表限位仍要在现场确认。
 
 ```bash
 uv run scanplan plan --station input/<工位>.json \

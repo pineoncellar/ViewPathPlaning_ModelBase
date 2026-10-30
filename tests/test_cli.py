@@ -103,8 +103,14 @@ def test_ls_needs_no_meshes_because_re_exporting_must_be_possible(tmp_path, view
 
 
 def test_ls_accepts_a_placement_and_switches_to_uframe_zero(tmp_path, viewpoints_json):
+    # The frame question, not the reachability question: the synthetic viewpoints sit inside
+    # the arm's own shoulder envelope, so the shipped joint gate would (correctly) refuse
+    # them and the export would stop before the placement was ever exercised.
+    gate_off = tmp_path / "no_gate.json"
+    gate_off.write_text(json.dumps({"robot": {"enabled": False}}), encoding="utf-8")
     assert main(["ls", "--viewpoints", str(viewpoints_json), "--prog-name", "PLACED",
-                 "--place", "0,0,0,0,0,0", "--out", str(tmp_path)]) == 0
+                 "--place", "0,0,0,0,0,0", "--config", str(gate_off),
+                 "--out", str(tmp_path)]) == 0
     assert "UFRAME_NUM=0" in (tmp_path / "PLACED.LS").read_text(encoding="utf-8")
 
 

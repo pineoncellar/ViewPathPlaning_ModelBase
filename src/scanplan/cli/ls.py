@@ -90,21 +90,27 @@ def run(args, parser: argparse.ArgumentParser) -> int:
     stroke_plan = any(isinstance(item, dict) and item.get("stroke_id") is not None
                       for item in viewpoints)
     motion, speed, termination, order = args.motion, args.speed, args.termination, True
+    joint_speed = None
+    try:
+        # Loaded even for a pose-only export: the robot block is what the joint audit runs
+        # with, and an export that cannot say whether the arm reaches its points should not
+        # be written at all.
+        cfg = load_config(args.config)
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+        parser.error(f"cannot read the configuration: {error}")
+        return 2
     if stroke_plan:
         # The configuration is authoritative here: a stroke plan's motion, termination and
         # speed are one decision, and two sources for it is how a program ends up flown at
         # a speed the coverage was not computed for.
-        try:
-            cfg = load_config(args.config)
-        except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
-            parser.error(f"cannot read the configuration: {error}")
-            return 2
         motion = cfg.motion.type
         termination = cfg.motion.termination
         speed = f"{cfg.motion.speed_mm_s:g} mm/sec"
+        joint_speed = f"{cfg.motion.joint_speed_pct:g}%"
         order = False
-        print(f"stroke plan: {motion} {speed} {termination} from the configuration, and the "
-              "planner's own order is kept (re-sorting would split strokes)")
+        print(f"stroke plan: {motion} {speed} {termination}, J moves at {joint_speed} from "
+              "the configuration, and the planner's own order is kept (re-sorting would "
+              "split strokes)")
 
     place = args.place
     if registration is not None:
@@ -120,8 +126,10 @@ def run(args, parser: argparse.ArgumentParser) -> int:
                                      else args.uframe),
                              utool=args.utool,
                              motion=motion, speed=speed, termination=termination,
+                             joint_speed=joint_speed,
                              joint_blocks=bool(args.joint_blocks),
-                             order=order)
+                             order=order,
+                             robot=cfg.robot)
     except ValueError as error:
         parser.error(str(error))
         return 2

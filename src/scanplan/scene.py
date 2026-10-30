@@ -115,6 +115,28 @@ class Station:
         to_base = self.base_tree.query(points, k=1)[0]
         return np.minimum(to_fixture, to_base)
 
+    def inside_part(self, points) -> np.ndarray:
+        """Whether each point lies INSIDE the part, i.e. within its material or a pocket.
+
+        Every delivered point of the program - a scan position as much as a retract or a
+        transition corner - has to sit outside the part: the head approaches from outside,
+        and a point inside the 0.7 mm sheet is a point no controller can reach.
+
+        Measured by parity: a ray that leaves the point and crosses the closed shell an odd
+        number of times started inside it. Three axis-aligned rays vote, because one ray
+        that grazes an edge, runs along a face or is truncated answers wrongly and a single
+        answer would then be believed.
+        """
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if len(points) == 0:
+            return np.zeros(0, dtype=bool)
+        caster = self.obstacles()["part"]
+        votes = np.zeros(len(points), dtype=np.int64)
+        for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+            directions = np.broadcast_to(np.asarray(axis, dtype=float), points.shape)
+            votes += caster.hit_count(points, directions) % 2
+        return votes >= 2
+
     def nearest_obstacle_point(self, points) -> np.ndarray:
         """The obstacle sample that `clearance_mm` measured the distance to."""
         points = np.asarray(points, dtype=float).reshape(-1, 3)

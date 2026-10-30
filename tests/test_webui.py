@@ -23,6 +23,7 @@ from scanweb import (
     _preview_registration,
     _record_history_run,
     _registration_from_payload,
+    _scan_regions,
     _sync_input_part,
     _synthetic_base,
 )
@@ -50,7 +51,7 @@ def test_the_page_defaults_come_from_the_shipped_configuration():
     config = scanweb._public_config()
     assert config["delivery_mode"] == "stroke"
     assert config["surface_bias"] == pytest.approx(0.5)
-    assert config["robot_enabled"] is False
+    assert config["robot_enabled"] is True
     assert config["motion"] in ("J", "L")
     assert set(config["parameter_sources"]) == {
         "stroke.min_gain_mm2_per_step", "stroke.min_stroke_mm", "stroke.seed_dirs",
@@ -132,6 +133,47 @@ def test_reset_poses_default_to_stl_vehicle_coordinates():
 
     assert len(transforms) == 3
     assert all(np.array_equal(transform, np.eye(4)) for transform in transforms)
+
+
+def test_scan_faces_picked_in_the_page_are_moved_into_the_station_frame():
+    rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = [500.0, -250.0, 900.0]
+    triangle = [[0.0, 0.0, 30.0], [10.0, 0.0, 30.0], [0.0, 10.0, 30.0]]
+    data = {
+        "scan_regions": [{
+            "origin": [10.0, 20.0, 30.0],
+            "normal": [0.0, 0.0, 2.0],
+            "tolerance_mm": 0.6,
+            "triangles": [triangle],
+        }]
+    }
+
+    regions = _scan_regions(data, transform)
+
+    assert len(regions) == 1
+    region = regions[0]
+    assert region.origin == pytest.approx(rotation @ np.array([10.0, 20.0, 30.0])
+                                          + transform[:3, 3])
+    assert region.normal == pytest.approx(np.array([0.0, 0.0, 1.0]))
+    assert region.tolerance_mm == pytest.approx(0.6)
+    assert region.triangles.shape == (1, 3, 3)
+    expected = np.array(triangle) @ rotation.T + transform[:3, 3]
+    assert region.triangles[0] == pytest.approx(expected)
+
+
+def test_no_picked_scan_faces_leaves_the_whole_face_as_the_target():
+    assert _scan_regions({}, np.eye(4)) == []
+    assert _scan_regions({"scan_regions": []}, np.eye(4)) == []
+
+
+def test_a_scan_face_without_triangles_is_rejected():
+    face = {"origin": [0, 0, 0], "normal": [0, 0, 1], "tolerance_mm": 0.5}
+    with pytest.raises(ValueError, match="no triangles"):
+        _scan_regions({"scan_regions": [{**face, "triangles": []}]}, np.eye(4))
+    with pytest.raises(ValueError, match="corners"):
+        _scan_regions({"scan_regions": [{**face, "triangles": [[[0.0, 0.0]]]}]}, np.eye(4))
 
 
 def test_stl_upload_is_decoded_as_a_triangular_mesh():
@@ -323,6 +365,21 @@ def test_the_page_offers_re_localisation_after_a_plan():
     assert "/api/relocate" in script
     assert "syncSetupFromResult" in script
     assert "不重新规划" in page
+
+
+def test_the_page_remembers_the_last_field_coordinates():
+    root = Path(scanweb.__file__).parent
+    page = (root / "index.html").read_text(encoding="utf-8")
+    script = (root / "app.js").read_text(encoding="utf-8")
+
+    # 现场坐标记在浏览器本地，下次打开页面回填，且可以一键丢弃
+    assert 'id="datumMemoryNote"' in page
+    assert 'id="clearDatumMemory"' in page
+    assert "localStorage" in script
+    assert "scanplan.datum.measured" in script
+    assert "restoreDatumMemory" in script
+    assert "saveDatumMemory" in script
+    assert "scheduleDatumMemorySave" in script
 
 
 def test_vehicle_frame_base_inverts_the_installation_transform(tmp_path):

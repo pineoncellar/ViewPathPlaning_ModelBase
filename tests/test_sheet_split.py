@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import trimesh
 from conftest import crossed_plates, has_unmerged_vertices
 
 from scanplan.sheet_split import split_sheet
@@ -67,6 +68,23 @@ def test_material_thickness_is_recovered_from_the_mirror_partner(folded_plate_un
 def test_split_survives_unmerged_vertices(folded_plate_unmerged):
     assert has_unmerged_vertices(folded_plate_unmerged)
     assert split_sheet(folded_plate_unmerged, seed=1).oriented_fraction > 0.9
+
+
+def test_a_degenerate_triangle_does_not_abort_the_split(folded_plate_unmerged):
+    # Real CAD tessellations contain zero-area slivers. Such a face has a zero normal, so
+    # the mirror-partner cast leaves it with a zero-length direction, which trimesh turns
+    # into NaN ray bounds and rtree refuses. One sliver used to take the whole plan down.
+    base = len(folded_plate_unmerged.vertices)
+    slivered = trimesh.Trimesh(
+        vertices=np.vstack([folded_plate_unmerged.vertices,
+                            folded_plate_unmerged.vertices[[0, 1]]]),
+        faces=np.vstack([folded_plate_unmerged.faces, [[base, base, base + 1]]]),
+        process=False,
+    )
+    assert (slivered.area_faces < 1e-12).any()
+    split = split_sheet(slivered, seed=1)
+    assert split.areas["upper"] > 0 and split.areas["lower"] > 0
+    assert 0.5 < split.thickness_mm < 1.0
 
 
 def test_a_part_with_no_single_through_thickness_axis_is_flagged(folded_plate_unmerged):

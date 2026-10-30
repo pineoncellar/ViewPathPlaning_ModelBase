@@ -37,6 +37,42 @@ _SPEED = re.compile(
     r"^\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>%|mm/sec|mm/s|deg/sec|deg/s|sec)?\s*$",
     re.IGNORECASE)
 
+# A joint move takes a percentage speed; a rate with a unit is refused by the controller.
+# Used when a point is written as joint angles but the program's speed is a rate, and as the
+# fallback for a J instruction whose speed the caller did not set. The shipped configuration
+# overrides it with `motion.joint_speed_pct`.
+_JOINT_BLOCK_SPEED = "50%"
+
+# The CONFIG field, as the CONTROLLER parses it: shoulder / elbow / wrist letters, then
+# three TURN digits. The digits are revolutions past the axis's own travel and are
+# NON-NEGATIVE: ROBOGUIDE answers `ASBN-009 on line ..., column ... Configuration error`
+# and refuses the whole file for a `-1`. Checking the shape here is what keeps this
+# writer from producing a program that cannot be imported at all.
+_CONFIG = re.compile(
+    r"^\s*(?P<shoulder>[NF])\s+(?P<elbow>[UD])\s+(?P<wrist>[TF])\s*,\s*"
+    r"(?P<turns>\d{1,2}\s*,\s*\d{1,2}\s*,\s*\d{1,2})\s*$",
+    re.IGNORECASE)
+
+
+def check_config(config: str) -> str:
+    """Validate a FANUC CONFIG string and return it in canonical form.
+
+    The field is written verbatim into every `P[n]` block, so a malformed one costs the
+    whole import rather than one point - which is exactly what happened on 2026-10-27,
+    when a negative turn digit stopped `T1.LS` at load time. Refusing it here turns that
+    into an error message that names the string and says what a legal one looks like.
+    """
+    found = _CONFIG.match(str(config))
+    if found is None:
+        raise ValueError(
+            f"CONFIG {config!r} is not a FANUC configuration: expected "
+            "'<N|F> <U|D> <T|F>, t1, t2, t3' with three NON-NEGATIVE turn digits, e.g. "
+            "'N U T, 0, 0, 0'. A negative digit (e.g. 'N U F, -1, 0, 0') makes ROBOGUIDE "
+            "reject the whole program with ASBN-009 'Configuration error' at load time")
+    turns = ", ".join(part.strip() for part in found["turns"].split(","))
+    return (f"{found['shoulder'].upper()} {found['elbow'].upper()} "
+            f"{found['wrist'].upper()}, {turns}")
+
 
 def check_speed(speed: str, motion: str = "J") -> str:
     """Validate a FANUC speed field and return it normalised.
@@ -99,6 +135,7 @@ def build_ls(
     constant: str = "",
     home_joints=None,
     joint_blocks: bool = False,
+    joint_speed: str = _JOINT_BLOCK_SPEED,
     stamp: datetime | str | None = None,
 ) -> str:
     """Render the whole `.LS` program.
@@ -125,6 +162,7 @@ def build_ls(
     else:
         stamp_text = (stamp or datetime.now()).strftime("%y-%m-%d  TIME %H:%M:%S")
     speed = check_speed(speed, motion)
+    config = check_config(config)
 
     def command(index: int, point_motion: str, point_termination: str,
                 point_speed: str, is_joint: bool = False) -> str:
@@ -148,12 +186,16 @@ def build_ls(
     point_specs: list[tuple[str, str, str, bool]] = []
     for pt in points:
         point_indices.append(next_index)
-        point_config = pt.get("config") or config
+        point_config = check_config(pt.get("config") or config)
         point_motion = str(pt.get("motion") or motion)
         point_termination = str(pt.get("termination") or termination)
         point_speed = check_speed(str(pt.get("speed") or speed), point_motion)
         joints = pt.get("joints_deg")
         as_joint = bool(joint_blocks and joints is not None)
+        if as_joint and not point_speed.endswith("%"):
+            # The speed belongs to the L instruction a sweep is written with; a joint move
+            # takes a percentage, and the controller refuses mm/sec on one
+            point_speed = joint_speed
         if as_joint:
             pos_blocks.append(
                 _pos_block(next_index, "joint", uframe, utool, point_config, joints))

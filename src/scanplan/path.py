@@ -29,12 +29,12 @@ moves, and the sweep the coverage figure was computed for never happens. See
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 from .config import PlannerConfig
-from .geometry import unit
+from .geometry import tangents, unit
 from .scanner_model import ScannerModel, ScannerPose
 from .scene import Station
 from .strokes import Stroke
@@ -45,10 +45,24 @@ _SAME_POSE_DEG = 0.5
 # Shorter than this and the item is a pose, not a sweep: delivering both of its ends would
 # put two identical corners in the program.
 _ZERO_MM = 1e-9
+# An axis whose usable range is at least this wide can reach the same pose with more than
+# one number, which is what makes the written joint values ambiguous.
+_FULL_TURN_DEG = 360.0
 # Multiples of `retract_clearance_mm` the connector tries before giving up. A fixed lift
 # assumes the space behind the head is empty, and on a real cell it is not: the base sits
 # behind the upper face and the fixture behind the lower one.
 _LIFT_FACTORS = (1.0, 2.0, 3.0, 4.0, 6.0, 8.0)
+# What a change of the CONFIG letters costs the branch search, in degrees of joint travel.
+# Sized above the swings it is meant to avoid (158-168 deg on the measured program) but not
+# so high that it forces a family which then needs a bigger detour elsewhere.
+_CONFIG_CHANGE_COST_DEG = 240.0
+
+# J6 gets a second charge on top of the all-axis one. J6 is the axis that turns the head about
+# the optical axis; while the head scans it is the axis that must stay still, and every degree
+# it turns is a different pixel-to-part mapping on the fly. The DP already prices the worst
+# axis of each step; this makes it prefer the branch that spends the turn on the arm instead
+# when both options cost the same all-axis step.
+_J6_COST_WEIGHT = 0.5
 
 ROLE_COVERAGE = "coverage"
 ROLE_RETRACT = "retract"
@@ -70,6 +84,10 @@ LEVEL_SAFE_PLANE = "L3-safe-plane"
 _GROUP_DEG = 60.0
 # Sweeps whose outward directions agree to within this belong to one direction group.
 _GROUP_MERGE_DEG = 30.0
+# The clearance reported for a route that runs through the part. There is no margin to
+# report - the head is inside the blank - and every caller decides on `margin > 0`, so the
+# number only has to be negative, stable, and obviously not a measurement.
+_THROUGH_PART_MARGIN_MM = -1.0
 
 
 @dataclass(frozen=True)
@@ -512,11 +530,18 @@ def _travel(points: Sequence[PathPoint]) -> float:
 
 def _segment_margin(first: PathPoint, second: PathPoint, cfg: PlannerConfig,
                     station: Station, model: ScannerModel, *, visible=None
-                    ) -> tuple[float, bool]:
+                    ) -> tuple[float, bool, bool]:
     """Smallest body clearance along one short move, and whether the tracker held.
 
     Sampled at the cheap step: a transition is not a scan, so what matters is that the
     head fits everywhere on it, not what it can see.
+
+    The second value says whether the move ran through the PART. Until it was measured,
+    only the fixture and the base were obstacles here, so a connector could cross the
+    blank and still report a clearance - the "straight line" fallback below already
+    needed a fixture standing right behind the sheet to notice. Every corner of the
+    delivered program has to stay outside the part, so the segment is sampled for that
+    too and a route that fails is refused like any other clearance refusal.
     """
     start = np.asarray(first.position, dtype=float)
     end = np.asarray(second.position, dtype=float)
@@ -525,8 +550,9 @@ def _segment_margin(first: PathPoint, second: PathPoint, cfg: PlannerConfig,
     fractions = np.linspace(0.0, 1.0, count + 1)[:, None]
     positions = start[None, :] * (1.0 - fractions) + end[None, :] * fractions
     margin = float(station.clearance_mm(positions).min() - model.body_limit_mm)
+    inside = bool(station.inside_part(positions).any())
     seen = True if visible is None else bool(np.all(visible(positions)))
-    return margin, seen
+    return margin, inside, seen
 
 
 def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: PathPlan,
@@ -557,14 +583,23 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
     lift is raised until the moves are clear AND the rotation is spread over enough travel
     to stay inside the rate limit.
 
-    Returns None when no route qualifies and `strict` is set - that is the hard gate, and
-    the caller turns it into "this item is not delivered" rather than a line in a report.
+    Returns None when no route qualifies. Two reasons are judged differently: a route that
+    fails CLEARANCE is refused only when `strict` is set - that is the hard gate, and its
+    caller turns a refusal into "this item is not delivered" rather than a line in a report.
+    A route whose transition corner the arm cannot hold falls back to a direct move between
+    the two poses (recorded), because both ends are legal by definition and the alternative
+    is losing the area they cover - unless the straight line itself is inside the geometry,
+    which under `strict` drops the item like any other clearance refusal.
     """
     same = _same_pose(previous, entry)
     rotation = _rotation_deg(previous, entry)
     limit = int(cfg.stroke.connector_level)
 
-    if normal is not None and _crosses_direction(previous, entry):
+    if cfg.stroke.retract_mode == "auto":
+        return _connector_straight(previous, entry, cfg, plan, station, model, rotation,
+                                   same, visible=visible, strict=strict, kin=kin)
+
+    if normal is not None and plane is not None and _crosses_direction(previous, entry):
         found = _cross_group(previous, entry, cfg, station, model, rotation,
                              normal=normal, plane=plane, visible=visible)
         if found is not None and _route_allowed(found[0], kin):
@@ -573,31 +608,81 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
             return route
 
     if limit <= 0 and same:
-        margin, seen = _segment_margin(previous, entry, cfg, station, model,
-                                       visible=visible)
-        if margin > 0.0 and seen:
+        margin, inside, seen = _segment_margin(previous, entry, cfg, station, model,
+                                               visible=visible)
+        if margin > 0.0 and not inside and seen:
             _record(plan, same, margin, rotation, 0.0, LEVEL_STRAIGHT, entry, cfg)
             return []
 
     if limit <= 1:
         found = _one_corner(previous, entry, cfg, station, model, rotation,
-                            visible=visible, kin=kin)
+                            visible=visible, kin=kin, normal=normal)
         if found is not None and _route_allowed(found[0], kin):
             points, margin = found
             _record(plan, same, margin, rotation, 0.0, LEVEL_ONE_CORNER, entry, cfg)
             return points
 
     points, margin, rate = _two_corners(previous, entry, cfg, station, model, rotation,
-                                        same, visible=visible, kin=kin)
-    # The hard gate refuses on CLEARANCE and on joint feasibility. It does not refuse on
-    # `rate`: how much rotation one millimetre of flight can absorb is a modelling
-    # assumption whose constant (`max_rot_deg_per_mm`) has never been calibrated on this
-    # cell, and turning an unmeasured heuristic into a dropped sweep makes the plan look
-    # legal by making it worse. Rate failures are still recorded as violations and counted
-    # in the report, so they stay visible rather than accepted.
-    legal = margin > 0.0 and _route_allowed(points, kin)
+                                        same, visible=visible, kin=kin, normal=normal)
+    # Two different things can make a route unusable, and they are judged differently:
+    #
+    # * JOINT feasibility is never negotiable. A transition corner the arm cannot hold is
+    #   not a judgement call - the controller will not execute it, and `assign_branches`
+    #   could only report the point as unsolved and make the .LS export refuse. So an
+    #   unreachable route is refused here whatever `stroke.hard_gate` says.
+    # * CLEARANCE is the configurable one. `hard_gate` on means "drop the sweep rather than
+    #   fly it close to the fixture"; off means "deliver it and list every route that failed
+    #   clearance", because a transit the planner thinks is 15 mm short is something
+    #   ROBOGUIDE can actually answer while a 27-point coverage hole cannot.
+    #
+    # `rate` is never a refusal either: how much rotation a millimetre of flight can absorb
+    # rests on an uncalibrated constant, and dropping sweeps over it would make the plan look
+    # legal by making it worse. Rate failures are recorded and counted instead.
+    reachable = _route_allowed(points, kin)
+    legal = margin > 0.0 and reachable
+    if not legal and normal is not None and plane is not None:
+        # Last resort: leave through the common plane. The plane route used to be reserved
+        # for pairs that face opposite ways, but a pocket wall blocks the LOCAL routes
+        # whatever the re-orientation is - "no route into it keeps clearance (1 deg)" is
+        # exactly that case - and the plane is the one surface that gets both waiting points
+        # out of the pocket. Only tried when everything cheaper has failed, so it cannot
+        # cost a corner on a route that already worked.
+        found = _cross_group(previous, entry, cfg, station, model, rotation,
+                             normal=normal, plane=plane, visible=visible)
+        if found is not None and _route_allowed(found[0], kin):
+            route, plane_margin = found
+            _record(plan, same, plane_margin, rotation, 0.0, LEVEL_SAFE_PLANE, entry, cfg)
+            return route
     _record(plan, same, margin, rotation, rate, LEVEL_TWO_CORNERS, entry, cfg)
-    if strict and not legal:
+    if not reachable:
+        # Every corner of every route is outside the arm's envelope, but BOTH ENDS are
+        # points the gate already accepted - they are in the program either way. A direct
+        # move between two holdable poses is what a programmer writes by hand, and the
+        # controller interpolates it in joint space, so it is executable. Refusing it drops
+        # the sweep or pose and loses the area it covered: on the 2026-10-28 station that
+        # was 15 of 17 poses and 4 of 7 sweeps, i.e. 95.9% selected becoming 51.4%
+        # delivered. It is recorded on its own line, never silent.
+        direct, direct_inside, _seen = _segment_margin(previous, entry, cfg, station,
+                                                       model, visible=visible)
+        plan.violations.append(
+            f"the connector into stroke {entry.stroke_id} goes straight: no retract corner "
+            f"the arm can hold was found on any route tried (direct clearance "
+            f"{direct:.1f} mm)")
+        _record(plan, same, direct, rotation, 0.0, LEVEL_STRAIGHT, entry, cfg)
+        if strict and (direct <= 0.0 or direct_inside):
+            # ...but "a move a programmer would write by hand" means a move that MISSES the
+            # part. Two poses 800 mm apart on a curved surface are joined by a line that
+            # dips through it, and the model says so here: on the 2026-10-29 station this
+            # branch was the only thing between a 97.4% plan and a transit 28 mm INSIDE the
+            # blank. Losing the sweep is a coverage hole the report can name; flying that
+            # line is a crash, so under the hard gate the item goes instead.
+            plan.violations.append(
+                f"the straight line into stroke {entry.stroke_id} is refused: it passes "
+                f"{abs(direct):.1f} mm inside the geometry, so the sweep is dropped rather "
+                "than flown")
+            return None
+        return []
+    if strict and margin <= 0.0:
         return None
     return points
 
@@ -661,14 +746,90 @@ def _cross_group(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
         return None
     margin = np.inf
     seen = True
+    inside = False
     for first, second in ((previous, wait_out), (wait_out, wait_in), (wait_in, entry)):
-        found, tracker_ok = _segment_margin(first, second, cfg, station, model,
-                                            visible=visible)
+        found, through_part, tracker_ok = _segment_margin(first, second, cfg, station,
+                                                          model, visible=visible)
         margin = min(margin, found)
+        inside = inside or through_part
         seen = seen and tracker_ok
-    if margin <= 0.0 or not seen:
+    if margin <= 0.0 or inside or not seen:
         return None
     return [wait_out, wait_in], float(margin)
+
+
+def _connector_straight(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
+                        plan: PathPlan, station: Station, model: ScannerModel,
+                        rotation: float, same: bool, *, visible=None, strict: bool = False,
+                        kin=None) -> list[PathPoint] | None:
+    """`stroke.retract_mode = auto`: go straight, and sidestep only when the line is blocked.
+
+    The site asked for no retract (2026-10-29), and the reason is in the program: two
+    waiting corners per transition triple the J instructions, lengthen the flight and put
+    the wrist at every one of those poses. A J move straight to the next entry does the
+    same job with one instruction - the controller interpolates in joint space, so the
+    wrist turn rides along instead of needing a corner to start turning at.
+
+    Straight is only honest while the line is clear, though: two poses on a curved panel
+    are joined by a line that dips through it, and that is a crash rather than a detour. So
+    the line is sampled, and when it fails the head leaves SIDEWAYS - perpendicular to its
+    own optical axis - for one waiting point before flying on. Sideways, not backwards:
+    retracting along the axis walks into whatever is behind the head, which on this cell is
+    the base behind the upper face and the fixture behind the lower one.
+    """
+    margin, inside_part, seen = _segment_margin(previous, entry, cfg, station, model,
+                                               visible=visible)
+    if margin > 0.0 and not inside_part and seen:
+        _record(plan, same, margin, rotation, 0.0, LEVEL_STRAIGHT, entry, cfg)
+        return []
+
+    found = _lateral_corner(previous, entry, cfg, station, model, rotation,
+                            visible=visible, kin=kin)
+    if found is not None:
+        route, corner_margin = found
+        _record(plan, same, corner_margin, rotation, 0.0, LEVEL_ONE_CORNER, entry, cfg)
+        return route
+
+    # Nothing worked: the straight move is all that is left. Under the hard gate an item is
+    # worth less than a transit through the part, so it goes rather than being flown.
+    if strict and (margin <= 0.0 or inside_part):
+        plan.violations.append(
+            f"the straight line into stroke {entry.stroke_id} is refused: it passes "
+            f"{abs(margin):.1f} mm inside the geometry and no sideways waiting point could "
+            "be found, so the sweep is dropped rather than flown")
+        return None
+    _record(plan, same, margin, rotation, 0.0, LEVEL_STRAIGHT, entry, cfg)
+    plan.violations.append(
+        f"the connector into stroke {entry.stroke_id} goes straight: the line "
+        + ("passes through the part" if inside_part
+           else f"keeps only {margin:.1f} mm of clearance")
+        + " and no sideways waiting point could be found")
+    return []
+
+
+def _lateral_directions(previous: PathPoint, count: int = 8) -> list[np.ndarray]:
+    """Unit directions perpendicular to the head's axis, evenly spread round it.
+
+    Perpendicular on purpose: the retract this replaces went straight back along the axis,
+    into the base or the fixture. A sidestep leaves the part's own volume immediately,
+    whatever the head happens to be pointing at.
+    """
+    axis = unit(np.asarray(previous.axis, dtype=float))
+    first, second = tangents(axis)
+    angles = np.linspace(0.0, 2.0 * np.pi * (1.0 - 1.0 / count), count)
+    return [unit(np.cos(angle) * first + np.sin(angle) * second) for angle in angles]
+
+
+def _lateral_corner(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
+                    station: Station, model: ScannerModel, rotation: float, *,
+                    visible=None, kin=None) -> tuple[list[PathPoint], float] | None:
+    """One sideways waiting point, over the eight directions and the ladder of distances."""
+    for direction in _lateral_directions(previous):
+        found = _one_corner_along(previous, entry, cfg, station, model, rotation, direction,
+                                  visible=visible, kin=kin)
+        if found is not None:
+            return found
+    return None
 
 
 def _count_level(plan: PathPlan, level: str) -> None:
@@ -697,21 +858,59 @@ def _record(plan: PathPlan, same: bool, margin: float, rotation: float, rate: fl
             f"{_LIFT_FACTORS[-1] * cfg.stroke.retract_clearance_mm:g} mm of lift")
 
 
-def _retract_point(previous: PathPoint, lift: float) -> PathPoint:
-    """A point `lift` millimetres behind the head, keeping its pose."""
+def _retract_point(previous: PathPoint, lift: float, direction=None) -> PathPoint:
+    """A waiting point `lift` millimetres away from the head, keeping its pose.
+
+    `direction` defaults to -axis, i.e. straight back along the optical axis, which is the
+    obvious guess and the one that keeps the retract and the dive collinear. It is only a
+    guess: behind a horizontal-looking head is the part's own side wall, and a corner there
+    can be blocked by the fixture or - more often on this cell - sit outside the arm's
+    envelope while the pose itself is fine. The caller therefore also offers the outward
+    direction of the safe plane, which is up and away from everything the plane was built
+    to clear.
+    """
+    if direction is None:
+        direction = -np.asarray(previous.axis, dtype=float)
     return PathPoint(
         position=np.asarray(previous.position, dtype=float)
-        - np.asarray(previous.axis, dtype=float) * lift,
+        + np.asarray(direction, dtype=float) * lift,
         axis=np.asarray(previous.axis, dtype=float), roll_deg=float(previous.roll_deg),
         role=ROLE_RETRACT, source=str(previous.source), stroke_id=previous.stroke_id)
 
 
+def _retract_directions(previous: PathPoint, normal) -> list[np.ndarray]:
+    """The directions to try for a waiting point, best guess first, without duplicates."""
+    back = -unit(np.asarray(previous.axis, dtype=float))
+    out = [back]
+    if normal is not None:
+        plane_out = unit(np.asarray(normal, dtype=float))
+        # within about 25 degrees of "behind the head" it is the same move, so trying it
+        # again would only double the ray casts
+        if float(np.dot(back, plane_out)) < float(np.cos(np.deg2rad(25.0))):
+            out.append(plane_out)
+    return out
+
+
 def _one_corner(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
                 station: Station, model: ScannerModel, rotation: float, *,
-                visible=None, kin=None) -> tuple[list[PathPoint], float] | None:
+                visible=None, kin=None, normal=None) -> tuple[list[PathPoint], float] | None:
     """L1: retract, then fly straight to the next entry. None when no lift works."""
+    for direction in _retract_directions(previous, normal):
+        found = _one_corner_along(previous, entry, cfg, station, model, rotation, direction,
+                                  visible=visible, kin=kin)
+        if found is not None:
+            return found
+    return None
+
+
+def _one_corner_along(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
+                      station: Station, model: ScannerModel, rotation: float, direction,
+                      *, visible=None, kin=None
+                      ) -> tuple[list[PathPoint], float] | None:
+    """L1 along one particular retract direction, over the ladder of lifts."""
     for factor in _LIFT_FACTORS:
-        retract = _retract_point(previous, float(cfg.stroke.retract_clearance_mm) * factor)
+        retract = _retract_point(previous, float(cfg.stroke.retract_clearance_mm) * factor,
+                                 direction)
         reach = float(np.linalg.norm(np.asarray(entry.position, dtype=float)
                                      - np.asarray(retract.position, dtype=float)))
         if reach <= 0.0 or rotation / reach > cfg.stroke.max_rot_deg_per_mm:
@@ -724,24 +923,45 @@ def _one_corner(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
             continue
         margin = np.inf
         seen = True
+        inside = False
         for first, second in ((previous, retract), (retract, entry)):
-            found, tracker_ok = _segment_margin(first, second, cfg, station, model,
-                                                visible=visible)
+            found, through_part, tracker_ok = _segment_margin(first, second, cfg, station,
+                                                              model, visible=visible)
             margin = min(margin, found)
+            inside = inside or through_part
             seen = seen and tracker_ok
-        if margin > 0.0 and seen:
+        if margin > 0.0 and not inside and seen:
             return [retract], float(margin)
     return None
 
 
 def _two_corners(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
                  station: Station, model: ScannerModel, rotation: float, same: bool, *,
-                 visible=None, kin=None) -> tuple[list[PathPoint], float, float]:
+                 visible=None, kin=None, normal=None
+                 ) -> tuple[list[PathPoint], float, float]:
     """L2, the original route: retract, traverse behind the next entry, dive in."""
+    best: tuple[list[PathPoint], float, float] | None = None
+    for direction in _retract_directions(previous, normal):
+        points, margin, rate = _two_corners_along(previous, entry, cfg, station, model,
+                                                 rotation, same, direction,
+                                                 visible=visible, kin=kin)
+        if margin > 0.0 and rate == 0.0:
+            return points, margin, rate
+        if best is None or margin > best[1]:
+            best = (points, margin, rate)
+    assert best is not None
+    return best
+
+
+def _two_corners_along(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
+                       station: Station, model: ScannerModel, rotation: float, same: bool,
+                       direction, *, visible=None, kin=None
+                       ) -> tuple[list[PathPoint], float, float]:
+    """L2 along one particular retract direction, over the ladder of lifts."""
     best: tuple[float, list[PathPoint], float] | None = None
     for factor in _LIFT_FACTORS:
         lift = float(cfg.stroke.retract_clearance_mm) * factor
-        retract = _retract_point(previous, lift)
+        retract = _retract_point(previous, lift, direction)
         through = PathPoint(
             position=np.asarray(entry.position, dtype=float)
             - np.asarray(entry.axis, dtype=float) * lift,
@@ -754,16 +974,23 @@ def _two_corners(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
         rate = rotation / reach if reach > 0.0 else float("inf")
         margin = np.inf
         seen = True
+        inside = False
         for first, second in ((previous, retract), (retract, through), (through, entry)):
-            found, tracker_ok = _segment_margin(first, second, cfg, station, model,
-                                                visible=visible)
+            found, through_part, tracker_ok = _segment_margin(first, second, cfg, station,
+                                                              model, visible=visible)
             margin = min(margin, found)
+            inside = inside or through_part
             seen = seen and tracker_ok
         rate_ok = same or rate <= cfg.stroke.max_rot_deg_per_mm
         reachable = _route_allowed([retract, through], kin)
         points = [retract, through]
-        if margin > 0.0 and rate_ok and seen and reachable:
+        if margin > 0.0 and not inside and rate_ok and seen and reachable:
             return points, float(margin), 0.0
+        # Callers judge a route by `margin > 0`, so a route through the part has to arrive
+        # with a negative one: it has no clearance to report at any lift, and it must never
+        # win the "roomiest attempt" comparison below.
+        if inside:
+            margin = _THROUGH_PART_MARGIN_MM
         # keep the roomiest attempt seen so far: a bigger lift is not monotonically safer,
         # because retracting away from the part can walk towards the base behind it
         if best is None or margin > best[0]:
@@ -788,6 +1015,7 @@ class BranchAssignment:
     broken: list[int] = field(default_factory=list)
     max_step_deg: float = 0.0
     max_step_at: int | None = None
+    max_j6_step_deg: float = 0.0
     min_margin_deg: float | None = None
     histogram: dict[str, int] = field(default_factory=dict)
 
@@ -808,6 +1036,12 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
 
     Points without any feasible solution are reported, never silently filled in with
     something plausible.
+
+    Changing the CONFIG letters mid-program costs extra: the letters are the arm's posture,
+    not the tool's pose, so the controller gets to the next one by swinging the whole arm
+    round (J1 167 deg on the 2026-10-28 program, J3 159 deg on the way back in). Nothing in
+    the delivery geometry models that swing, so it is paid for here - as a preference, not a
+    ban: when the only solution for a point sits in another family, the path still takes it.
     """
     if gate is None or not gate.active:
         return BranchAssignment()
@@ -824,7 +1058,9 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
         for j, option in enumerate(candidates[index]):
             best = (float("inf"), 0)
             for k, previous in enumerate(candidates[index - 1]):
-                cost = total[index - 1][k] + _step_between(previous, option)
+                cost = (total[index - 1][k] + _step_between(previous, option)
+                        + _J6_COST_WEIGHT * _axis_step_between(previous, option, 5)
+                        + _config_penalty(previous, option))
                 if cost < best[0]:
                     best = (cost, k)
             total[index][j] = best[0]
@@ -838,8 +1074,15 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
         if index > 0:
             choice = parent[index][choice]
 
+    picked = _unwrap_along(picked, getattr(getattr(gate, "robot", None), "limits", None))
     steps = [_step_between(picked[index - 1], picked[index])
              for index in range(1, len(picked))]
+    # J6 on its own: the head turns about the optical axis with J6 alone, so a large J6 step
+    # is the wrist spinning in place. That is harmless between sweeps (the move scans
+    # nothing) and impossible during one (a sweep is a constant pose), so it is reported
+    # separately from the all-axis worst step rather than folded into it.
+    j6_steps = [_axis_step_between(picked[index - 1], picked[index], 5)
+                for index in range(1, len(picked))]
     broken = [index + 1 for index, step in enumerate(steps) if step > max_step_deg]
     worst = max(steps) if steps else 0.0
     margins = [item.min_margin_deg for item in picked if item is not None]
@@ -851,8 +1094,56 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float
     return BranchAssignment(
         solutions=picked, failed=failed, broken=broken, max_step_deg=float(worst),
         max_step_at=(int(np.argmax(steps)) + 1 if steps else None),
+        max_j6_step_deg=(float(max(j6_steps)) if j6_steps else 0.0),
         min_margin_deg=(float(min(margins)) if margins else None),
         histogram=histogram)
+
+
+def _unwrap_along(solutions: Sequence, limits) -> list:
+    """Rewrite the turn-free axes so the program turns the short way, not the long one.
+
+    An axis with a full 720 degree range has more than one number for the same pose, and the
+    closed form is free to hand back whichever one it likes: two consecutive points can read
+    -179.8 and +177.5, which are 2.6 degrees apart as a pose and 357 degrees apart as a J
+    move. The controller interpolates the numbers it is given, so a turn like that is a real
+    full revolution of the wrist in the middle of the path, not a display quirk.
+
+    Each point is therefore shifted by whole turns to the representative nearest the point
+    before it. Two conditions keep the written program equivalent: the shifted value must
+    stay inside the usable envelope, and it must stay on the same side of one full turn, so
+    the CONFIG turn digits - which this module does not recompute - stay correct.
+
+    Only an axis with at least two full turns of travel is treated as one that can wrap.
+    A 370 degree range is a wide joint, not a turn-enabled one: J1 on this machine stops at
+    plus or minus 185 and cannot be told to come the other way round.
+    """
+    if limits is None or not solutions:
+        return list(solutions)
+    spans = [(float(upper) - float(lower)) for lower, upper in limits]
+    out: list = [solutions[0]]
+    for index in range(1, len(solutions)):
+        first, second = out[index - 1], solutions[index]
+        if first is None or second is None:
+            out.append(second)
+            continue
+        joints = [float(value) for value in second.joints_deg]
+        moved = False
+        for axis, span in enumerate(spans):
+            if span < 2.0 * _FULL_TURN_DEG - 1e-6:
+                continue
+            lower, upper = (float(limits[axis][0]), float(limits[axis][1]))
+            shift = round((float(first.joints_deg[axis]) - joints[axis]) / _FULL_TURN_DEG)
+            if not shift:
+                continue
+            shifted = joints[axis] + shift * _FULL_TURN_DEG
+            if not lower <= shifted <= upper:
+                continue
+            if abs(shifted) > _FULL_TURN_DEG or abs(joints[axis]) > _FULL_TURN_DEG:
+                continue
+            joints[axis] = shifted
+            moved = True
+        out.append(replace(second, joints_deg=tuple(joints)) if moved else second)
+    return out
 
 
 def _step_between(first, second) -> float:
@@ -868,6 +1159,33 @@ def _step_between(first, second) -> float:
     delta = (np.asarray(second.joints_deg, dtype=float)
              - np.asarray(first.joints_deg, dtype=float))
     return float(np.max(np.abs((delta + 180.0) % 360.0 - 180.0)))
+
+
+def _axis_step_between(first, second, axis: int) -> float:
+    """One axis' joint change between two solutions, in degrees, shortest way round."""
+    if first is None or second is None:
+        return 0.0
+    delta = float(second.joints_deg[axis]) - float(first.joints_deg[axis])
+    return abs((delta + 180.0) % 360.0 - 180.0)
+
+
+def _config_penalty(first, second) -> float:
+    """The extra cost of changing the arm's CONFIG letters between two points.
+
+    The letters say which posture the arm is in - front or back, elbow up or down, wrist
+    flipped or not - and two postures for the same tool pose are not two nearby joint
+    vectors: the controller swings the whole arm round to get from one to the other. On the
+    2026-10-28 program that swing was J1 167.6 deg out and J3 158.8 deg in, in the middle of
+    a scan. It is invisible to every clearance check in this module (they only see the tool
+    path), so it is charged here instead, where the sequence is chosen.
+
+    A charge, not a prohibition: a point whose only solution is in another family keeps it.
+    """
+    if first is None or second is None:
+        return 0.0
+    one = str(getattr(first, "config", "")).split(",")[0].strip()
+    other = str(getattr(second, "config", "")).split(",")[0].strip()
+    return 0.0 if one == other else _CONFIG_CHANGE_COST_DEG
 
 
 def transition_poses(plan: PathPlan, cfg: PlannerConfig) -> list[ScannerPose]:

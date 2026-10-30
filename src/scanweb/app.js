@@ -11,12 +11,24 @@ const AXIS_LABELS = { "+X": "车尾 +X", "-X": "车头 −X", "+Y": "右侧 +Y",
 const MODEL_LABELS = { part: "零件", support: "夹具", base: "底座" };
 const MAX_TRIANGLES = 500000;
 
+// 补充扫描面：主扫描面（整车方向那块）由第 01 步决定，这里点选的面是「额外再扫」的面——
+// 它们会加进主扫描面，不会缩小主扫描面。每点一下选中整整一块平直面（沿相连三角形生长，
+// 与点击面法向相差不超过 REGION_FACE_DEG），不细碎切割。这块面的三角形原样交给服务端，
+// 服务端按「离这些三角形不超过 REGION_TOLERANCE_MM、朝向一致」把它们并进目标面。
+const REGION_FACE_DEG = 15;
+const REGION_NORMAL_DEG = 20;
+const REGION_TOLERANCE_MM = 0.5;
+const REGION_SEND_TRIANGLES = 6000;
+const REGION_MAX_FACES = 12;
+const REGION_MAX_TRIANGLES = 400000;
+const REGION_VERTEX_MM = 0.05;
+
 const state = {
   models: {},
   picked: [],
   pointCount: 3,
   measured: Array.from({ length: 4 }, () => ["", "", ""]),
-  autoFace: false,
+  scanRegions: [],
   registration: null,
   solving: false,
   result: null,
@@ -29,30 +41,42 @@ let registrationTimer = 0;
 let registrationRequest = 0;
 let toastTimer = 0;
 
-const glState = {
-  gl: null,
-  meshProgram: null,
-  flatProgram: null,
-  meshLoc: {},
-  flatLoc: {},
-  meshes: {},
-  center: [0, 0, 0],
-  radius: 1000,
-  distance: 2600,
-  yaw: -Math.PI / 3,
-  pitch: Math.PI / 6,
-  home: null,
-  pathLine: null,
-  pathLineCount: 0,
-  pathPoint: null,
-  pathPointCount: 0,
-  raf: 0,
-  drag: null,
-  lastView: null,
-  lastProjection: null,
-  lastWidth: 1,
-  lastHeight: 1
-};
+// 两个独立的 WebGL 视图：定位点 3D 视图与扫描面 3D 视图。两者共用同一份模型数据，
+// 但相机、缓冲区与交互互不影响；扫描面点选因此不会和选定位点抢同一次点击。
+function createView(canvasId, overlayId, kind) {
+  return {
+    canvasId, overlayId, kind,
+    gl: null,
+    meshProgram: null,
+    flatProgram: null,
+    meshLoc: {},
+    flatLoc: {},
+    meshes: {},
+    center: [0, 0, 0],
+    radius: 1000,
+    distance: 2600,
+    yaw: -Math.PI / 3,
+    pitch: Math.PI / 6,
+    home: null,
+    fitted: false,
+    pathLine: null,
+    pathLineCount: 0,
+    pathPoint: null,
+    pathPointCount: 0,
+    scanRegionBuffer: null,
+    scanRegionCount: 0,
+    raf: 0,
+    drag: null,
+    lastView: null,
+    lastProjection: null,
+    lastWidth: 1,
+    lastHeight: 1
+  };
+}
+
+const datumView = createView("modelCanvas", "overlayCanvas", "datum");
+const faceView = createView("faceCanvas", "faceOverlayCanvas", "faces");
+const allViews = [datumView, faceView];
 
 /* ---------- small vector / matrix helpers ---------- */
 
@@ -81,14 +105,14 @@ function rotate3(m, v) {
   ];
 }
 
-function camera() {
-  const cp = Math.cos(glState.pitch);
+function camera(view) {
+  const cp = Math.cos(view.pitch);
   const eye = [
-    glState.center[0] + glState.distance * cp * Math.cos(glState.yaw),
-    glState.center[1] + glState.distance * cp * Math.sin(glState.yaw),
-    glState.center[2] + glState.distance * Math.sin(glState.pitch)
+    view.center[0] + view.distance * cp * Math.cos(view.yaw),
+    view.center[1] + view.distance * cp * Math.sin(view.yaw),
+    view.center[2] + view.distance * Math.sin(view.pitch)
   ];
-  const forward = unit(sub(glState.center, eye));
+  const forward = unit(sub(view.center, eye));
   const right = unit(cross(forward, [0, 0, 1]));
   const up = cross(right, forward);
   return { eye, forward, right, up };
@@ -151,16 +175,17 @@ function link(gl, vertexSource, fragmentSource) {
   return program;
 }
 
-function initRenderer() {
-  const canvas = $("modelCanvas");
+function initRenderer(view) {
+  const canvas = $(view.canvasId);
+  if (!canvas) return;
   const gl = canvas.getContext("webgl", { antialias: true, alpha: false, preserveDrawingBuffer: true });
   if (!gl) {
     setRegistrationStatus("当前浏览器无法初始化 WebGL，3D 视图不可用，但配准与规划仍可使用。", "bad");
     return;
   }
-  glState.gl = gl;
+  view.gl = gl;
   try {
-    glState.meshProgram = link(gl,
+    view.meshProgram = link(gl,
       [
         "attribute vec3 aPos;", "attribute vec3 aNrm;",
         "uniform mat4 uProj;", "uniform mat4 uView;", "uniform mat3 uNormal;",
@@ -192,7 +217,7 @@ function initRenderer() {
         "}"
       ].join("\n")
     );
-    glState.flatProgram = link(gl,
+    view.flatProgram = link(gl,
       [
         "attribute vec3 aPos;",
         "uniform mat4 uProj;", "uniform mat4 uView;",
@@ -212,27 +237,27 @@ function initRenderer() {
     );
   } catch (error) {
     setRegistrationStatus("3D 渲染器初始化失败：" + error.message, "bad");
-    glState.gl = null;
+    view.gl = null;
     return;
   }
-  glState.meshLoc = {
-    pos: gl.getAttribLocation(glState.meshProgram, "aPos"),
-    nrm: gl.getAttribLocation(glState.meshProgram, "aNrm"),
-    proj: gl.getUniformLocation(glState.meshProgram, "uProj"),
-    view: gl.getUniformLocation(glState.meshProgram, "uView"),
-    normal: gl.getUniformLocation(glState.meshProgram, "uNormal"),
-    color: gl.getUniformLocation(glState.meshProgram, "uColor"),
-    axis: gl.getUniformLocation(glState.meshProgram, "uScanAxis"),
-    highlight: gl.getUniformLocation(glState.meshProgram, "uHighlight")
+  view.meshLoc = {
+    pos: gl.getAttribLocation(view.meshProgram, "aPos"),
+    nrm: gl.getAttribLocation(view.meshProgram, "aNrm"),
+    proj: gl.getUniformLocation(view.meshProgram, "uProj"),
+    view: gl.getUniformLocation(view.meshProgram, "uView"),
+    normal: gl.getUniformLocation(view.meshProgram, "uNormal"),
+    color: gl.getUniformLocation(view.meshProgram, "uColor"),
+    axis: gl.getUniformLocation(view.meshProgram, "uScanAxis"),
+    highlight: gl.getUniformLocation(view.meshProgram, "uHighlight")
   };
-  glState.flatLoc = {
-    pos: gl.getAttribLocation(glState.flatProgram, "aPos"),
-    proj: gl.getUniformLocation(glState.flatProgram, "uProj"),
-    view: gl.getUniformLocation(glState.flatProgram, "uView"),
-    size: gl.getUniformLocation(glState.flatProgram, "uSize"),
-    shift: gl.getUniformLocation(glState.flatProgram, "uShift"),
-    color: gl.getUniformLocation(glState.flatProgram, "uColor"),
-    alpha: gl.getUniformLocation(glState.flatProgram, "uAlpha")
+  view.flatLoc = {
+    pos: gl.getAttribLocation(view.flatProgram, "aPos"),
+    proj: gl.getUniformLocation(view.flatProgram, "uProj"),
+    view: gl.getUniformLocation(view.flatProgram, "uView"),
+    size: gl.getUniformLocation(view.flatProgram, "uSize"),
+    shift: gl.getUniformLocation(view.flatProgram, "uShift"),
+    color: gl.getUniformLocation(view.flatProgram, "uColor"),
+    alpha: gl.getUniformLocation(view.flatProgram, "uAlpha")
   };
   gl.enable(gl.DEPTH_TEST);
   gl.depthFunc(gl.LEQUAL);
@@ -253,8 +278,8 @@ function computeBounds(triangles) {
   return { low, high };
 }
 
-function buildMeshBuffers(name, triangles) {
-  const gl = glState.gl;
+function buildMeshBuffers(view, name, triangles) {
+  const gl = view.gl;
   if (!gl) return;
   const positions = new Float32Array(triangles.length * 9);
   const normals = new Float32Array(triangles.length * 9);
@@ -273,7 +298,7 @@ function buildMeshBuffers(name, triangles) {
       normals[offset + 2] = normal[2];
     }
   }
-  const previous = glState.meshes[name];
+  const previous = view.meshes[name];
   if (previous) {
     gl.deleteBuffer(previous.posBuffer);
     gl.deleteBuffer(previous.nrmBuffer);
@@ -284,14 +309,14 @@ function buildMeshBuffers(name, triangles) {
   const nrmBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
-  glState.meshes[name] = { posBuffer, nrmBuffer, count: triangles.length * 3 };
+  view.meshes[name] = { posBuffer, nrmBuffer, count: triangles.length * 3 };
 }
 
-function render() {
-  glState.raf = 0;
-  const gl = glState.gl;
-  const canvas = $("modelCanvas");
-  const overlay = $("overlayCanvas");
+function render(view) {
+  view.raf = 0;
+  const gl = view.gl;
+  const canvas = $(view.canvasId);
+  const overlay = $(view.overlayId);
   if (!gl || !canvas) return;
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const cssWidth = Math.max(canvas.clientWidth, 1);
@@ -306,16 +331,16 @@ function render() {
     overlay.width = width;
     overlay.height = height;
   }
-  glState.lastWidth = cssWidth;
-  glState.lastHeight = cssHeight;
+  view.lastWidth = cssWidth;
+  view.lastHeight = cssHeight;
 
-  const cam = camera();
-  const view = lookAt(cam.eye, glState.center, [0, 0, 1]);
-  const near = Math.max(glState.distance * 0.002, 0.05);
-  const far = Math.max(glState.distance + glState.radius * 8, glState.radius * 12);
+  const cam = camera(view);
+  const viewMatrix = lookAt(cam.eye, view.center, [0, 0, 1]);
+  const near = Math.max(view.distance * 0.002, 0.05);
+  const far = Math.max(view.distance + view.radius * 8, view.radius * 12);
   const projection = perspective(FOV, width / Math.max(height, 1), near, far);
-  glState.lastView = view;
-  glState.lastProjection = projection;
+  view.lastView = viewMatrix;
+  view.lastProjection = projection;
 
   gl.viewport(0, 0, width, height);
   gl.clearColor(0.039, 0.067, 0.102, 1.0);
@@ -324,78 +349,92 @@ function render() {
   gl.disable(gl.BLEND);
 
   const normalMatrix = new Float32Array([
-    view[0], view[1], view[2],
-    view[4], view[5], view[6],
-    view[8], view[9], view[10]
+    viewMatrix[0], viewMatrix[1], viewMatrix[2],
+    viewMatrix[4], viewMatrix[5], viewMatrix[6],
+    viewMatrix[8], viewMatrix[9], viewMatrix[10]
   ]);
-  const scanAxisView = rotate3(view, SIDE_VECTORS[currentAxis()] || [0, 0, 1]);
+  const scanAxisView = rotate3(viewMatrix, SIDE_VECTORS[currentAxis()] || [0, 0, 1]);
   const styles = {
     part: { color: [0.62, 0.67, 0.71], highlight: 1 },
     support: { color: [0.49, 0.56, 0.61], highlight: 0 },
     base: { color: [0.36, 0.43, 0.49], highlight: 0 }
   };
-  gl.useProgram(glState.meshProgram);
-  gl.uniformMatrix4fv(glState.meshLoc.proj, false, projection);
-  gl.uniformMatrix4fv(glState.meshLoc.view, false, view);
-  gl.uniformMatrix3fv(glState.meshLoc.normal, false, normalMatrix);
-  gl.uniform3fv(glState.meshLoc.axis, scanAxisView);
-  gl.enableVertexAttribArray(glState.meshLoc.pos);
-  gl.enableVertexAttribArray(glState.meshLoc.nrm);
+  gl.useProgram(view.meshProgram);
+  gl.uniformMatrix4fv(view.meshLoc.proj, false, projection);
+  gl.uniformMatrix4fv(view.meshLoc.view, false, viewMatrix);
+  gl.uniformMatrix3fv(view.meshLoc.normal, false, normalMatrix);
+  gl.uniform3fv(view.meshLoc.axis, scanAxisView);
+  gl.enableVertexAttribArray(view.meshLoc.pos);
+  gl.enableVertexAttribArray(view.meshLoc.nrm);
+  const showFixture = view.kind === "faces"
+    ? $("scanShowFixture").checked : $("showFixture").checked;
+  const showBase = view.kind === "faces"
+    ? $("scanShowBase").checked : $("showBase").checked;
   for (const name of ["base", "support", "part"]) {
-    if (name === "support" && !$("showFixture").checked) continue;
-    if (name === "base" && !$("showBase").checked) continue;
-    const mesh = glState.meshes[name];
+    if (name === "support" && !showFixture) continue;
+    if (name === "base" && !showBase) continue;
+    const mesh = view.meshes[name];
     if (!mesh) continue;
     gl.bindBuffer(gl.ARRAY_BUFFER, mesh.posBuffer);
-    gl.vertexAttribPointer(glState.meshLoc.pos, 3, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(view.meshLoc.pos, 3, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, mesh.nrmBuffer);
-    gl.vertexAttribPointer(glState.meshLoc.nrm, 3, gl.FLOAT, false, 0, 0);
-    gl.uniform3fv(glState.meshLoc.color, styles[name].color);
-    gl.uniform1f(glState.meshLoc.highlight, styles[name].highlight);
+    gl.vertexAttribPointer(view.meshLoc.nrm, 3, gl.FLOAT, false, 0, 0);
+    gl.uniform3fv(view.meshLoc.color, styles[name].color);
+    gl.uniform1f(view.meshLoc.highlight, styles[name].highlight);
     gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
   }
 
-  gl.useProgram(glState.flatProgram);
-  gl.uniformMatrix4fv(glState.flatLoc.proj, false, projection);
-  gl.uniformMatrix4fv(glState.flatLoc.view, false, view);
-  gl.enableVertexAttribArray(glState.flatLoc.pos);
-  if (glState.meshLoc.nrm >= 0) gl.disableVertexAttribArray(glState.meshLoc.nrm);
+  gl.useProgram(view.flatProgram);
+  gl.uniformMatrix4fv(view.flatLoc.proj, false, projection);
+  gl.uniformMatrix4fv(view.flatLoc.view, false, viewMatrix);
+  gl.enableVertexAttribArray(view.flatLoc.pos);
+  if (view.meshLoc.nrm >= 0) gl.disableVertexAttribArray(view.meshLoc.nrm);
 
-  const shift = glState.radius * 0.004;
-  if (state.result && state.showPath && $("showPath").checked && glState.pathLine) {
+  const shift = view.radius * 0.004;
+  if (view.kind === "faces" && view.scanRegionCount > 0 && view.scanRegionBuffer) {
+    // 点选的扫描面正好贴在零件表面上，向相机推移一点只为了避免与零件自身 z-fighting
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    drawFlat(view, view.scanRegionBuffer, gl.TRIANGLES, view.scanRegionCount,
+      [1.0, 0.85, 0.2], 1, shift * 1.5, 0.72);
+    gl.disable(gl.BLEND);
+  }
+  if (view.kind === "datum" && state.result && state.showPath && $("showPath").checked
+    && view.pathLine) {
     gl.disable(gl.DEPTH_TEST);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.lineWidth(Math.max(1, Math.round(2 * dpr)));
-    drawFlat(glState.pathLine, gl.LINES, glState.pathLineCount, [0.06, 0.72, 0.88], 1, 0, 0.95);
-    drawFlat(glState.pathPoint, gl.POINTS, glState.pathPointCount, [1.0, 0.58, 0.12], Math.max(6, 8 * dpr), 0, 1.0);
+    drawFlat(view, view.pathLine, gl.LINES, view.pathLineCount, [0.06, 0.72, 0.88], 1, 0, 0.95);
+    drawFlat(view, view.pathPoint, gl.POINTS, view.pathPointCount, [1.0, 0.58, 0.12], Math.max(6, 8 * dpr), 0, 1.0);
     gl.disable(gl.BLEND);
     gl.enable(gl.DEPTH_TEST);
   }
 
-  drawOverlay(view, projection, cssWidth, cssHeight, dpr);
+  if (view.kind === "datum") drawOverlay(view, viewMatrix, projection, cssWidth, cssHeight, dpr);
 }
 
-function drawFlat(buffer, mode, count, color, size, shift, alpha) {
-  const gl = glState.gl;
+function drawFlat(view, buffer, mode, count, color, size, shift, alpha) {
+  const gl = view.gl;
   if (!buffer || count <= 0) return;
   gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-  gl.vertexAttribPointer(glState.flatLoc.pos, 3, gl.FLOAT, false, 0, 0);
-  gl.uniform3fv(glState.flatLoc.color, color);
-  gl.uniform1f(glState.flatLoc.size, size);
-  gl.uniform1f(glState.flatLoc.shift, shift);
-  gl.uniform1f(glState.flatLoc.alpha, alpha);
+  gl.vertexAttribPointer(view.flatLoc.pos, 3, gl.FLOAT, false, 0, 0);
+  gl.uniform3fv(view.flatLoc.color, color);
+  gl.uniform1f(view.flatLoc.size, size);
+  gl.uniform1f(view.flatLoc.shift, shift);
+  gl.uniform1f(view.flatLoc.alpha, alpha);
   gl.drawArrays(mode, 0, count);
 }
 
-function drawOverlay(view, projection, width, height, dpr) {
-  const canvas = $("overlayCanvas");
+function drawOverlay(view, viewMatrix, projection, width, height, dpr) {
+  const canvas = $(view.overlayId);
+  if (!canvas) return;
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
   const points = state.picked.slice(0, state.pointCount);
   points.forEach((point, index) => {
-    const projected = projectPoint(view, projection, width, height, point);
+    const projected = projectPoint(viewMatrix, projection, width, height, point);
     if (!projected) return;
     ctx.beginPath();
     ctx.arc(projected.x, projected.y, 7, 0, Math.PI * 2);
@@ -414,9 +453,14 @@ function drawOverlay(view, projection, width, height, dpr) {
   });
 }
 
-function requestRender() {
-  if (glState.raf) return;
-  glState.raf = requestAnimationFrame(render);
+function requestRender(view) {
+  const target = view || datumView;
+  if (target.raf) return;
+  target.raf = requestAnimationFrame(() => render(target));
+}
+
+function requestRenderAll() {
+  for (const view of allViews) requestRender(view);
 }
 
 /* ---------- scene camera and picking ---------- */
@@ -434,40 +478,47 @@ function refreshBounds(forceFit) {
     }
   }
   if (!any) return;
-  glState.center = [(low[0] + high[0]) / 2, (low[1] + high[1]) / 2, (low[2] + high[2]) / 2];
-  glState.radius = Math.max(1, 0.5 * Math.hypot(high[0] - low[0], high[1] - low[1], high[2] - low[2]));
-  glState.home = { center: glState.center.slice(), radius: glState.radius };
-  if (forceFit || !glState.fitted) {
-    fitView();
-    glState.fitted = true;
+  for (const view of allViews) {
+    view.center = [(low[0] + high[0]) / 2, (low[1] + high[1]) / 2, (low[2] + high[2]) / 2];
+    view.radius = Math.max(1, 0.5 * Math.hypot(high[0] - low[0], high[1] - low[1],
+      high[2] - low[2]));
+    view.home = { center: view.center.slice(), radius: view.radius };
+    if (forceFit || !view.fitted) {
+      fitView(view);
+      view.fitted = true;
+    }
   }
   $("stageEmpty").style.display = "none";
-  requestRender();
+  const faceEmpty = $("faceStageEmpty");
+  if (faceEmpty) faceEmpty.style.display = "none";
+  requestRenderAll();
 }
 
-function fitView() {
-  if (!glState.home) return;
-  glState.center = glState.home.center.slice();
-  glState.radius = glState.home.radius;
-  glState.distance = Math.max(glState.radius * 2.6, 10);
-  glState.yaw = -Math.PI / 3;
-  glState.pitch = Math.PI / 6;
-  requestRender();
+function fitView(view) {
+  const target = view && view.canvasId ? view : datumView;
+  if (!target.home) return;
+  target.center = target.home.center.slice();
+  target.radius = target.home.radius;
+  target.distance = Math.max(target.radius * 2.6, 10);
+  target.yaw = -Math.PI / 3;
+  target.pitch = Math.PI / 6;
+  requestRender(target);
 }
 
-function lookAlongAxis() {
-  if (!glState.home) return;
-  glState.center = glState.home.center.slice();
-  glState.distance = Math.max(glState.radius * 2.3, 10);
+function lookAlongAxis(view) {
+  const target = view || datumView;
+  if (!target.home) return;
+  target.center = target.home.center.slice();
+  target.distance = Math.max(target.radius * 2.3, 10);
   const axis = currentAxis();
   const angles = {
     "+X": [0, 0], "-X": [Math.PI, 0],
     "+Y": [Math.PI / 2, 0], "-Y": [-Math.PI / 2, 0],
     "+Z": [-Math.PI / 2, Math.PI / 2 - 0.001], "-Z": [-Math.PI / 2, -Math.PI / 2 + 0.001]
   };
-  glState.yaw = angles[axis][0];
-  glState.pitch = angles[axis][1];
-  requestRender();
+  target.yaw = angles[axis][0];
+  target.pitch = angles[axis][1];
+  requestRender(target);
 }
 
 function resetPicks() {
@@ -497,22 +548,326 @@ function undoPoint() {
   setRegistrationStatus("已撤销 P" + index + "，下一次点击将重新选择该点。");
 }
 
-function pickScene(clientX, clientY) {
-  const canvas = $("modelCanvas");
+/* ---------- supplementary scan faces ---------- */
+
+// 主扫描面由第 01 步的整车方向决定；这里点选的是「额外再扫」的面，加进主扫描面，
+// 不会缩小主扫描面。可以连续点选多块。
+
+function rawNormal(triangle) {
+  return cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]));
+}
+
+function triangleNormals(model) {
+  if (!model.normals) {
+    model.normals = model.triangles.map((triangle) => {
+      const normal = rawNormal(triangle);
+      const length = Math.hypot(normal[0], normal[1], normal[2]);
+      return length > 0 ? [normal[0] / length, normal[1] / length, normal[2] / length] : [0, 0, 0];
+    });
+  }
+  return model.normals;
+}
+
+function triangleCentroids(model) {
+  if (!model.centroids) {
+    model.centroids = model.triangles.map((triangle) => [
+      (triangle[0][0] + triangle[1][0] + triangle[2][0]) / 3,
+      (triangle[0][1] + triangle[1][1] + triangle[2][1]) / 3,
+      (triangle[0][2] + triangle[1][2] + triangle[2][2]) / 3
+    ]);
+  }
+  return model.centroids;
+}
+
+function vertexKey(point) {
+  const step = 1 / REGION_VERTEX_MM;
+  return Math.round(point[0] * step) + "|" + Math.round(point[1] * step) + "|"
+    + Math.round(point[2] * step);
+}
+
+function vertexBuckets(model) {
+  if (!model.buckets) {
+    const buckets = new Map();
+    model.triangles.forEach((triangle, index) => {
+      for (const point of triangle) {
+        const key = vertexKey(point);
+        const list = buckets.get(key);
+        if (list) list.push(index); else buckets.set(key, [index]);
+      }
+    });
+    model.buckets = buckets;
+  }
+  return model.buckets;
+}
+
+// CAD 数模按曲面分块网格化，接缝处顶点不重合，所以「相连」还要看重心距离。link 由整块模型的
+// 典型三角形尺寸定：真实数模里细长的碎三角形会把边长中位数压得很小，补丁就长不出去了。
+function meshLink(model) {
+  if (!model.link) {
+    const step = Math.max(1, Math.floor(model.triangles.length / 4000));
+    let area = 0;
+    let counted = 0;
+    for (let index = 0; index < model.triangles.length; index += step) {
+      const normal = rawNormal(model.triangles[index]);
+      area += 0.5 * Math.hypot(normal[0], normal[1], normal[2]);
+      counted += 1;
+    }
+    const typical = counted ? Math.sqrt(2 * (area / counted)) : 1.0;
+    model.link = Math.max(0.5, 1.2 * typical);
+  }
+  return model.link;
+}
+
+function triangleGrid(model) {
+  const link = meshLink(model);
+  if (model.grid && model.grid.link === link) return model.grid;
+  const cells = new Map();
+  triangleCentroids(model).forEach((centre, index) => {
+    const key = Math.floor(centre[0] / link) + "|" + Math.floor(centre[1] / link) + "|"
+      + Math.floor(centre[2] / link);
+    const list = cells.get(key);
+    if (list) list.push(index); else cells.set(key, [index]);
+  });
+  model.grid = { link, cells };
+  return model.grid;
+}
+
+// 一块「扫描面」= 点击处所在的整块平直面：沿相连的三角形生长，只要它与点击面法向相差不超过
+// REGION_FACE_DEG。法向比较的是与种子的夹角，所以弯曲超过该角度的地方会自然停下、留给下一次
+// 点选——而不是把一整块平面切成一堆小碎块。
+function growPatch(model, seedIndex, origin, normal) {
+  const normals = triangleNormals(model);
+  const centroids = triangleCentroids(model);
+  const buckets = vertexBuckets(model);
+  const { link, cells } = triangleGrid(model);
+  const limit = Math.cos(REGION_FACE_DEG * Math.PI / 180);
+  const seedNormal = normals[seedIndex] || normal;
+  const seen = new Uint8Array(model.triangles.length);
+  const patch = [];
+  const queue = [seedIndex];
+  seen[seedIndex] = 1;
+  const accept = (other) => {
+    if (seen[other]) return;
+    if (dot(normals[other], seedNormal) < limit) return;
+    seen[other] = 1;
+    queue.push(other);
+  };
+  while (queue.length && patch.length < REGION_MAX_TRIANGLES) {
+    const index = queue.pop();
+    patch.push(index);
+    for (const point of model.triangles[index]) {
+      for (const other of buckets.get(vertexKey(point)) || []) accept(other);
+    }
+    const centre = centroids[index];
+    const base = [Math.floor(centre[0] / link), Math.floor(centre[1] / link),
+      Math.floor(centre[2] / link)];
+    for (let dx = -1; dx <= 1; dx += 1) {
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dz = -1; dz <= 1; dz += 1) {
+          const bucket = cells.get((base[0] + dx) + "|" + (base[1] + dy) + "|"
+            + (base[2] + dz));
+          if (!bucket) continue;
+          for (const other of bucket) {
+            if (seen[other]) continue;
+            const gap = sub(centroids[other], centre);
+            if (Math.hypot(gap[0], gap[1], gap[2]) > link) continue;
+            accept(other);
+          }
+        }
+      }
+    }
+  }
+  return patch;
+}
+
+function patchArea(model, patch) {
+  let area = 0;
+  for (const index of patch) {
+    const normal = rawNormal(model.triangles[index]);
+    area += 0.5 * Math.hypot(normal[0], normal[1], normal[2]);
+  }
+  return area;
+}
+
+// 直接把这块面自己的三角形交给服务端：服务端按「采样点离这些三角形不超过 tolerance_mm、
+// 朝向一致」判定，所以扫到的就是这里高亮出来的那块面，没点到的孔与凹腔里没有三角形。
+function regionFromPatch(model, patch, origin, normal) {
+  const step = Math.ceil(patch.length / REGION_SEND_TRIANGLES);
+  const triangles = [];
+  for (let index = 0; index < patch.length; index += step) {
+    triangles.push(model.triangles[patch[index]].map(
+      (point) => point.map((value) => round(value))
+    ));
+  }
+  return {
+    origin: origin.slice(),
+    normal,
+    toleranceMm: REGION_TOLERANCE_MM,
+    geometry: triangles
+  };
+}
+
+
+// 从历史记录恢复的点选面：服务端回传的就是这些三角形，按顶点坐标找回模型里的序号，
+// 高亮与规划范围因此都不需要重算几何。
+function triangleKey(triangle) {
+  return triangle.map((point) => vertexKey(point)).sort().join("/");
+}
+
+function triangleIndexMap(model) {
+  if (!model.triangleKeys) {
+    const map = new Map();
+    model.triangles.forEach((triangle, index) => {
+      const key = triangleKey(triangle);
+      if (!map.has(key)) map.set(key, index);
+    });
+    model.triangleKeys = map;
+  }
+  return model.triangleKeys;
+}
+
+
+
+function scanRegionSummary() {
+  if (!state.scanRegions.length) return "";
+  const area = state.scanRegions.reduce((sum, region) => sum + region.areaMm2, 0);
+  return "补充扫描面 " + state.scanRegions.length + " 块 · 额外 " + (area / 1e6).toFixed(3)
+    + " m²（加在主扫描面之上）";
+}
+
+function buildScanRegionBuffer() {
+  const gl = faceView.gl;
+  const model = state.models.part;
+  if (!gl || !model || !state.scanRegions.length) {
+    faceView.scanRegionCount = 0;
+    return;
+  }
+  const positions = [];
+  for (const region of state.scanRegions) {
+    for (const index of region.indices || []) {
+      const triangle = model.triangles[index];
+      if (!triangle) continue;
+      for (const point of triangle) {
+        positions.push(point[0], point[1], point[2]);
+      }
+    }
+  }
+  if (!positions.length) {
+    faceView.scanRegionCount = 0;
+    return;
+  }
+  if (!faceView.scanRegionBuffer) faceView.scanRegionBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, faceView.scanRegionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.DYNAMIC_DRAW);
+  faceView.scanRegionCount = positions.length / 3;
+}
+
+function refreshScanRegions() {
+  // 补充面不改主扫描面方向：第 01 步选的整车方向始终是主扫描面
+  buildScanRegionBuffer();
+  updateAxisBadge($("axisBadge").textContent);
+  updatePickInstruction();
+  requestRenderAll();
+}
+
+function addScanRegion(hit) {
+  const model = state.models.part;
+  if (!model) return;
+  if (state.scanRegions.length >= REGION_MAX_FACES) {
+    toast("最多补充 " + REGION_MAX_FACES + " 块扫描面；先撤销或清空再继续");
+    return;
+  }
+  const patch = growPatch(model, hit.triangle, hit.point, hit.normal);
+  // 同一块面再点一次不该多出一条记录：这块面已有九成以上被选过就当作重复点击
+  const chosen = new Set();
+  for (const region of state.scanRegions) {
+    for (const index of region.indices) chosen.add(index);
+  }
+  const fresh = patch.filter((index) => !chosen.has(index)).length;
+  if (patch.length && fresh / patch.length <= 0.1) {
+    toast("这块面已经选过了（第 " + (state.scanRegions.length) + " 块就包含它）");
+    return;
+  }
+  const region = regionFromPatch(model, patch, hit.point, hit.normal);
+  state.scanRegions.push({
+    ...region,
+    indices: patch,
+    areaMm2: patchArea(model, patch)
+  });
+  refreshScanRegions();
+  toast("已加入第 " + state.scanRegions.length + " 块补充扫描面（"
+    + (patchArea(model, patch) / 1e6).toFixed(3) + " m²，加在主扫描面之上）；可继续点选，右键撤销");
+}
+
+function undoScanRegion() {
+  if (!state.scanRegions.length) {
+    toast("当前没有可撤销的扫描面");
+    return;
+  }
+  state.scanRegions.pop();
+  refreshScanRegions();
+  toast(state.scanRegions.length
+    ? "已撤销，剩下 " + state.scanRegions.length + " 块补充扫描面"
+    : "补充扫描面已清空，只扫主扫描面");
+}
+
+function clearScanRegions() {
+  state.scanRegions = [];
+  buildScanRegionBuffer();
+  updateAxisBadge("已清空补充扫描面");
+  updatePickInstruction();
+  requestRenderAll();
+}
+
+function restoreScanRegions(regions) {
+  const model = state.models.part;
+  state.scanRegions = [];
+  if (!model || !Array.isArray(regions)) {
+    buildScanRegionBuffer();
+    return;
+  }
+  for (const record of regions) {
+    if (!record || !Array.isArray(record.triangles) || !record.triangles.length) continue;
+    const lookup = triangleIndexMap(model);
+    const triangles = [];
+    for (const triangle of record.triangles) {
+      const index = lookup.get(triangleKey(triangle.map((corner) => corner.map(Number))));
+      if (index !== undefined) triangles.push(index);
+    }
+    if (!triangles.length) continue;
+    state.scanRegions.push({
+      origin: record.origin.map(Number),
+      normal: unit(record.normal.map(Number)),
+      toleranceMm: Number(record.tolerance_mm) || REGION_TOLERANCE_MM,
+      geometry: record.triangles,
+      indices: triangles,
+      areaMm2: patchArea(model, triangles)
+    });
+  }
+  refreshScanRegions();
+}
+
+function pickScene(view, clientX, clientY) {
+  const canvas = $(view.canvasId);
+  if (!canvas) return null;
   const rect = canvas.getBoundingClientRect();
-  if (!glState.lastView || !glState.lastProjection) return null;
+  if (!view.lastView || !view.lastProjection) return null;
   const x = clientX - rect.left;
   const y = clientY - rect.top;
   const aspect = rect.width / Math.max(rect.height, 1);
   const ndcX = (x / rect.width) * 2 - 1;
   const ndcY = 1 - (y / rect.height) * 2;
-  const cam = camera();
+  const cam = camera(view);
   const tan = Math.tan(FOV / 2);
   const direction = unit(add(cam.forward, add(mul(cam.right, ndcX * tan * aspect), mul(cam.up, ndcY * tan))));
   let best = null;
+  const showFixture = view.kind === "faces"
+    ? $("scanShowFixture").checked : $("showFixture").checked;
+  const showBase = view.kind === "faces"
+    ? $("scanShowBase").checked : $("showBase").checked;
   for (const name of ["part", "support", "base"]) {
-    if (name === "support" && !$("showFixture").checked) continue;
-    if (name === "base" && !$("showBase").checked) continue;
+    if (name === "support" && !showFixture) continue;
+    if (name === "base" && !showBase) continue;
     const model = state.models[name];
     if (!model) continue;
     const triangles = model.triangles;
@@ -536,6 +891,7 @@ function pickScene(clientX, clientY) {
         best = {
           t,
           model: name,
+          triangle: index,
           point: add(cam.eye, mul(direction, t)),
           normal: unit(cross(edge1, edge2))
         };
@@ -546,30 +902,13 @@ function pickScene(clientX, clientY) {
 }
 
 function handleCanvasClick(clientX, clientY) {
-  const hit = pickScene(clientX, clientY);
+  const hit = pickScene(datumView, clientX, clientY);
   if (!hit) {
     toast("没有点中模型表面，请对准零件点击");
     return;
   }
   if (hit.model !== "part") {
     toast("请点击零件表面选择定位点，不要点到夹具或底座");
-    return;
-  }
-  if (state.autoFace) {
-    const normal = hit.normal;
-    const component = [Math.abs(normal[0]), Math.abs(normal[1]), Math.abs(normal[2])];
-    let axisIndex = 0;
-    if (component[1] > component[axisIndex]) axisIndex = 1;
-    if (component[2] > component[axisIndex]) axisIndex = 2;
-    const sign = normal[axisIndex] >= 0 ? "+" : "-";
-    const axis = sign + "XYZ"[axisIndex];
-    $("scanAxis").value = axis;
-    state.autoFace = false;
-    $("pickAxis").classList.remove("active");
-    updateAxisBadge("已按点击表面设为 " + axis);
-    renderDatumRows();
-    requestRender();
-    toast("已根据点击表面选择扫描面 " + axis);
     return;
   }
   if (state.picked.length >= state.pointCount) {
@@ -581,12 +920,134 @@ function handleCanvasClick(clientX, clientY) {
   registrationRequest += 1;
   renderDatumRows();
   updateSolveAvailability();
-  requestRender();
+  requestRender(datumView);
   setRegistrationStatus("已选 P" + state.picked.length + "，请继续选择并填写现场坐标。");
   scheduleRegistrationCheck();
 }
 
+// 扫描面视图里的点击：一下选中整整一块平整面，不进入任何模式，也不会影响定位点。
+function handleFaceClick(clientX, clientY) {
+  const hit = pickScene(faceView, clientX, clientY);
+  if (!hit) {
+    toast("没有点中模型表面，请对准零件点击");
+    return;
+  }
+  if (hit.model !== "part") {
+    toast("请点击零件表面选择扫描面，不要点到夹具或底座");
+    return;
+  }
+  addScanRegion(hit);
+}
+
 function round(value) { return Math.round(value * 1000) / 1000; }
+
+/* ---------- remembered field coordinates ---------- */
+
+// 现场坐标很少每次都重新量，所以把上一次填进定位点表格的 X/Y/Z 记在浏览器本地，
+// 下次打开页面时直接回填。它只是输入便利：表格仍然要配合本次点选的定位点使用，
+// 回填后照常重算配准，清空按钮可以丢弃这份记录。
+const DATUM_MEMORY_KEY = "scanplan.datum.measured.v1";
+
+function datumMemoryStorage() {
+  try {
+    return window.localStorage || null;
+  } catch (_) {
+    // 浏览器禁用存储时表格照常可用，只是不再记忆
+    return null;
+  }
+}
+
+function readDatumMemory() {
+  const storage = datumMemoryStorage();
+  if (!storage) return null;
+  let parsed = null;
+  try {
+    const raw = storage.getItem(DATUM_MEMORY_KEY);
+    parsed = raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+  const rows = parsed && Array.isArray(parsed.rows) ? parsed.rows : [];
+  const values = Array.from({ length: 4 }, (_, index) => {
+    const row = Array.isArray(rows[index]) ? rows[index] : [];
+    return [0, 1, 2].map((axis) => {
+      const value = row[axis];
+      return value === null || value === undefined ? "" : String(value);
+    });
+  });
+  if (!values.some((row) => row.some((value) => value !== ""))) return null;
+  return { rows: values, savedAt: parsed && typeof parsed.savedAt === "string" ? parsed.savedAt : "" };
+}
+
+let datumMemoryTimer = 0;
+
+function saveDatumMemory() {
+  window.clearTimeout(datumMemoryTimer);
+  const storage = datumMemoryStorage();
+  if (!storage) return;
+  const rows = state.measured.map((row) => row.map((value) => (value === null || value === undefined) ? "" : String(value)));
+  try {
+    if (rows.every((row) => row.every((value) => value === ""))) {
+      storage.removeItem(DATUM_MEMORY_KEY);
+      return;
+    }
+    storage.setItem(DATUM_MEMORY_KEY, JSON.stringify({
+      rows,
+      savedAt: new Date().toISOString()
+    }));
+  } catch (_) {
+    // 配额已满或处于隐私模式：记忆只是便利，失败不影响规划
+  }
+}
+
+function scheduleDatumMemorySave() {
+  window.clearTimeout(datumMemoryTimer);
+  datumMemoryTimer = window.setTimeout(saveDatumMemory, 300);
+}
+
+function renderDatumMemoryNote(memory) {
+  const note = $("datumMemoryNote");
+  if (!note) return;
+  note.hidden = !memory;
+  const text = $("datumMemoryText");
+  if (!memory || !text) return;
+  const when = new Date(memory.savedAt);
+  const stamp = memory.savedAt && !Number.isNaN(when.getTime())
+    ? when.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+    : "";
+  text.textContent = "已载入上次填写的现场坐标" + (stamp ? "（" + stamp + "）" : "")
+    + "，请核对是否与本次点选的定位点一致。";
+}
+
+// 回填上一次的现场坐标；没有记录时保持空表。
+function restoreDatumMemory() {
+  const memory = readDatumMemory();
+  state.measured = memory
+    ? memory.rows.map((row) => row.slice())
+    : Array.from({ length: 4 }, () => ["", "", ""]);
+  renderDatumMemoryNote(memory);
+  return Boolean(memory);
+}
+
+function clearDatumMemory() {
+  window.clearTimeout(datumMemoryTimer);
+  const storage = datumMemoryStorage();
+  try {
+    if (storage) storage.removeItem(DATUM_MEMORY_KEY);
+  } catch (_) {
+    // 存储不可用时只清空表格
+  }
+  renderDatumMemoryNote(null);
+  state.measured = Array.from({ length: 4 }, () => ["", "", ""]);
+  state.registration = null;
+  registrationRequest += 1;
+  window.clearTimeout(registrationTimer);
+  renderDatumRows();
+  if (state.result) renderRelocatePanel(state.result);
+  updateSolveAvailability();
+  setRegistrationStatus("已清空上次填写的现场坐标，请重新输入本次实测值。");
+  toast("已清空现场坐标");
+}
 
 /* ---------- UI: models and datum rows ---------- */
 
@@ -691,14 +1152,16 @@ async function loadModel(name, file) {
     bounds: computeBounds(triangles),
     base64: null
   };
-  buildMeshBuffers(name, triangles);
-  const card = document.querySelector('label[for="' + name + 'File"]');
-  if (card) card.classList.add("has-file");
+  for (const view of allViews) buildMeshBuffers(view, name, triangles);
+  const card = document.querySelector('label[for="' + name + 'File"]');  if (card) card.classList.add("has-file");
   const target = $(name + "Name");
   if (target) target.textContent = (file.name || "模型") + " · " + triangles.length.toLocaleString() + " 面";
   if (name === "part") {
     state.picked = [];
     state.registration = null;
+    state.scanRegions = [];
+    faceView.scanRegionCount = 0;
+    updatePickInstruction();
     registrationRequest += 1;
     renderDatumRows();
     recommendAxis(false);
@@ -739,6 +1202,7 @@ function renderDatumRows() {
         mirrorDatumInput("relocateRows", index, axis, input.value);
         state.registration = null;
         updateSolveAvailability();
+        scheduleDatumMemorySave();
         scheduleRegistrationCheck();
       });
       cell.append(input);
@@ -748,9 +1212,17 @@ function renderDatumRows() {
   }
   $("pointCounter").textContent = "已选 " + state.picked.length + " / " + state.pointCount;
   $("canvasCounter").textContent = state.picked.length + " / " + state.pointCount;
-  $("pickInstruction").textContent = state.autoFace
-    ? "点击零件主扫描面，自动推断整车坐标轴方向"
-    : "按顺序点击零件表面的 P1…P" + state.pointCount + "；右键撤销最后一点";
+  updatePickInstruction();
+}
+
+function updatePickInstruction() {
+  $("pickInstruction").textContent =
+    "按顺序点击零件表面的 P1…P" + state.pointCount + "；右键撤销最后一点";
+  const note = $("scanFaceNote");
+  if (note) {
+    note.textContent = "点一下选中整块面，作为主扫描面之外的补充（已补充 "
+      + state.scanRegions.length + " 块）；右键撤销上一块。";
+  }
 }
 
 function measuredPoints() {
@@ -796,6 +1268,11 @@ function currentAxis() { return $("scanAxis").value; }
 
 function updateAxisBadge(text) {
   $("axisBadge").textContent = text;
+  const note = $("scanFaceBadge");
+  if (note) {
+    note.textContent = scanRegionSummary()
+      || (state.models.part ? "未补充 · 只扫主扫描面" : "—");
+  }
 }
 
 function recommendAxis(showToast) {
@@ -851,8 +1328,10 @@ function updateSolveAvailability() {
 
 function updateWorkflow() {
   const items = document.querySelectorAll("#workflowList li");
+  // 第 2 步（补充点选扫描面）是可选的：零件与夹具就位即算完成，停在第一步或配准未完成时
+  // 当前步骤落在「定位」上。
   const stage = !state.models.part || !state.models.support ? 0
-    : state.picked.length < state.pointCount || !state.registration ? 1 : 2;
+    : state.picked.length < state.pointCount || !state.registration ? 2 : 3;
   items.forEach((item, index) => {
     item.classList.toggle("current", index === stage);
     item.classList.toggle("done", index < stage);
@@ -860,6 +1339,21 @@ function updateWorkflow() {
 }
 
 /* ---------- registration and planning ---------- */
+
+// The point cap is optional: an empty box means "no cap", which is the configuration's own
+// `target.max_points: null`. A value the planner cannot honour is not rejected here - the
+// run reports what it actually delivered - but a nonsense one (zero, negative, fractional)
+// would silently change the meaning of the budget, so it is refused before the run.
+function parseMaxPoints() {
+  const field = $("maxPoints");
+  const raw = field ? field.value.trim() : "";
+  if (raw === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 2 || !Number.isInteger(value)) {
+    throw new Error("最少路径规划点必须是 2 以上的整数，留空表示不限");
+  }
+  return value;
+}
 
 function payload(includeMeshes) {
   if (state.picked.length !== state.pointCount) {
@@ -871,6 +1365,7 @@ function payload(includeMeshes) {
     throw new Error("LS 程序名必须以字母开头，仅含 A–Z、0–9 和下划线，最多 16 字符");
   }
   const runName = $("runName").value.trim();
+  const maxPoints = parseMaxPoints();
   const data = {
     cad_points_vehicle_mm: state.picked.slice(0, state.pointCount),
     measured_points_mm: measuredPoints(),
@@ -883,11 +1378,20 @@ function payload(includeMeshes) {
     run_name: runName || undefined,
     run_id: /^[A-Za-z0-9_-]{1,64}$/.test(runName) ? runName : undefined
   };
+  if (maxPoints !== null) data.max_points = maxPoints;
   if (includeMeshes) {
     data.models = {};
     for (const name of ["part", "support", "base"]) {
       if (state.models[name]) data.models[name] = { stl_base64: state.models[name].base64 };
     }
+  }
+  if (state.scanRegions.length) {
+    data.scan_regions = state.scanRegions.map((region) => ({
+      origin: region.origin.map(round),
+      normal: region.normal.map((value) => Number(value.toFixed(9))),
+      tolerance_mm: Number(region.toleranceMm.toFixed(3)),
+      triangles: region.geometry
+    }));
   }
   return data;
 }
@@ -1263,7 +1767,7 @@ async function solve() {
 }
 
 function buildPathBuffers() {
-  const gl = glState.gl;
+  const gl = datumView.gl;
   if (!gl || !state.result || !Array.isArray(state.result.viewpoints)) return;
   const points = state.result.viewpoints
     .slice()
@@ -1275,14 +1779,14 @@ function buildPathBuffers() {
   }
   const lineData = new Float32Array(line);
   const pointData = new Float32Array(points.flat());
-  if (!glState.pathLine) glState.pathLine = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, glState.pathLine);
+  if (!datumView.pathLine) datumView.pathLine = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, datumView.pathLine);
   gl.bufferData(gl.ARRAY_BUFFER, lineData, gl.STATIC_DRAW);
-  glState.pathLineCount = line.length / 3;
-  if (!glState.pathPoint) glState.pathPoint = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, glState.pathPoint);
+  datumView.pathLineCount = line.length / 3;
+  if (!datumView.pathPoint) datumView.pathPoint = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, datumView.pathPoint);
   gl.bufferData(gl.ARRAY_BUFFER, pointData, gl.STATIC_DRAW);
-  glState.pathPointCount = points.length;
+  datumView.pathPointCount = points.length;
 }
 
 function formatElapsed(seconds) {
@@ -1410,6 +1914,8 @@ function syncSetupFromResult(result) {
     measured.forEach((point, index) => {
       state.measured[index] = point.map((value) => String(round(Number(value))));
     });
+    // 表格现在显示的是这次运行用到的坐标，不再是上次手填的那份
+    renderDatumMemoryNote(null);
   }
   state.registration = {
     measured_frame: result.measured_frame,
@@ -1420,6 +1926,11 @@ function syncSetupFromResult(result) {
   };
   if (result.program_name) $("progName").value = result.program_name;
   if (result.delivery_mode) $("scanMode").value = result.delivery_mode;
+  if (Number.isFinite(Number(result.max_points)) && Number(result.max_points) > 0) {
+    $("maxPoints").value = String(Number(result.max_points));
+  } else if (result.max_points === null) {
+    $("maxPoints").value = "";
+  }
   if (Number.isFinite(Number(result.uframe))) {
     $("measureFrame").value = String(Number(result.uframe));
   }
@@ -1434,6 +1945,11 @@ function syncSetupFromResult(result) {
       $("scanAxis").value = axis;
       updateAxisBadge("本次运行：" + AXIS_LABELS[axis]);
     }
+  }
+  const storedRegions = Array.isArray(result.scan_regions_vehicle)
+    ? result.scan_regions_vehicle : [];
+  if (storedRegions.length && storedRegions.length !== state.scanRegions.length) {
+    restoreScanRegions(storedRegions);
   }
   document.querySelectorAll("[data-point-count]").forEach((button) => {
     button.classList.toggle("active", Number(button.dataset.pointCount) === state.pointCount);
@@ -1485,6 +2001,7 @@ function renderRelocatePanel(result) {
         mirrorDatumInput("datumRows", index, axis, input.value);
         state.registration = null;
         updateSolveAvailability();
+        scheduleDatumMemorySave();
         scheduleRegistrationCheck();
       });
       cell.append(input);
@@ -1674,7 +2191,7 @@ function bindEvents() {
 
   $("scanAxis").addEventListener("change", () => {
     updateAxisBadge("手动选择：" + AXIS_LABELS[currentAxis()]);
-    requestRender();
+    requestRenderAll();
   });
   $("measureFrame").addEventListener("change", () => {
     state.registration = null;
@@ -1688,28 +2205,36 @@ function bindEvents() {
     scheduleRegistrationCheck();
   });
   $("recommendAxis").addEventListener("click", () => recommendAxis(true));
+  // 主扫描面确定之后，补充点选扫描面在下面独立的 3D 视图里做
   $("pickAxis").addEventListener("click", () => {
     if (!state.models.part) {
       toast("请先导入零件 STL");
       return;
     }
-    state.autoFace = !state.autoFace;
-    $("pickAxis").classList.toggle("active", state.autoFace);
-    renderDatumRows();
-    toast(state.autoFace ? "请点击零件主扫描面，自动判断整车坐标轴" : "已取消在模型上点选扫描面");
+    $("scanFacePanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    fitView(faceView);
+    window.setTimeout(() => requestRender(faceView), 120);
+    toast("在「补充点选扫描面」视图里点击零件表面，即选中整块平面");
   });
+  $("clearScanFaces").addEventListener("click", clearScanRegions);
+  $("undoScanFace").addEventListener("click", undoScanRegion);
+  $("fitScanView").addEventListener("click", () => fitView(faceView));
+  $("lookScanAxis").addEventListener("click", () => lookAlongAxis(faceView));
+  $("scanShowFixture").addEventListener("change", () => requestRender(faceView));
+  $("scanShowBase").addEventListener("change", () => requestRender(faceView));
   document.querySelectorAll("[data-point-count]").forEach((button) => {
     button.addEventListener("click", () => setPointCount(Number(button.dataset.pointCount)));
   });
   $("clearPoints").addEventListener("click", resetPicks);
   $("undoPoint").addEventListener("click", undoPoint);
-  $("fitView").addEventListener("click", fitView);
-  $("lookAlongAxis").addEventListener("click", lookAlongAxis);
-  $("showFixture").addEventListener("change", requestRender);
-  $("showBase").addEventListener("change", requestRender);
+  $("clearDatumMemory").addEventListener("click", clearDatumMemory);
+  $("fitView").addEventListener("click", () => fitView(datumView));
+  $("lookAlongAxis").addEventListener("click", () => lookAlongAxis(datumView));
+  $("showFixture").addEventListener("change", () => requestRender(datumView));
+  $("showBase").addEventListener("change", () => requestRender(datumView));
   $("showPath").addEventListener("change", (event) => {
     state.showPath = event.target.checked;
-    requestRender();
+    requestRender(datumView);
   });
   $("solveButton").addEventListener("click", solve);
   $("relocateButton").addEventListener("click", relocate);
@@ -1755,10 +2280,18 @@ function bindEvents() {
   $("historySearch").addEventListener("input", renderHistory);
   $("historyGoSetup").addEventListener("click", () => showView("workspace"));
 
-  const canvas = $("modelCanvas");
+  bindCanvas(datumView, handleCanvasClick, undoPoint);
+  bindCanvas(faceView, handleFaceClick, undoScanRegion);
+}
+
+// 每个 3D 视图各自处理旋转/缩放/平移，点击则交给调用方：定位视图取定位点，
+// 扫描面视图取整块扫描面。两个视图互不影响。
+function bindCanvas(view, onClick, onRightClick) {
+  const canvas = $(view.canvasId);
+  if (!canvas) return;
   canvas.addEventListener("pointerdown", (event) => {
     canvas.setPointerCapture(event.pointerId);
-    glState.drag = {
+    view.drag = {
       x: event.clientX,
       y: event.clientY,
       moved: 0,
@@ -1767,41 +2300,41 @@ function bindEvents() {
     };
   });
   canvas.addEventListener("pointermove", (event) => {
-    const drag = glState.drag;
+    const drag = view.drag;
     if (!drag) return;
     const dx = event.clientX - drag.x;
     const dy = event.clientY - drag.y;
     drag.moved += Math.abs(dx) + Math.abs(dy);
     if (drag.mode === "rotate") {
-      glState.yaw -= dx * 0.008;
-      glState.pitch = clamp(glState.pitch + dy * 0.008, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
+      view.yaw -= dx * 0.008;
+      view.pitch = clamp(view.pitch + dy * 0.008, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
     } else {
-      const cam = camera();
-      const scale = glState.distance * Math.tan(FOV / 2) * 2 / Math.max($("modelCanvas").clientHeight, 1);
-      glState.center = add(glState.center, add(mul(cam.right, -dx * scale), mul(cam.up, dy * scale)));
+      const cam = camera(view);
+      const scale = view.distance * Math.tan(FOV / 2) * 2 / Math.max(canvas.clientHeight, 1);
+      view.center = add(view.center, add(mul(cam.right, -dx * scale), mul(cam.up, dy * scale)));
     }
     drag.x = event.clientX;
     drag.y = event.clientY;
-    requestRender();
+    requestRender(view);
   });
   canvas.addEventListener("pointerup", (event) => {
-    const drag = glState.drag;
-    glState.drag = null;
+    const drag = view.drag;
+    view.drag = null;
     if (!drag) return;
-    if (drag.moved < 5 && drag.button === 0) handleCanvasClick(event.clientX, event.clientY);
+    if (drag.moved < 5 && drag.button === 0) onClick(event.clientX, event.clientY);
   });
-  canvas.addEventListener("pointercancel", () => { glState.drag = null; });
+  canvas.addEventListener("pointercancel", () => { view.drag = null; });
   canvas.addEventListener("contextmenu", (event) => {
     event.preventDefault();
-    if (glState.drag && glState.drag.moved > 5) return;
-    undoPoint();
+    if (view.drag && view.drag.moved > 5) return;
+    onRightClick();
   });
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
-    glState.distance = clamp(glState.distance * Math.exp(event.deltaY * 0.0012), glState.radius * 0.25, glState.radius * 20);
-    requestRender();
+    view.distance = clamp(view.distance * Math.exp(event.deltaY * 0.0012),
+      view.radius * 0.25, view.radius * 20);
+    requestRender(view);
   }, { passive: false });
-  window.addEventListener("resize", requestRender);
 }
 
 /* ---------- views and history ---------- */
@@ -1980,8 +2513,9 @@ function resetWorkspace() {
   state.models = {};
   state.picked = [];
   state.pointCount = 3;
-  state.measured = Array.from({ length: 4 }, () => ["", "", ""]);
-  state.autoFace = false;
+  // 新项目同样沿用上一次填写的现场坐标，省掉重复录入
+  restoreDatumMemory();
+  state.scanRegions = [];
   state.registration = null;
   state.result = null;
   state.resultSource = null;
@@ -1989,16 +2523,19 @@ function resetWorkspace() {
   registrationRequest += 1;
   window.clearTimeout(registrationTimer);
 
-  glState.meshes = {};
-  glState.pathLine = null;
-  glState.pathLineCount = 0;
-  glState.pathPoint = null;
-  glState.pathPointCount = 0;
-  glState.center = [0, 0, 0];
-  glState.radius = 1000;
-  glState.distance = 2600;
-  glState.home = null;
-  glState.fitted = false;
+  for (const view of allViews) {
+    view.meshes = {};
+    view.pathLine = null;
+    view.pathLineCount = 0;
+    view.pathPoint = null;
+    view.pathPointCount = 0;
+    view.scanRegionCount = 0;
+    view.center = [0, 0, 0];
+    view.radius = 1000;
+    view.distance = 2600;
+    view.home = null;
+    view.fitted = false;
+  }
 
   for (const name of ["part", "support", "base"]) {
     const input = $(name + "File");
@@ -2014,6 +2551,8 @@ function resetWorkspace() {
     button.classList.toggle("active", Number(button.dataset.pointCount) === 3);
   });
   $("pickAxis").classList.remove("active");
+  $("scanShowFixture").checked = true;
+  $("scanShowBase").checked = true;
   $("showFixture").checked = true;
   $("showBase").checked = true;
   $("showPath").checked = false;
@@ -2028,6 +2567,8 @@ function resetWorkspace() {
   $("resultName").textContent = "项目";
   $("resultSubtitle").textContent = "规划完成";
   $("stageEmpty").style.display = "";
+  const faceStageEmpty = $("faceStageEmpty");
+  if (faceStageEmpty) faceStageEmpty.style.display = "";
   $("formFeedback").textContent = "";
   $("scanAxis").value = "+Z";
   setRegistrationStatus(
@@ -2038,7 +2579,7 @@ function resetWorkspace() {
   updateAxisBadge("尚未导入零件");
   updateSolveAvailability();
   showResultState("empty");
-  requestRender();
+  requestRenderAll();
 }
 
 async function deleteHistoryRun(run) {
@@ -2086,15 +2627,17 @@ async function applyServerDefaults() {
 }
 
 function init() {
-  initRenderer();
+  for (const view of allViews) initRenderer(view);
   bindEvents();
+  restoreDatumMemory();
   renderDatumRows();
   updateAxisBadge("尚未导入零件");
   updateSolveAvailability();
   showResultState("empty");
-  render();
+  requestRenderAll();
+  window.addEventListener("resize", requestRenderAll);
 }
 
-window.__scanplan = { state, glState, camera, projectPoint, pickScene };
+window.__scanplan = { state, datumView, faceView, allViews, camera, projectPoint, pickScene };
 init();
 applyServerDefaults();

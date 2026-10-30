@@ -14,6 +14,7 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from conftest import THICKNESS_MM
 
 from scanplan.config import load_config
 from scanplan.coverage import CoverageResult, attribute_uncovered, evaluate, merge
@@ -262,10 +263,25 @@ def test_geometry_outranks_the_tracker_when_both_apply(clamped_plate, model_plac
 def test_the_counters_record_what_was_rejected(clamped_plate, model_placeholder, cfg):
     result = evaluate(ladder_poses(), head_on_samples(60.0), clamped_plate.station,
                       model_placeholder, cfg)
-    assert set(result.counters) == {"rejected_clearance", "rejected_tracker",
-                                    "rejected_kinematics", "rejected_no_points", "rays"}
+    assert set(result.counters) == {"rejected_inside_part", "rejected_clearance",
+                                    "rejected_tracker", "rejected_kinematics",
+                                    "rejected_no_points", "rays"}
     assert result.counters["rays"] > 0
     assert result.counters["rejected_clearance"] == 0
+    assert result.counters["rejected_inside_part"] == 0
+
+
+def test_a_pose_inside_the_part_is_refused_before_any_ray_is_cast(clamped_plate,
+                                                                 model_placeholder, cfg):
+    # the reference point sits inside the 0.7 mm sheet, which no controller can reach; the
+    # part-containment veto comes first, so the pose is not counted as a clearance failure
+    inside = pose_above(x_mm=70.0, y_mm=0.0, z_mm=THICKNESS_MM / 2.0)
+    result = evaluate([inside], head_on_samples(60.0), clamped_plate.station,
+                      model_placeholder, cfg)
+    assert result.counters["rejected_inside_part"] == 1
+    assert result.counters["rejected_clearance"] == 0
+    assert result.counters["rays"] == 0
+    assert len(result.sets[0]) == 0
 
 
 def test_an_empty_pose_list_gives_an_empty_result(clamped_plate, model_placeholder, cfg):

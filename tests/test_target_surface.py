@@ -14,6 +14,7 @@ import pytest
 
 from scanplan.geometry import grid_cells
 from scanplan.target_surface import (
+    ScanRegion,
     build_target,
     face_mesh,
     fixture_contact_mask,
@@ -126,3 +127,62 @@ def test_only_the_upper_face_is_exempted_where_the_clamp_presses(clamped_plate, 
                          clamped_plate.station, cfg)
     assert len(upper.exempt.points) > 0
     assert len(lower.exempt.points) == 0
+
+
+def pick(x0, x1, y0, y1, *, z=0.7, normal=(0.0, 0.0, 1.0), step=5.0, holes=()):
+    """A picked scan face over the plate's own coordinates, as the page sends it.
+
+    z defaults to the flat plate's top face; the fixture that builds it is in conftest.
+    The page sends the picked face's own triangles, so this tiles the rectangle at `step`
+    and leaves the holes untiled - exactly what clicking a face with holes produces.
+    """
+    origin = np.array([(x0 + x1) / 2.0, (y0 + y1) / 2.0, z], dtype=float)
+    triangles = []
+    for x in np.arange(x0, x1 - 1e-9, step):
+        for y in np.arange(y0, y1 - 1e-9, step):
+            centre_x, centre_y = x + step / 2.0, y + step / 2.0
+            if any(hx0 <= centre_x <= hx1 and hy0 <= centre_y <= hy1
+                   for hx0, hx1, hy0, hy1 in holes):
+                continue
+            triangles.append([[x, y, z], [x + step, y, z], [x + step, y + step, z]])
+            triangles.append([[x, y, z], [x + step, y + step, z], [x, y + step, z]])
+    return ScanRegion(triangles=np.array(triangles, dtype=float),
+                      normal=np.array(normal, dtype=float), origin=origin,
+                      tolerance_mm=0.5)
+
+
+def test_a_supplementary_face_on_the_far_side_is_added_to_the_target(clamped_plate, cfg):
+    # the plate's `upper` target is the top face; picking the bottom face must ADD it,
+    # not replace the top one
+    plain = build_target(clamped_plate.station.part, clamped_plate.split, "upper",
+                         clamped_plate.station, cfg)
+    under = pick(-50.0, 50.0, -50.0, 50.0, z=0.0, normal=(0.0, 0.0, -1.0))
+    target = build_target(clamped_plate.station.part, clamped_plate.split, "upper",
+                          clamped_plate.station, cfg, regions=[under])
+    assert pytest.approx(target.supplementary_mm2, rel=0.02) == 100.0 * 100.0
+    assert target.supplementary_regions == 1
+    assert target.face_area_mm2 > plain.face_area_mm2
+    # the main face is untouched: every top-face sample is still there
+    top = target.samples.points[:, 2] > 0.6
+    assert top.sum() >= plain.samples.points.shape[0] * 0.5
+    assert (target.samples.points[~top, 2] < 0.1).all()
+    # nothing is exempted for being unpicked: the only exemption is the clamped region
+    assert set(target.exempt.reasons) == {"fixture_contact"}
+
+
+def test_a_pick_on_the_main_face_adds_nothing_instead_of_narrowing(clamped_plate, cfg):
+    plain = build_target(clamped_plate.station.part, clamped_plate.split, "upper",
+                         clamped_plate.station, cfg)
+    region = pick(-50.0, 50.0, -50.0, 50.0)
+    target = build_target(clamped_plate.station.part, clamped_plate.split, "upper",
+                          clamped_plate.station, cfg, regions=[region])
+    assert target.supplementary_mm2 == pytest.approx(0.0)
+    assert target.face_area_mm2 == pytest.approx(plain.face_area_mm2)
+    assert target.samples.total_area_mm2 == pytest.approx(plain.samples.total_area_mm2)
+
+
+def test_a_pick_that_covers_nothing_is_an_error_rather_than_an_empty_plan(clamped_plate, cfg):
+    region = pick(400.0, 500.0, 400.0, 500.0)
+    with pytest.raises(ValueError, match="supplementary faces"):
+        build_target(clamped_plate.station.part, clamped_plate.split, "upper",
+                     clamped_plate.station, cfg, regions=[region])

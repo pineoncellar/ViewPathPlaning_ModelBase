@@ -27,6 +27,16 @@ def summary_lines(report: dict) -> list[str]:
         f"max incidence          {report['placeholders']['max_incidence_deg']:.0f} deg "
         "(PLACEHOLDER)",
     ]
+    supplementary = report.get("definition", {}).get("supplementary_area_mm2")
+    if supplementary:
+        lines.insert(
+            2,
+            f"supplementary         {report['definition']['supplementary_faces']} picked "
+            f"face(s), {supplementary / 1e6:.4f} m2 added to the main face")
+    inside_positions = report.get("program", {}).get("positions_inside_part")
+    if inside_positions is not None:
+        lines.append(f"positions in part      {inside_positions} of {report['viewpoints']} "
+                     "(delivered P points, must be 0)")
     path = report.get("program", {})
     if path.get("path_length_mm") is not None:
         interrupts = path.get("interrupts", {})
@@ -44,8 +54,10 @@ def summary_lines(report: dict) -> list[str]:
                      f"{strokes.get('delivered_strokes') or strokes['candidates']} delivered "
                      f"of {strokes['candidates']} candidates, swept coverage "
                      f"{strokes['swept_coverage_pct']:.2f}%")
-        for violation in path.get("constraint_violations", []):
-            lines.append(f"CONSTRAINT             {violation}")
+    # Violations are printed whatever the deliverable was: "the joint gate removed four
+    # sweeps" must not be hidden because the stroke stage happened to lose the ranking.
+    for violation in path.get("constraint_violations", []):
+        lines.append(f"CONSTRAINT             {violation}")
     kinematics = report.get("kinematics", {})
     lines += [
         f"ray backend            {report['runtime']['ray_backend']}",
@@ -62,7 +74,13 @@ def summary_lines(report: dict) -> list[str]:
             f"joints                 min margin {kinematics.get('min_margin_deg')} deg, "
             f"worst step {kinematics.get('max_step_deg')} deg "
             f"(limit {kinematics.get('max_step_deg_limit')}), "
+            f"worst J6 step {kinematics.get('max_j6_step_deg')} deg, "
             f"branches {kinematics.get('branch_histogram')}")
+        if kinematics.get("points_without_solution"):
+            lines.append(
+                f"JOINT                  {kinematics['points_without_solution']} delivered "
+                "point(s) have no joint solution inside the usable envelope - the .LS "
+                "export refuses them")
     budget = report.get("budget", {})
     if budget.get("max_points") is not None:
         lines.append(f"budget                 {budget.get('verdict')} at "

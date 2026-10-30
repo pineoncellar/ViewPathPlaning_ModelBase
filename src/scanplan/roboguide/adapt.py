@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -41,6 +42,17 @@ _MISSING = object()
 # FANUC program comments are limited to 16 characters, and the default below has
 # to fit: the header is written verbatim into the controller.
 _COMMENT = "scan viewpoints"
+# Motion for the moves that do not scan. A stroke plan sweeps WHILE the head travels, so the
+# move along a sweep must be a straight interpolated (L) move - a joint move's TCP path is
+# not knowable, and the coverage figure would stop describing what the scanner sees. The
+# moves between sweeps scan nothing, and there a joint (J) move is both faster and the only
+# honest way to turn the wrist: an L move would drag the tool along an arc through the part
+# to achieve the same rotation.
+_TRANSITION_MOTION = "J"
+# Speed of a J instruction when the caller does not supply one. The shipped configuration
+# carries `motion.joint_speed_pct` (5%) and every real export passes it; this default only
+# keeps a bare `export()` call legal.
+_TRANSITION_SPEED = "50%"
 
 
 def _field(item, key: str, default=_MISSING):
@@ -206,6 +218,106 @@ def _extents(points: list[dict]) -> dict:
     return {"min": xyz.min(axis=0).round(3).tolist(), "max": xyz.max(axis=0).round(3).tolist()}
 
 
+def joint_audit(points: list[dict], robot_params, *, check_pose: bool = True) -> dict:
+    """Which exported points the arm cannot hold inside the planner's envelope.
+
+    The last line of defence, and deliberately a REFUSAL rather than a warning. Every
+    downstream complaint about this tool so far has the same shape: a program was written
+    whose points the robot could not reach, and the report said so in a block nobody read.
+    A point that cannot be commanded is not a delivery, so the export stops.
+
+    Two sources of evidence, in order of authority:
+
+    * `joints_deg`, written by the planner's branch assignment. Frame-free, so it is
+      checked whenever it is present - and it is checked against the SAME shrunk envelope
+      the gate used (`robot.limits_usage_frac`), not the datasheet.
+    * the Cartesian pose, solved here, for a viewpoint set produced with the gate off.
+      Only meaningful when the exported numbers are robot-base numbers (`uframe == 0`,
+      i.e. a placement was applied); under a taught UFRAME the numbers live in that user
+      frame and inverse kinematics would answer a different question.
+
+    `unverified` is reported, not fatal: it says "this export carries no joint evidence",
+    which is the honest description of a pose-only review export through a taught UFRAME.
+    """
+    if robot_params is None or not bool(getattr(robot_params, "enabled", False)):
+        return {"enabled": False, "checked": 0, "from_joints": 0, "from_pose": 0,
+                "illegal": [], "unverified": []}
+    from scanplan.kinematics import Robot
+
+    arm = Robot(robot_params)
+    illegal: list[dict] = []
+    unverified: list[dict] = []
+    from_joints = 0
+    from_pose = 0
+    for index, point in enumerate(points, start=1):
+        joints = point.get("joints_deg")
+        if joints is not None:
+            from_joints += 1
+            if not arm.feasible(joints):
+                illegal.append({"point": index, "vp_key": point.get("vp_key"),
+                                "reason": "joints_deg outside the usable envelope",
+                                "joints_deg": [round(float(value), 3) for value in joints],
+                                "margins_deg": [None if math.isinf(float(value)) else
+                                                round(float(value), 3)
+                                                for value in arm.margins(joints)]})
+                continue
+            # The CONFIG string is DERIVED from the solution, never trusted. A
+            # `viewpoints.json` written before 2026-10-27 carries turn digits computed as
+            # `floor(j / 360)`, i.e. `-1` on every negative joint - and ROBOGUIDE refuses
+            # to load a program containing that. Re-deriving repairs the old file instead
+            # of forcing a re-plan.
+            point["config"] = _derived_config(arm, point, joints)
+            continue
+        if not check_pose:
+            unverified.append({"point": index, "vp_key": point.get("vp_key")})
+            continue
+        from_pose += 1
+        found = [item for item in arm.solutions(point["xyz_mm"], point["rotation"])
+                 if item.ok]
+        if found:
+            # Attach the solution so the audit is evidence, not an opinion: the caller can
+            # see the joint values the export could have used.
+            point["joints_deg"] = found[0].joints_deg
+            point["config"] = point.get("config") or found[0].config
+            continue
+        illegal.append({"point": index, "vp_key": point.get("vp_key"),
+                        "reason": "no joint solution inside the usable envelope"})
+    return {"enabled": True, "checked": len(points), "from_joints": from_joints,
+            "from_pose": from_pose, "illegal": illegal, "unverified": unverified,
+            "envelope_deg": [list(pair) for pair in arm.limits],
+            "limits_source": arm.limits_source}
+
+
+def _derived_config(arm, point: dict, joints) -> str:
+    """The CONFIG string implied by this point's joint values.
+
+    Preferred source is the matching solution's own string (letters and turns both come
+    from the arm model). If the stored joints do not match a root to 0.01 deg - a rounded
+    file, or a tool that moved since - the last two letters of the stored string are kept
+    and only the turn digits are recomputed, because the letters are a branch choice the
+    planner made and the digits are pure arithmetic.
+    """
+    for item in arm.solutions(point["xyz_mm"], point["rotation"]):
+        if np.allclose(item.joints_deg, np.asarray(joints, dtype=float), atol=0.01):
+            return item.config
+    words = str(point.get("config") or "").split(",")[0].split()
+    if len(words) == 3:
+        return arm.config_string(joints, words[0], words[1])
+    return arm.config_string(joints, "N", "U")
+
+
+def _audit_error(audit: dict) -> str:
+    """The refusal message, in the words a shop-floor reader needs."""
+    sample = ", ".join(f"P[{item['point']}]" for item in audit["illegal"][:6])
+    more = "" if len(audit["illegal"]) <= 6 else f" (+{len(audit['illegal']) - 6} more)"
+    return (f"{len(audit['illegal'])} of {audit['checked']} exported point(s) are outside "
+            f"the joint envelope the planner allows ({sample}{more}): "
+            f"{audit.get('limits_source')}. Writing them would produce a program the "
+            "controller must refuse. Re-plan with the robot block enabled "
+            "(configs/robot_gate.json) so the gate drops those poses, or fix the station "
+            "layout whichever the case is.")
+
+
 def _contract_blocks(
     prog_name: str,
     *,
@@ -219,6 +331,7 @@ def _contract_blocks(
     ordering: dict,
     point_count: int,
     extents: dict,
+    joint_speed: str = "",
 ) -> dict:
     """The frame contract: everything the workshop has to reproduce in ROBOGUIDE."""
     return {
@@ -292,6 +405,7 @@ def _contract_blocks(
             "prog_name": prog_name,
             "motion": motion.upper(),
             "speed": speed,
+            "joint_speed": joint_speed,
             "config_string": config,
             "config_note": (
                 "the CONFIG string hints which posture solution to take; if ROBOGUIDE "
@@ -326,16 +440,24 @@ def export(
     utool=1,
     motion="J",
     speed="100%",
+    joint_speed: str | None = None,
     termination="FINE",
     config="N U T, 0, 0, 0",
     joint_blocks: bool = False,
     order=True,
+    robot=None,
 ) -> dict:
     """Write `<NAME>.LS`, `<NAME>_points.csv`, `<NAME>_frame.json` and return the contract.
 
     `place` is the optional 'x,y,z,w,p,r' pose of the CAD frame inside the
     ROBOGUIDE world; it re-expresses every point and defaults the UFRAME to 0,
     because the points then need no UFRAME taught by hand.
+
+    `robot` is the planner's `RobotParams`. When the robot block is enabled, every point
+    is audited against the SAME joint envelope the planner used, and the export raises
+    rather than writing a program that contains a pose the arm cannot hold. Leave it None
+    only where the numbers are not robot targets at all (a re-localised path is expressed
+    in a measured frame and its reachability was explicitly not re-tested).
 
     `order=True` is refused for a stroke plan. Re-sorting splits each stroke into two
     unrelated moves, which silently voids the sweep the coverage figure was computed
@@ -353,6 +475,22 @@ def export(
             "order is the program order and depends on distance; re-sorting would split "
             "each stroke into two unrelated moves. Call export(order=False), or export "
             "the single-pose plan instead")
+
+    if strokes:
+        # `motion` is the motion of the move INTO a point, so the second corner of a sweep
+        # carries L (that move IS the sweep) and everything else carries J.
+        transition_speed = joint_speed or _TRANSITION_SPEED
+        previous_stroke = None
+        for point in points:
+            sweeping = (point["role"] == "coverage" and point["stroke_id"] is not None
+                        and point["stroke_id"] == previous_stroke)
+            if sweeping:
+                point["motion"] = motion
+            else:
+                point["motion"] = _TRANSITION_MOTION
+                point["speed"] = transition_speed
+            previous_stroke = (point["stroke_id"]
+                               if point["role"] == "coverage" else None)
 
     if place:
         rotation_place, translation_place = parse_pose(place)
@@ -385,6 +523,12 @@ def export(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # The joint wall. Runs on the FINAL numbers and before a single byte is written, so a
+    # refused export leaves no `.LS` behind that someone could later pick up.
+    audit = joint_audit(points, robot, check_pose=(int(uframe) == 0))
+    if audit["illegal"]:
+        raise ValueError(_audit_error(audit))
+
     ls_text = ls.build_ls(
         points,
         prog_name=name,
@@ -396,6 +540,7 @@ def export(
         config=config,
         comment=_COMMENT,
         joint_blocks=joint_blocks,
+        joint_speed=joint_speed or _TRANSITION_SPEED,
     )
     ls_path = out_dir / f"{name}.LS"
     csv_path = out_dir / f"{name}_points.csv"
@@ -421,9 +566,21 @@ def export(
         ordering=ordering,
         point_count=len(points),
         extents=_extents(points),
+        joint_speed=(joint_speed or _TRANSITION_SPEED) if strokes else "",
     )
     contract["program"]["termination"] = str(termination).upper()
     contract["program"]["strokes"] = sorted(strokes) if strokes else []
+    contract["joint_audit"] = audit
+    if audit["enabled"]:
+        # The old blanket "joint limits are not modelled" line is now false for this
+        # export, and a contract that overstates what was NOT checked is as misleading as
+        # one that overstates what was.
+        contract["not_modelled"][0] = (
+            "Robot reachability and joint limits WERE checked for this export: every point "
+            "carries a joint solution inside the usable envelope "
+            f"({audit.get('limits_source')}, {audit['from_joints']} from the plan's own "
+            f"joint values, {audit['from_pose']} solved here). Robot COLLISION and the "
+            "interpolation between two points are still not modelled.")
     with frame_path.open("w", encoding="utf-8") as handle:
         json.dump(contract, handle, indent=2)
 

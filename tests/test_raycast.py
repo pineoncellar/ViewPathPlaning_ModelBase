@@ -36,6 +36,36 @@ def test_a_miss_reports_infinity_not_zero(flat_plate):
     assert np.isinf(distance[0]) and triangle[0] == -1
 
 
+def test_hit_count_separates_inside_from_outside(fixture_box):
+    # the parity test behind "no position may sit in the part": the box spans z in
+    # [-60, -5], so a ray leaving a point in its middle meets one face more than it should
+    caster = RayCaster(fixture_box)
+    origins = np.array([[0.0, 0.0, -30.0], [0.0, 0.0, 100.0], [0.0, 0.0, -100.0]])
+    counts = caster.hit_count(origins, np.tile([1.0, 0.0, 0.0], (3, 1)))
+    assert counts.tolist() == [1, 0, 0]
+    assert [count % 2 for count in counts.tolist()] == [1, 0, 0]
+
+
+def test_a_degenerate_direction_is_a_miss_not_a_crash(flat_plate):
+    # A zero-area triangle has a zero face normal, so the mirror-partner cast of the
+    # sheet split asks for a zero-length ray. trimesh turns that into NaN bounds and
+    # rtree refuses the query, so one such face used to abort the whole plan.
+    distance, triangle = RayCaster(flat_plate).nearest(
+        np.array([[0.0, 0.0, 5.0], [5.0, 5.0, 10.0]]),
+        np.array([[0.0, 0.0, 0.0], [np.nan, 0.0, -1.0]]))
+    assert np.isinf(distance).all() and (triangle == -1).all()
+
+
+def test_degenerate_rays_do_not_disturb_their_neighbours(flat_plate):
+    origins = np.array([[5.0, 5.0, 10.0], [5.0, 5.0, 10.0], [5.0, 5.0, 10.0]])
+    directions = np.array([[0.0, 0.0, -1.0], [0.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
+    distance, triangle = RayCaster(flat_plate, chunk=2).nearest(origins, directions)
+    assert pytest.approx(float(distance[0]), abs=1e-6) == 10.0 - 0.7
+    assert np.isinf(distance[1]) and triangle[1] == -1
+    assert pytest.approx(float(distance[2]), abs=1e-6) == 10.0 - 0.7
+    assert triangle[0] >= 0 and triangle[2] >= 0
+
+
 def test_only_the_nearest_hit_is_reported(flat_plate, fixture_box):
     _, name, _ = nearest_across(
         {"plate": RayCaster(flat_plate), "box": RayCaster(fixture_box)},

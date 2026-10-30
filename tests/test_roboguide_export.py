@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from scanplan.config import RobotParams
 from scanplan.geometry import scanner_frame
 from scanplan.roboguide import adapt, ls, wpr
 
@@ -38,6 +40,73 @@ def viewpoints() -> list[dict]:
             "roll_deg": 210.0,
         },
     ]
+
+
+def test_an_unreachable_point_is_refused_instead_of_written(tmp_path):
+    """The joint wall. A program the arm cannot execute must not be produced at all.
+
+    This is the failure the site hit: a Cartesian program was written, ROBOGUIDE answered
+    MOTN-018 / TPIF-012, and nothing in the pipeline had objected because the joint gate
+    was off. The export now refuses on its own, before a single byte is written.
+    """
+    robot = replace(RobotParams.disabled(), enabled=True)
+    with pytest.raises(ValueError, match="joint envelope"):
+        adapt.export(viewpoints(), tmp_path / "refused", prog_name=PROG,
+                     place="0,0,0,0,0,0", robot=robot)
+    assert not (tmp_path / "refused" / f"{PROG}.LS").exists()
+
+
+def test_a_point_with_infeasible_joints_is_refused(tmp_path):
+    """Stored joint values are checked even when the numbers live in a taught UFRAME."""
+    robot = replace(RobotParams.disabled(), enabled=True)
+    point = {"id": 1, "position": (2000.0, 0.0, 1000.0), "axis": (0.0, 0.0, -1.0),
+             "roll_deg": 0.0,
+             # J2 = 44 deg is inside the datasheet's +46 but only 2 deg from it, and the
+             # gate reserves `joint_margin_deg` (5) at each end
+             "joints_deg": (0.0, 44.0, 0.0, 0.0, 64.0, 0.0)}
+    with pytest.raises(ValueError, match="joint envelope"):
+        adapt.export([point], tmp_path, prog_name=PROG, robot=robot)
+
+
+def test_the_joint_audit_records_the_envelope_it_used(tmp_path):
+    """Evidence, not an opinion: the contract says which envelope was enforced."""
+    robot = replace(RobotParams.disabled(), enabled=True)
+    reachable = {"id": 1, "position": (2000.0, 0.0, 1000.0),
+                 "axis": (0.0, 0.0, -1.0), "roll_deg": 0.0}
+    contract = adapt.export([reachable], tmp_path, prog_name=PROG,
+                            place="0,0,0,0,0,0", robot=robot)
+    audit = contract["joint_audit"]
+    assert audit["enabled"] is True
+    assert audit["illegal"] == []
+    assert audit["checked"] == 1 and audit["from_pose"] == 1
+    assert audit["envelope_deg"][4] == pytest.approx([-125.0, 125.0])
+    assert "joint limits WERE checked" in contract["not_modelled"][0]
+
+
+def test_without_a_robot_block_the_export_says_nothing_was_verified(tmp_path):
+    contract = adapt.export(viewpoints(), tmp_path, prog_name=PROG)
+    assert contract["joint_audit"] == {
+        "enabled": False, "checked": 0, "from_joints": 0, "from_pose": 0,
+        "illegal": [], "unverified": []}
+
+
+def test_a_negative_turn_digit_is_refused_before_a_byte_is_written(tmp_path):
+    """`N U F, -1, -1, -1` is what stopped the 2026-10-27 import (ASBN-009).
+
+    The field goes into every `P[n]` block, so a malformed one costs the whole file, and
+    ROBOGUIDE reports it as a load error with a column number and no hint about where the
+    string came from. Refusing it here names the string instead.
+    """
+    with pytest.raises(ValueError, match="CONFIG"):
+        ls.check_config("N U F, -1, 0, 0")
+    with pytest.raises(ValueError, match="CONFIG"):
+        ls.check_config("N U T")
+    assert ls.check_config("n u t,0,0,0") == "N U T, 0, 0, 0"
+    points = viewpoints()
+    points[0]["config"] = "N U F, -1, 0, 0"
+    with pytest.raises(ValueError, match="CONFIG"):
+        adapt.export(points, tmp_path / "bad", prog_name=PROG)
+    assert not (tmp_path / "bad" / f"{PROG}.LS").exists()
 
 
 def test_the_three_files_appear(tmp_path):
@@ -124,6 +193,52 @@ def test_joint_blocks_are_ignored_without_joint_values(tmp_path):
     text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
     assert "J1=" not in text
     assert text.count("X =") == len(viewpoints())
+
+
+def test_a_joint_block_never_inherits_a_rate_speed(tmp_path):
+    """`J P[n] 100mm/sec` is not a legal instruction: a joint move takes a percentage.
+
+    The rate belongs to the L instruction a sweep is written with, so writing the same
+    point as joint angles has to fall back to a percentage rather than pass the rate on.
+    """
+    points = viewpoints()
+    for point in points:
+        point["joints_deg"] = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0)
+    adapt.export(points, tmp_path / "joints", prog_name=PROG, joint_blocks=True,
+                 motion="L", speed="100mm/sec")
+    text = (tmp_path / "joints" / f"{PROG}.LS").read_text(encoding="ascii")
+    assert "mm/sec" not in text
+    assert text.count("J P[") == len(points)
+
+
+def test_a_stroke_plan_scans_with_l_moves_and_repositions_with_j(tmp_path):
+    """The head scans while it travels, so the move ALONG a sweep must be interpolated (L).
+
+    A joint move's TCP path is not knowable, so writing one down a stroke would mean the
+    coverage figure no longer describes what the scanner sees. The move into the second
+    corner of a stroke IS the sweep; the move into the first corner and anything reaching a
+    retract point scan nothing, and there a joint move is the honest way to turn the wrist.
+    """
+    points = viewpoints()
+    points[0].update(stroke_id=1, role="coverage")
+    points[1].update(stroke_id=1, role="coverage")
+    points[2].update(stroke_id=2, role="coverage")
+    points[3].update(stroke_id=None, role="retract")
+    adapt.export(points, tmp_path, prog_name=PROG, order=False, motion="L",
+                 speed="100mm/sec", termination="CNT0")
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    moves = re.findall(r"^\s*\d+:([LJ]) P\[(\d+)\]", text, re.MULTILINE)
+    assert moves == [("J", "1"), ("L", "2"), ("J", "3"), ("J", "4")]
+    assert "L P[2] 100mm/sec CNT0" in text
+    assert "J P[1] 50% FINE" in text
+
+
+def test_a_pose_only_plan_keeps_the_configured_motion(tmp_path):
+    """No stroke_id means no sweep, so there is nothing to interpolate: J stays J."""
+    adapt.export(viewpoints(), tmp_path, prog_name=PROG)
+    text = (tmp_path / f"{PROG}.LS").read_text(encoding="ascii")
+    assert "L P[" not in text
+    assert text.count("J P[") == len(viewpoints())
 
 
 def test_wpr_is_unwrapped_along_the_delivered_order():

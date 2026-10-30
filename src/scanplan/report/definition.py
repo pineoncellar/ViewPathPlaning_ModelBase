@@ -9,7 +9,7 @@ from __future__ import annotations
 from ..config import PlannerConfig
 from ..coverage import CoverageResult
 from ..sheet_split import SheetSplit
-from ..target_surface import TargetSet, contact_summary
+from ..target_surface import TargetSet, contact_summary, exempt_breakdown
 from ..tracker import Tracker
 
 EXEMPT_REASON = "fixture_contact"
@@ -46,16 +46,23 @@ PLACEHOLDERS_NOTE = (
 def definition_block(*, config: PlannerConfig, target: TargetSet, split: SheetSplit,
                      coverage: CoverageResult) -> dict:
     """What the target was, before any coverage number is read."""
+    supplementary = target.supplementary_mm2 > 0.0
     return {
         "definition": {
             "name": "topological: one face of the original flat blank",
-            "target": f"the {target.face} face of the blank, minus fixture contact",
+            "target": (f"the {target.face} face of the blank, minus fixture contact"
+                       if not supplementary else
+                       f"the {target.face} face of the blank PLUS "
+                       f"{target.supplementary_regions} supplementary scan face(s) picked in "
+                       "the 3D view, minus fixture contact"),
             "split": "mirror partner per face -> mid-surface PCA -> local sheet normal m; "
                      "|n.m| ~ 1 = a face of the blank, ~ 0 = sheared cross-section; the "
                      "sign of n.m after orienting m says which face",
             "upper_area_mm2": round(split.areas["upper"], 1),
             "lower_area_mm2": round(split.areas["lower"], 1),
             "blanked_edge_area_mm2": round(split.areas["band"], 1),
+            "supplementary_area_mm2": round(target.supplementary_mm2, 1),
+            "supplementary_faces": target.supplementary_regions,
             "material_thickness_mm": round(split.thickness_mm, 3),
             "orientation_confidence": round(split.oriented_fraction, 4),
             "not_target": ["the other face of the blank",
@@ -81,6 +88,7 @@ def definition_block(*, config: PlannerConfig, target: TargetSet, split: SheetSp
         "point_area_mm2": round(
             float(target.samples.total_area_mm2 / max(coverage.n_targets, 1)), 3),
         "exempt": {**contact_summary(target), "reason": EXEMPT_REASON},
+        "exempt_by_reason": exempt_breakdown(target),
     }
 
 

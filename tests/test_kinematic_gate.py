@@ -12,11 +12,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from scanplan.config import RobotParams
 from scanplan.coverage import attribute_uncovered, evaluate
-from scanplan.kinematics import KinematicGate
-from scanplan.path import PathPoint, assign_branches
+from scanplan.kinematics import KinematicGate, Solution
+from scanplan.path import PathPoint, _unwrap_along, assign_branches
 from scanplan.scanner_model import ScannerModel, ScannerPose
 from scanplan.target_surface import SampleSet
 
@@ -123,3 +124,52 @@ def test_branch_assignment_without_a_gate_is_empty():
     assignment = assign_branches([], None, 40.0)
     assert assignment.solutions == []
     assert assignment.ok
+
+
+def solution(joints) -> Solution:
+    """A joint solution with only the fields the unwrap looks at filled in."""
+    return Solution(joints_deg=tuple(float(value) for value in joints), shoulder="N",
+                    elbow="U", wrist_flip="T", config="N U T, 0, 0, 0",
+                    j5_margin_deg=0.0, min_margin_deg=5.0, ok=True)
+
+
+LIMITS = ((-185.0, 185.0), (-60.0, 46.0), (-122.0, 190.0), (-360.0, 360.0),
+          (-125.0, 125.0), (-360.0, 360.0))
+
+
+def test_a_wrapped_wrist_is_written_as_the_short_turn():
+    """-179.8 then +177.5 is 2.6 degrees of pose and 357 degrees of J move.
+
+    The controller interpolates the numbers in the file, so leaving the second point as the
+    closed form handed it back asks for a full revolution of J4 in the middle of a sweep.
+    """
+    first = solution([-90.0, 26.0, 0.6, -179.8, 58.7, 8.0])
+    second = solution([-96.8, 35.2, 1.9, 177.5, 68.0, 14.9])
+    unwrapped = _unwrap_along([first, second], LIMITS)
+    assert unwrapped[0] is first
+    assert unwrapped[1].joints_deg[3] == pytest.approx(-182.5, abs=0.05)
+    # every other axis is left exactly alone
+    assert list(unwrapped[1].joints_deg[:3]) == list(second.joints_deg[:3])
+    assert unwrapped[1].config == second.config
+
+
+def test_the_short_turn_is_not_taken_when_it_leaves_the_envelope():
+    """A shift that would push the axis out of its range keeps the original number."""
+    asymmetric = tuple((-180.0, 540.0) if axis == 3 else pair
+                       for axis, pair in enumerate(LIMITS))
+    first = solution([-90.0, 26.0, 0.6, -350.0, 58.7, 8.0])
+    second = solution([-96.8, 35.2, 1.9, 5.0, 68.0, 14.9])
+    unwrapped = _unwrap_along([first, second], asymmetric)
+    assert unwrapped[1].joints_deg[3] == pytest.approx(5.0)
+    # the same pair does wrap when the range has room for it
+    both = tuple((-360.0, 360.0) if axis == 3 else pair
+                 for axis, pair in enumerate(LIMITS))
+    assert _unwrap_along([first, second], both)[1].joints_deg[3] == pytest.approx(-355.0)
+
+
+def test_an_axis_that_cannot_wrap_is_never_shifted():
+    """J1 has one number per pose, so nothing is rewritten even when it looks wrapped."""
+    first = solution([179.0, 0.0, 0.0, 0.0, 30.0, 0.0])
+    second = solution([-179.0, 0.0, 0.0, 0.0, 30.0, 0.0])
+    unwrapped = _unwrap_along([first, second], LIMITS)
+    assert unwrapped[1] is second

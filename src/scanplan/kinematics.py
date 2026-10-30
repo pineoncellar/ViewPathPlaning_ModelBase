@@ -37,7 +37,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config import RobotParams
+from .config import RobotParams, usable_limits
 
 # A solution is kept only when forward() reproduces the request this closely. The model
 # itself reproduces measured poses to 0.02 mm, so anything worse is a wrong root.
@@ -85,6 +85,25 @@ def rotation_angle_deg(first, second) -> float:
                                              -1.0, 1.0))))
 
 
+def turn_digits(value_deg: float) -> int:
+    """Whole revolutions past the axis's own travel; 0 for anything inside +-360.
+
+    This was `floor(j / 360)`, which wrote `-1` for every negative joint - and a negative
+    turn digit is not a legal FANUC CONFIG. ROBOGUIDE stops at that column on import with
+    ASBN-009 `on line ..., column ... Configuration error` and refuses the WHOLE program,
+    even when every joint is well inside its limits: on 2026-10-27 a delivery whose J1 was
+    -102 deg carried `N U F, -1, -1, -1` and never loaded.
+
+    A turn is a revolution BEYOND the axis's own range (J1 +-185, J4/J6 +-360 here), not
+    the sign of the value. Every usable joint value lives inside that range, so the digit
+    is 0; a value outside it is one (or more) turns and is flagged as negative here so the
+    exporter can refuse rather than write a program whose CONFIG the controller cannot read.
+    """
+    if abs(float(value_deg)) <= 360.0:
+        return 0
+    return int(np.sign(value_deg) * np.floor(abs(float(value_deg)) / 360.0 + 0.5))
+
+
 @dataclass(frozen=True)
 class Solution:
     """One complete joint solution for a Cartesian pose, with the numbers that judge it.
@@ -117,10 +136,12 @@ class Robot:
 
     def __init__(self, params: RobotParams):
         self.params = params
-        self.limits = tuple((max(low, soft_low), min(high, soft_high))
-                            for (low, high), (soft_low, soft_high)
-                            in zip(params.mechanical_limits_deg, params.soft_limits_deg,
-                                   strict=True))
+        # Not the datasheet envelope and not the controller's set either: the intersection
+        # shrunk to the central `limits_usage_frac` of every axis range. Every `wraps`,
+        # `margins`, `j5_margin` and `feasible` answer below is therefore relative to the
+        # envelope the site actually allows the planner to use, not to the machine's stops.
+        self.limits = usable_limits(params.mechanical_limits_deg, params.soft_limits_deg,
+                                    params.limits_usage_frac)
         self.tool_vector = np.asarray(params.tool_xyz_mm, dtype=float).reshape(3)
         self.tool_rotation = _ypr_rotation(params.tool_ypr_deg)
         # Effective forearm: the offset turns the forearm into a slightly longer link that
@@ -132,11 +153,24 @@ class Robot:
         self.limits_source = self._limits_source()
 
     def _limits_source(self) -> str:
-        """Which envelope is in force, in words a report can print."""
+        """Which envelope is in force, in words a report can print.
+
+        The share belongs in the string: "the datasheet is in force" would be a false
+        claim once 10 % of the travel is withheld at each end, and the report is read by
+        people deciding whether a delivered path may be commanded.
+        """
         sharp = any(soft != mech for soft, mech in zip(self.params.soft_limits_deg,
                                                        self.params.mechanical_limits_deg,
                                                        strict=True))
-        return "soft (intersected with mechanical)" if sharp else "mechanical"
+        base = "soft (intersected with mechanical)" if sharp else "mechanical"
+        fraction = float(self.params.limits_usage_frac)
+        margin = float(self.params.joint_margin_deg)
+        notes: list[str] = []
+        if fraction < 1.0:
+            notes.append(f"central {fraction * 100:.0f}% of each axis range")
+        if margin > 0.0:
+            notes.append(f"{margin:g} deg reserved at each end")
+        return f"{base}, {', '.join(notes)}" if notes else base
 
     # -- forward -------------------------------------------------------------
 
@@ -264,6 +298,8 @@ class Robot:
         flange = target @ self.tool_rotation.T
         wrist = point - target @ self.tool_vector
         found: list[Solution] = []
+        allowed = {str(family).upper().strip().replace("  ", " ")
+                   for family in getattr(self.params, "allowed_configs", ()) or ()}
         for shoulder, elbow, arm in self._arm_solutions(wrist):
             a1x, a2, b = arm["a1x"], arm["a2"], arm["b"]
             for flip, wrist_angles, singular in self._wrist_solutions(a1x, b, flange):
@@ -273,11 +309,18 @@ class Robot:
                     continue
                 if verify and not self._reproduces(placed, point, target):
                     continue
+                config = self.config_string(placed, shoulder, elbow)
+                if allowed and config.split(",")[0].strip().upper() not in allowed:
+                    # A family this cell has not proven. The front/back posture numbers J2
+                    # around -40 here and around +143 on the pendant, so the limits this
+                    # config carries cannot judge it - and a point that slips through stops
+                    # the program at MOTN-017 instead of being planned around.
+                    continue
                 margins = self.margins(placed)
                 found.append(Solution(
                     joints_deg=tuple(float(value) for value in placed),
                     shoulder=shoulder, elbow=elbow, wrist_flip=flip,
-                    config=self.config_string(placed, shoulder, elbow),
+                    config=config,
                     j5_margin_deg=self.j5_margin(placed),
                     min_margin_deg=float(margins.min()),
                     ok=bool(margins.min() >= self.params.joint_margin_deg
@@ -392,8 +435,14 @@ class Robot:
         branch, which is the same pose turned 180 degrees.
         """
         values = np.asarray(joints, dtype=float).reshape(6)
-        turns = [int(np.floor(values[index] / 360.0 + 1e-9)) for index in (0, 3, 5)]
-        flip = "T" if values[4] < 0.0 else "F"
+        turns = [turn_digits(float(values[index])) for index in (0, 3, 5)]
+        pinned = str(getattr(self.params, "config_wrist_letter", "auto")).upper()
+        if pinned in ("T", "F"):
+            # Pinned for the cell: its controller refuses the other letter outright, and
+            # the two wrist branches describe the same TCP pose, so nothing is given up.
+            flip = pinned
+        else:
+            flip = "T" if values[4] < 0.0 else "F"
         return f"{shoulder} {elbow} {flip}, {turns[0]}, {turns[1]}, {turns[2]}"
 
     def reproduces(self, joints, position, rotation) -> bool:

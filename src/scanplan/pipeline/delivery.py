@@ -25,6 +25,10 @@ from .ranking import _rank_plan
 # Pruning keeps the requirement, not the achieved peak: pruning against the peak can
 # never remove anything, which would make the stage pointless by construction.
 PRUNE_TARGET_PCT = 99.0
+# How far above the requirement a selection may sit before pruning is allowed to touch it.
+# Below this it is already at the target - the greedy pass stopped as soon as it crossed -
+# and removing anything would only undershoot.
+PRUNE_SLACK_PCT = 0.5
 
 
 def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
@@ -169,13 +173,27 @@ def _one_delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[i
             items.append(stroke_cov.strokes[int(row) - n_poses])
 
     target_pct = cfg.target.coverage_target_pct
-    kept = prune(items, item_sets, list(range(len(items))), combined.area_mm2,
-                 combined.target_area_mm2,
-                 target_pct=PRUNE_TARGET_PCT if target_pct is None else target_pct,
-                 max_rounds=cfg.stroke.max_prune_rounds)
+    limit_pct = PRUNE_TARGET_PCT if target_pct is None else target_pct
+    # Pruning only has anything to do when the selection OVERSHOOTS the target: the greedy
+    # pass stops the moment it crosses, so the overshoot is under one item and removal can
+    # only undershoot. Shaving a set that already sits at the target cost 3.9 points of
+    # coverage on the 2026-10-28 station (99.04% selected -> 92.06% delivered) without a
+    # single drop being reported, so the guard is not cosmetic.
+    area = np.asarray(combined.area_mm2, dtype=float)
+    seen = np.zeros(combined.n_targets, dtype=bool)
+    for row in item_rows:
+        seen[combined.sets[row]] = True
+    selected_pct = (100.0 * float(area[seen].sum()) / combined.target_area_mm2
+                    if combined.target_area_mm2 > 0.0 else 0.0)
+    if selected_pct <= limit_pct + PRUNE_SLACK_PCT:
+        kept = list(range(len(items)))
+    else:
+        kept = prune(items, item_sets, list(range(len(items))), combined.area_mm2,
+                     combined.target_area_mm2, target_pct=limit_pct,
+                     max_rounds=cfg.stroke.max_prune_rounds)
     if len(kept) < len(items):
         say(f"  pruning: {len(items)} selected items -> {len(kept)} while staying at "
-            f"{(PRUNE_TARGET_PCT if target_pct is None else target_pct):g}%")
+            f"{limit_pct:g}%")
     kept_rows = [item_rows[index] for index in kept]
     path = build_path([items[index] for index in kept], cfg=cfg, station=station,
                       model=model, coverage_index=lambda index: kept_rows[index],
@@ -209,6 +227,12 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
 
     Three rounds is a cap, not a target: each round is a full ordering pass, and a plan that
     needs more than three is better reported than silently ground down.
+
+    The joint gate is enforced with the same severity as the clearance gate. A delivered
+    point with no feasible joint solution is not a warning in a report - it is a line the
+    controller will refuse, which is exactly the failure this function exists to remove. So
+    the item that owns such a point is dropped and the selection re-run without it, just
+    like an item whose connector keeps negative clearance.
     """
     say = log or (lambda _message: None)
     hard = cfg.stroke.hard_gate if strict is None else bool(strict)
@@ -216,17 +240,30 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
     current_sources = dict(sources)
     forbidden: set[int] = set()
     rejected: list[int] = []
+    joint_rows: set[int] = set()
     rebuilt = _rebuild_selection(combined, current, current_sources, None)
     path = PathPlan(points=[], ordering="empty")
     for _round in range(max(1, int(rounds))):
         rebuilt, path, kept_rows = _one_delivery(
             combined, current, current_sources, stroke_cov, coverage, cfg, station, model,
             gate, strict=hard, kin=kin, log=log)
-        if not path.dropped:
+        unrouted = {int(index) for index in path.dropped}
+        unsolvable: set[int] = set()
+        if kin is not None and kin.active and path.points:
+            # Solved here, inside the loop, because the answer decides whether this
+            # delivery is legal at all - not after it has been accepted.
+            assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg))
+            unsolvable = {int(point.stroke_id) for point in
+                          (path.points[index] for index in assignment.failed)
+                          if point.stroke_id is not None}
+        if not unrouted and not unsolvable:
             break
-        bad = {kept_rows[index] for index in path.dropped if index < len(kept_rows)}
+        illegal = unrouted | unsolvable
+        bad = {kept_rows[index] for index in illegal if 0 <= index < len(kept_rows)}
         if not bad:
             break
+        joint_rows |= {kept_rows[index] for index in unsolvable
+                       if 0 <= index < len(kept_rows)}
         rejected.extend(sorted(bad))
         forbidden |= bad
         if reselect is not None:
@@ -237,17 +274,28 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
             break
         say(f"  hard gate: dropping {len(bad)} item(s) and re-delivering "
             f"{len(current)}")
-    if rejected:
+    if joint_rows:
         path.violations.append(
-            f"the hard gate removed {len(rejected)} item(s) with no legal connector; "
-            "the selection was re-run without them")
+            f"the joint gate removed {len(joint_rows)} item(s) the arm cannot hold inside "
+            "the usable envelope; the selection was re-run without them")
+    if len(rejected) > len(joint_rows):
+        path.violations.append(
+            f"the hard gate removed {len(rejected) - len(joint_rows)} item(s) with no legal "
+            "connector; the selection was re-run without them")
     if kin is not None and kin.active and path.points:
+        # Re-solved on the path that survived: dropping an item changes its neighbours, so
+        # an assignment computed for the rejected delivery would describe a program that is
+        # no longer being delivered.
         assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg))
         path.branches = assignment
         path.max_step_deg = assignment.max_step_deg
         if assignment.failed:
+            # Only reachable when the round cap is exhausted (or a caller passes
+            # rounds=1). It stays a violation AND is refused at export time - the point is
+            # not silently shipped with `joints_deg = None`.
             path.violations.append(
-                f"{len(assignment.failed)} delivered point(s) have no joint solution at all")
+                f"{len(assignment.failed)} delivered point(s) still have no joint solution "
+                "inside the usable envelope; the .LS export refuses to write them")
         if assignment.broken:
             path.violations.append(
                 f"{len(assignment.broken)} joint step(s) exceed max_step_deg "
@@ -363,6 +411,26 @@ def _finish_stroke_plan(combined: CoverageResult, coverage: CoverageResult,
     pose_rank = (_rank_plan(pose_sel.coverage_pct, pose_path.turns,
                             pose_path.path_length_mm, target_pct)
                  if pose_sel is not None else None)
+    if bool(getattr(cfg.stroke, "require_sweeps", False)):
+        # A scanning cell is bought to sweep. When the configuration says so, the pose-only
+        # plan stops being an alternative deliverable and goes back to being a reference
+        # figure: it is used only when the sweeps cannot reach the target, because a
+        # program that scans nothing is worse than one that stops between passes.
+        met = (target_pct is None
+               or mixed_sel.coverage_pct + 1e-9 >= float(target_pct))
+        if met:
+            say("  sweeps required by the configuration: keeping the mixed plan "
+                f"({mixed_sel.coverage_pct:.2f}%, {mixed_path.turns} corners) even though "
+                f"the pose-only reference scores {pose_sel.coverage_pct:.2f}% "
+                f"in {pose_path.turns} corners" if pose_sel is not None else
+                "  sweeps required by the configuration: keeping the mixed plan")
+            mixed_path.verdict = verdict
+            mixed_path.budget_history = history
+            return mixed_sel, mixed_path, _swept_pct(mixed_sel, mixed_path, target, station,
+                                                     model, cfg, combined, gate, log=log)
+        say("  sweeps are required but only reach "
+            f"{mixed_sel.coverage_pct:.2f}% against a {target_pct:g}% target: "
+            "delivering the pose-only plan instead")
     if pose_rank is not None and pose_rank >= mixed_rank:
         say(f"  the mixed plan ({mixed_sel.coverage_pct:.2f}%, {mixed_path.turns} corners, "
             f"{mixed_path.path_length_mm:.0f} mm) does not beat the pose-only plan "

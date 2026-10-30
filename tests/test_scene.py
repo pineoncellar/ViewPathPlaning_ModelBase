@@ -13,7 +13,7 @@ import json
 
 import numpy as np
 import pytest
-from conftest import box, write_station_file
+from conftest import THICKNESS_MM, box, write_station_file
 
 from scanplan.scene import load_station, load_station_description, read_transform
 
@@ -117,6 +117,18 @@ def test_nearest_obstacle_point_is_where_that_distance_was_measured(station):
     nearest = station.nearest_obstacle_point(probe)
     assert np.allclose(np.linalg.norm(nearest - probe, axis=1),
                        station.clearance_mm(probe), atol=1e-9)
+
+
+def test_inside_part_tells_the_sheet_from_the_air_around_it(clamped_plate):
+    # the parity test behind "no P point sits inside the part": a ray leaving the point
+    # crosses a closed shell an odd number of times exactly when it started inside
+    points = np.array([
+        [0.0, 0.0, THICKNESS_MM / 2.0],       # in the middle of the 0.7 mm sheet
+        [0.0, 0.0, THICKNESS_MM + 50.0],      # above the top face
+        [0.0, 0.0, -50.0],                    # below the bottom face
+        [500.0, 0.0, THICKNESS_MM / 2.0],     # level with the sheet, off its footprint
+    ])
+    assert clamped_plate.station.inside_part(points).tolist() == [True, False, False, False]
 
 
 def test_a_typo_in_the_station_file_is_rejected(tmp_path, folded_plate, fixture_box, base_box):

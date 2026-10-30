@@ -41,8 +41,8 @@ from .target_surface import SampleSet
 REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by_base",
            "blocked_by_tracker", "only_poses_that_collide", "unreachable_joint_limit",
            "candidate_found")
-_COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_kinematics",
-                 "rejected_no_points", "rays")
+_COUNTER_KEYS = ("rejected_inside_part", "rejected_clearance", "rejected_tracker",
+                 "rejected_kinematics", "rejected_no_points", "rays")
 
 
 @dataclass
@@ -127,13 +127,21 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
                  if poses else np.zeros((0, 3)))
     tracker_ok = (np.asarray(visible(positions), dtype=bool) if visible is not None
                   else np.ones(len(poses), dtype=bool))
+    # Every scan position has to sit outside the part: the head approaches from outside,
+    # and a pose whose reference point is inside the sheet covers samples it could never
+    # measure. One vectorised query, because the alternative is three rays per pose in the
+    # loop that is already the run's hot spot.
+    inside_part = station.inside_part(positions) if len(positions) else np.zeros(0, dtype=bool)
     counters = dict.fromkeys(_COUNTER_KEYS, 0)
 
     sets: list[np.ndarray] = []
     quality: list[np.ndarray] = []
     for index, pose in enumerate(poses):
         rejected = None
-        if not model.body_fits(pose.position, station.clearance_mm(pose.position)[0]):
+        if inside_part[index]:
+            counters["rejected_inside_part"] += 1
+            rejected = "inside_part"
+        elif not model.body_fits(pose.position, station.clearance_mm(pose.position)[0]):
             counters["rejected_clearance"] += 1
             rejected = "clearance"
         elif not tracker_ok[index]:

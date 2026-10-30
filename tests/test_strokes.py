@@ -1,4 +1,4 @@
-"""The continuous-path stage: strokes, their coverage, the ordering and the export guard.
+﻿"""The continuous-path stage: strokes, their coverage, the ordering and the export guard.
 
 To assert: the coverage of one straight stroke is the analytic rectangle (the only place
 in the planner with a closed form); the two sampling steps behave as documented, coarse in
@@ -14,6 +14,7 @@ Every fixture is synthetic: customer CAD must never be committed.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 
 import numpy as np
@@ -24,11 +25,14 @@ from scanplan.config import load_config
 from scanplan.coverage import CoverageResult
 from scanplan.path import (
     LEVEL_ONE_CORNER,
+    LEVEL_SAFE_PLANE,
     LEVEL_STRAIGHT,
+    LEVEL_TWO_CORNERS,
     ROLE_COVERAGE,
     ROLE_REORIENT,
     ROLE_RETRACT,
     ROLE_TRAVERSE,
+    PathPlan,
     PathPoint,
     build_path,
     order_strokes,
@@ -52,6 +56,17 @@ from scanplan.strokes import (
 from scanplan.target_surface import SampleSet
 
 PLATE_TOP_MM = 0.7
+
+
+def retract_always(cfg):
+    """The shipped configuration with the historical retract-and-fly routing.
+
+    `stroke.retract_mode` ships as `auto` (straight between items, one sideways waiting
+    point only when the line is blocked). These tests are about the ROUTES that mode
+    replaces - the axial lift, the two-corner traverse and the safe plane - so they ask for
+    `always` explicitly rather than reading today's default.
+    """
+    return replace(cfg, stroke=replace(cfg.stroke, retract_mode="always"))
 
 
 @pytest.fixture(scope="module")
@@ -124,7 +139,7 @@ def test_one_stroke_covers_exactly_its_analytic_rectangle(bench, bench_cfg):
     line - which is exactly what the formula says, and the only place in the planner where
     an answer can be checked against arithmetic rather than against another run.
     """
-    samples = grid_samples(-500.0, 500.0, -400.0, 400.0, PLATE_TOP_MM, 20.0)
+    samples = grid_samples(-500.0, 500.0, -400.0, 400.0, PLATE_TOP_MM, 5.0)
     builder = StrokeBuilder(samples, bench, ScannerModel(bench_cfg.scanner), bench_cfg)
     stroke = horizontal_stroke(-150.0, 150.0)
     coverage = builder.evaluate([stroke])
@@ -133,22 +148,26 @@ def test_one_stroke_covers_exactly_its_analytic_rectangle(bench, bench_cfg):
     covered = np.zeros(len(samples.points), dtype=bool)
     covered[coverage.sets[0]] = True
     points = samples.points
-    expected = ((np.abs(points[:, 1]) <= 300.0 + 1e-6)
-                & (np.abs(points[:, 0]) <= 400.0 + 1e-6))
+    # the 200 mm side runs along station Y (the scanner's local x), the 300 mm side along
+    # station X (local y), so the sweep of a +-150 mm stroke is +-100 mm across and
+    # +-150 +- 150 mm along
+    expected = ((np.abs(points[:, 1]) <= 100.0 + 1e-6)
+                & (np.abs(points[:, 0]) <= 300.0 + 1e-6))
     assert np.array_equal(covered, expected)
-    area = float(len(coverage.sets[0]) * 400.0)
-    assert area == pytest.approx(600.0 * (300.0 + 500.0), rel=0.06)
+    # the sample sum over-counts by half a cell on each edge, which is what the tolerance buys
+    area = float(len(coverage.sets[0]) * 25.0)
+    assert area == pytest.approx(200.0 * (300.0 + 300.0), rel=0.05)
 
 
 def test_a_longer_stroke_covers_the_extra_length_and_nothing_else(bench, bench_cfg):
     """Doubling the stroke adds exactly the strip it travels over, never more."""
-    samples = grid_samples(-500.0, 500.0, -400.0, 400.0, PLATE_TOP_MM, 20.0)
+    samples = grid_samples(-500.0, 500.0, -400.0, 400.0, PLATE_TOP_MM, 5.0)
     builder = StrokeBuilder(samples, bench, ScannerModel(bench_cfg.scanner), bench_cfg)
     short = builder.evaluate([horizontal_stroke(-150.0, 150.0)]).sets[0]
     long = builder.evaluate([horizontal_stroke(-250.0, 250.0)]).sets[0]
     assert set(short.tolist()) < set(long.tolist())
-    # both ends grow by 100 mm along a 600 mm wide footprint: two strips, not one
-    assert len(long) - len(short) == pytest.approx(2.0 * 100.0 * 600.0 / 400.0, rel=0.05)
+    # both ends grow by 100 mm along a 200 mm wide footprint: two strips, not one
+    assert len(long) - len(short) == pytest.approx(2.0 * 100.0 * 200.0 / 25.0, rel=0.05)
 
 
 def test_grown_strokes_respect_the_bounds_and_the_segment_they_claim(bench, cfg):
@@ -177,6 +196,7 @@ def test_the_generator_does_not_offer_two_strokes_over_the_same_line():
 
 
 def test_a_pose_change_becomes_a_reorientation_and_a_translation_does_not(bench, cfg):
+    cfg = retract_always(cfg)
     model = ScannerModel(cfg.scanner)
     rolled_back = replace(cfg, stroke=replace(cfg.stroke, connector_level=2))
     same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
@@ -202,6 +222,7 @@ def test_a_pose_change_becomes_a_reorientation_and_a_translation_does_not(bench,
 
 def test_the_default_connector_drops_the_reorient_corner(bench, cfg):
     """L1: retract, then fly straight in, so a same-pose move costs one corner not two."""
+    cfg = retract_always(cfg)
     model = ScannerModel(cfg.scanner)
     assert cfg.stroke.connector_level == 1
     same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
@@ -219,6 +240,7 @@ def test_the_default_connector_drops_the_reorient_corner(bench, cfg):
 
 def test_connector_level_zero_needs_two_identical_poses_and_a_clear_line(bench, cfg):
     """L0 delivers no corner at all, and only for a pose that does not change."""
+    cfg = retract_always(cfg)
     model = ScannerModel(cfg.scanner)
     straight = replace(cfg, stroke=replace(cfg.stroke, connector_level=0))
     same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
@@ -236,7 +258,234 @@ def test_connector_level_zero_needs_two_identical_poses_and_a_clear_line(bench, 
     assert LEVEL_STRAIGHT not in mixed.connector_levels
 
 
+def test_the_shipped_connector_goes_straight_between_two_sweeps(bench, cfg):
+    """`retract_mode: auto` - the site's "no retract": no corner at all when the line is clear.
+
+    Two parallel sweeps 80 mm apart leave a line that misses the part, so there is nothing
+    to work around. Inserting waiting points here is what turned every transition into two
+    extra J instructions and put the wrist at a pose that scans nothing.
+    """
+    assert cfg.stroke.retract_mode == "auto"
+    model = ScannerModel(cfg.scanner)
+    same_pose = [horizontal_stroke(-150.0, 150.0, y=0.0),
+                 horizontal_stroke(-150.0, 150.0, y=80.0)]
+    path = build_path(same_pose, cfg=cfg, station=bench, model=model,
+                      start_near=np.zeros(3))
+    assert [point.role for point in path.points] == [ROLE_COVERAGE] * 4
+    assert path.connector_levels == {LEVEL_STRAIGHT: 1}
+    assert path.min_clearance_mm > 0.0
+    assert transition_poses(path, cfg) == []
+
+
+def test_the_straight_route_sidesteps_rather_than_lifting_when_it_is_blocked(
+        monkeypatch, cfg):
+    """When the line does run through the part, ONE waiting point leaves SIDEWAYS.
+
+    Sideways is the whole point: retracting along the optical axis walks into whatever sits
+    behind the head, which on the cell is the base behind the upper face and the fixture
+    behind the lower one. A perpendicular move leaves the part's volume immediately.
+    """
+    cfg = retract_always(cfg)          # only for its other fields; the mode is reset below
+    cfg = replace(cfg, stroke=replace(cfg.stroke, retract_mode="auto"))
+    import scanplan.path as path_module
+
+    previous = PathPoint(position=np.array([0.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                         role=ROLE_COVERAGE, source="greedy", stroke_id=0)
+    entry = PathPoint(position=np.array([200.0, 0.0, PLATE_TOP_MM + 300.0]),
+                      axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                      role=ROLE_COVERAGE, source="greedy", stroke_id=1)
+
+    def blocked_in_the_middle(first, second, _cfg, _station, _model, visible=None):
+        ends = {id(first), id(second)}
+        if ends == {id(previous), id(entry)}:
+            return -5.0, True, True      # the straight line runs through the blank
+        return 40.0, False, True
+
+    monkeypatch.setattr(path_module, "_segment_margin", blocked_in_the_middle)
+    plan = PathPlan(points=[])
+    route = path_module._connector(previous, entry, cfg, plan, station=None, model=None,
+                                   strict=True)
+    assert route is not None and len(route) == 1
+    assert plan.connector_levels == {LEVEL_ONE_CORNER: 1}
+    offset = np.asarray(route[0].position, dtype=float) - previous.position
+    axis = np.asarray(previous.axis, dtype=float)
+    # perpendicular to the optical axis, i.e. no axial lift at all
+    assert abs(float(np.dot(offset, axis))) < 1e-9
+    assert float(np.linalg.norm(offset)) == pytest.approx(cfg.stroke.retract_clearance_mm)
+
+
+def test_a_connector_with_no_clear_route_goes_out_through_the_safe_plane(
+        monkeypatch, cfg):
+    """The plane is the last resort before a sweep is dropped, not only an L3 feature.
+
+    Every local route uses one lift for both ends, retracted along each head's own axis. On
+    a pocket that lift has to grow until the horizontal traverse clears the wall, and a lift
+    that big puts the waiting corners out of the arm's reach - so both local routes fail and
+    the sweep used to be dropped. The plane route waits at a fixed height that is both above
+    the wall and reachable, which is the case the fallback exists for.
+
+    Clearance is faked, because the geometry is not the point here: a segment keeps it when
+    it runs along the head's axis (travel under 50 mm horizontally), and a horizontal transit
+    only keeps it above the plane - which is exactly the property the plane is chosen for.
+    """
+    cfg = retract_always(cfg)
+    import scanplan.path as path_module
+
+    normal = np.array([0.0, 0.0, 1.0])
+    # off the ladder of retract lifts (50 mm x 1, 2, 3, 4, 6, 8), so a local route cannot
+    # land on the plane by accident and look like the plane route
+    plane = PLATE_TOP_MM + 550.0
+    # the arm cannot hold a corner higher than this, so the lift a local route would need to
+    # get over the wall is out of reach - the plane is the only height that is both clear of
+    # the wall and reachable
+    reach_limit = plane + 40.0
+    asked: list[str] = []
+
+    def fake_margin(first, second, _cfg, _station, _model, visible=None):
+        asked.append(str(getattr(first, "role", "")))
+        top = np.asarray(second.position, dtype=float)
+        bottom = np.asarray(first.position, dtype=float)
+        flat = float(np.linalg.norm((top - bottom)[:2]))
+        if flat <= 50.0:
+            return 100.0, False, True        # retract / dive along the head's own axis
+        above = min(float(normal @ bottom), float(normal @ top))
+        return (100.0, False, True) if above >= plane - 1e-6 else (-30.0, False, True)
+
+    class FakeGate:
+        active = True
+
+        @staticmethod
+        def check(position, axis, roll_deg):
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=float(normal @ np.asarray(position)) <= reach_limit)
+
+    monkeypatch.setattr(path_module, "_segment_margin", fake_margin)
+    previous = PathPoint(position=np.array([0.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                         role=ROLE_COVERAGE, source="greedy", stroke_id=0)
+    entry = PathPoint(position=np.array([400.0, 0.0, PLATE_TOP_MM + 300.0]),
+                      axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                      role=ROLE_COVERAGE, source="greedy", stroke_id=1)
+    plan = PathPlan(points=[])
+    route = path_module._connector(previous, entry, cfg, plan, station=None, model=None,
+                                   strict=True, normal=normal, plane=plane, kin=FakeGate())
+    assert route is not None, "a blocked sweep must not be dropped while the plane is open"
+    assert plan.connector_levels == {LEVEL_SAFE_PLANE: 1}
+    assert asked, "the local routes have to be tried before the plane"
+    assert [point.role for point in route] == [ROLE_RETRACT, ROLE_TRAVERSE]
+    # both waiting points sit on the plane, so the traverse between them stays outside
+    for point in route:
+        assert float(normal @ point.position) == pytest.approx(plane, abs=1e-6)
+    assert plan.violations == []
+
+    # without a plane normal the local routes are all there is, and the only straight line
+    # between the two poses runs BELOW the wall (-30 mm): the connector is refused, because
+    # a transit through the part is not a route. The evidence is still booked.
+    blocked = PathPlan(points=[])
+    without = path_module._connector(previous, entry, cfg, blocked,
+                                     station=None, model=None, strict=True,
+                                     kin=FakeGate())
+    assert without is None
+    assert any("is refused" in line and "30.0 mm inside" in line
+               for line in blocked.violations)
+
+
+def test_a_route_the_arm_cannot_hold_falls_back_to_a_direct_move(monkeypatch, cfg):
+    """Joint feasibility is not negotiable, but the sweep is not lost over it either.
+
+    `stroke.hard_gate: false` means "deliver a sweep whose transit passes close to the
+    fixture and list the route" - it does NOT mean "deliver a corner the arm cannot reach".
+    When no corner on any route is reachable, both ENDS are still points the gate accepted,
+    so the move between them is a direct one: executable, and recorded on its own line.
+    Refusing it instead threw away 4 of 7 sweeps and 15 of 17 poses on the 2026-10-28
+    station (95.9% selected becoming 51.4% delivered).
+    """
+    cfg = retract_always(cfg)
+    import scanplan.path as path_module
+
+    def clear_margin(first, second, _cfg, _station, _model, visible=None):
+        return 7.5, False, True
+
+    class Unreachable:
+        active = True
+
+        @staticmethod
+        def check(position, axis, roll_deg):
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=False)
+
+    monkeypatch.setattr(path_module, "_segment_margin", clear_margin)
+    previous = PathPoint(position=np.array([0.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                         role=ROLE_COVERAGE, source="greedy", stroke_id=0)
+    entry = PathPoint(position=np.array([400.0, 0.0, PLATE_TOP_MM + 300.0]),
+                      axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                      role=ROLE_COVERAGE, source="greedy", stroke_id=1)
+    plan = PathPlan(points=[])
+    route = path_module._connector(previous, entry, cfg, plan, station=None, model=None,
+                                   strict=False, kin=Unreachable())
+    assert route == []                                  # no corner, straight there
+    # the failed L2 attempt is still booked, so the report shows both what was tried and
+    # what was finally written
+    assert plan.connector_levels == {LEVEL_TWO_CORNERS: 1, LEVEL_STRAIGHT: 1}
+    assert any("goes straight" in line and "7.5 mm" in line
+               for line in plan.violations)
+
+
+def test_a_straight_fallback_that_hits_the_part_is_refused_under_the_hard_gate(
+        monkeypatch, cfg):
+    """Two poses 800 mm apart on a curved surface are joined by a line through it.
+
+    The direct move exists because both ends are legal, but "a move a programmer would
+    write by hand" means one that MISSES the part. On the 2026-10-29 station the fallback
+    was the only thing between a 97.4% plan and a transit 28 mm inside the blank: a
+    coverage hole the report can name is worth more than a transit ROBOGUIDE rejects.
+    """
+    cfg = retract_always(cfg)
+    import scanplan.path as path_module
+
+    def buried(first, second, _cfg, _station, _model, visible=None):
+        # the line is inside the blank: the part-containment flag and a negative clearance,
+        # which is what the sampling reports for a transit through the sheet
+        return -28.2, True, True
+
+    class Unreachable:
+        active = True
+
+        @staticmethod
+        def check(position, axis, roll_deg):
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=False)
+
+    monkeypatch.setattr(path_module, "_segment_margin", buried)
+    previous = PathPoint(position=np.array([0.0, 0.0, PLATE_TOP_MM + 300.0]),
+                         axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                         role=ROLE_COVERAGE, source="greedy", stroke_id=0)
+    entry = PathPoint(position=np.array([400.0, 0.0, PLATE_TOP_MM + 300.0]),
+                      axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                      role=ROLE_COVERAGE, source="greedy", stroke_id=1)
+    plan = PathPlan(points=[])
+    assert path_module._connector(previous, entry, cfg, plan, station=None, model=None,
+                                  strict=True, kin=Unreachable()) is None
+    assert any("is refused" in line and "28.2 mm inside" in line
+               for line in plan.violations)
+    # the evidence of what was tried is still booked, so the report can explain the drop
+    assert plan.connector_levels == {LEVEL_TWO_CORNERS: 1, LEVEL_STRAIGHT: 1}
+
+    # the same line with clearance is still delivered: thin is a judgement call, buried is
+    # not, and the legacy profile (no hard gate) keeps the old lenient behaviour
+    monkeypatch.setattr(path_module, "_segment_margin",
+                        lambda *a, **k: (7.5, False, True))
+    assert path_module._connector(previous, entry, cfg, PathPlan(points=[]), station=None,
+                                  model=None, strict=True, kin=Unreachable()) == []
+    monkeypatch.setattr(path_module, "_segment_margin", buried)
+    assert path_module._connector(previous, entry, cfg, PathPlan(points=[]), station=None,
+                                  model=None, strict=False, kin=Unreachable()) == []
+
+
 def test_the_transition_poses_are_only_the_moves_between_sweeps(bench, cfg):
+    cfg = retract_always(cfg)
     model = ScannerModel(cfg.scanner)
     strokes = [horizontal_stroke(-150.0, 150.0, y=0.0),
                horizontal_stroke(-150.0, 150.0, y=80.0)]
@@ -413,10 +662,42 @@ def test_exporting_a_stroke_plan_refuses_to_re_sort(tmp_path):
                             speed="100 mm/sec", termination="CNT0", order=False)
     assert contract["ordering"]["method"] == "as delivered by the planner"
     text = (tmp_path / "kept" / "SCAN_A.LS").read_text(encoding="ascii")
-    assert text.count("L P[") == len(points)
-    assert "CNT0" in text and "FINE" not in text
+    # The head scans while it travels, so the move that goes down a stroke is interpolated
+    # (L) with CNT0 so it does not stop at every sample. The move INTO a stroke scans
+    # nothing - the head arrives at its first pose and only then starts sweeping - so it is
+    # written as a joint move, which is also the only honest way to turn the wrist.
+    moves = re.findall(r"^\s*\d+:([LJ]) P\[(\d+)\]", text, re.MULTILINE)
+    assert moves == [("J", "1"), ("L", "2"), ("J", "3"), ("L", "4")]
+    assert "L P[2] 100 mm/sec CNT0" in text
+    assert "J P[1] 50% FINE" in text
     assert contract["program"]["termination"] == "CNT0"
     assert contract["program"]["strokes"] == [0, 1]
+
+
+def test_every_joint_move_is_written_at_the_configured_joint_speed(tmp_path):
+    """A J instruction never scans, and its TCP path is the one thing the planner cannot
+    model - so the site writes them at 5%, not at the 50% default. The percentage comes
+    from `motion.joint_speed_pct`, which is what the CLI and the page pass here.
+    """
+    points = [
+        {"id": 0, "position": [0.0, 0.0, 300.0], "axis": [0.0, 0.0, -1.0], "roll_deg": 0.0,
+         "stroke_id": 0, "role": "coverage"},
+        {"id": 1, "position": [200.0, 0.0, 300.0], "axis": [0.0, 0.0, -1.0], "roll_deg": 0.0,
+         "stroke_id": 0, "role": "coverage"},
+        {"id": 2, "position": [20.0, 120.0, 300.0], "axis": [0.0, 0.0, -1.0],
+         "roll_deg": 0.0, "stroke_id": 1, "role": "coverage"},
+        {"id": 3, "position": [220.0, 120.0, 300.0], "axis": [0.0, 0.0, -1.0],
+         "roll_deg": 0.0, "stroke_id": 1, "role": "coverage"},
+    ]
+    contract = adapt.export(points, tmp_path, prog_name="SCAN_J", motion="L",
+                            speed="100 mm/sec", joint_speed="5%", termination="CNT0",
+                            order=False)
+    text = (tmp_path / "SCAN_J.LS").read_text(encoding="ascii")
+    assert "J P[1] 5% FINE" in text and "J P[3] 5% FINE" in text
+    assert "50%" not in text
+    # the L instructions keep the millimetre rate; the two are different quantities
+    assert "L P[2] 100 mm/sec CNT0" in text
+    assert contract["program"]["joint_speed"] == "5%"
 
 
 def test_the_shipped_configuration_delivers_strokes_and_says_so(clamped_plate):

@@ -32,6 +32,12 @@ DELIVERY_MODES = ("path", "lean")
 COST_MODELS = ("corners", "millimetres")
 
 
+# How the head gets from one delivered item to the next.
+# `always` keeps the historical retract-and-fly route; `auto` goes straight unless the
+# straight line would pass through the part, and then leaves sideways once.
+RETRACT_MODES = ("auto", "always")
+
+
 @dataclass(frozen=True)
 class ScannerParams:
     """The scanner's geometric and quality envelope.
@@ -56,6 +62,7 @@ class ScannerParams:
     tilts_deg: tuple[float, ...]
     rolls_deg: tuple[float, ...]
     aim_grid_mm: float
+    tilt_azimuths: int
     max_candidates: int
     refine_rounds: int
     refine_aim_grid_mm: float
@@ -131,6 +138,20 @@ class StrokeParams:
       route through a retract AND a re-orientation point, 1 spreads the rotation over the
       flight and drops the second point, 0 also allows a straight move between two
       identical poses. 0 stays off until ROBOGUIDE has confirmed it.
+    * `retract_mode` says whether the head lifts off between two items at all.
+
+      `always` is the historical behaviour: a waiting point is inserted between every
+      pair, so the head backs away, flies and dives back in. On the cell this doubles or
+      triples the number of J instructions for no scanning benefit, and every one of
+      those points is another place the arm can fail a joint limit.
+
+      `auto` (the site's choice, 2026-10-29) goes straight from one item to the next with
+      no corner at all, and inserts ONE waiting point only when the straight line would
+      pass through the part or keep no clearance. That waiting point leaves SIDEWAYS -
+      perpendicular to the optical axis - because lifting along the axis points the head
+      back into whatever is behind it, which on this cell is the base behind the upper
+      face and the fixture behind the lower one.
+
     * `order_axis_weight_mm_per_deg` prices a pose change in the ordering. Distance alone
       ignores the axis, so two adjacent strokes 60 degrees apart in pose look free to
       travel between and cost a large re-orientation instead.
@@ -166,6 +187,12 @@ class StrokeParams:
     * `side_scan_tilt_deg` adds a family of seeds whose optical axis is tilted off the
       surface normal by this angle, for the walls and deep pockets a head-on sweep cannot
       reach. 0 disables the family.
+    * `require_sweeps` keeps the SWEEP plan even when the pose-only reference scores better
+      on corners and travel. A scanning cell is bought to sweep: the pose plan is the
+      fallback for a pool whose sweeps cannot meet the target, not an equally good
+      deliverable that happens to stop the arm thirty times. On the 2026-10-28 station the
+      two tie on coverage (99.02% vs 99.04%) and the pose plan wins on corners, so without
+      this flag "stroke mode" silently delivers poses.
     """
 
     enabled: bool
@@ -179,6 +206,7 @@ class StrokeParams:
     coverage_step_mm: float
     check_step_mm: float
     retract_clearance_mm: float
+    retract_mode: str
     max_rot_deg_per_mm: float
     max_prune_rounds: int
     cost_model: str
@@ -192,6 +220,7 @@ class StrokeParams:
     repair_budget_share: float
     pool_mode: str
     side_scan_tilt_deg: float
+    require_sweeps: bool
 
 
 @dataclass(frozen=True)
@@ -200,11 +229,48 @@ class MotionParams:
 
     Speed is a floor setting, not a planning variable; it is carried here only so the
     program has one source for it instead of a flag and a config that can disagree.
+
+    `joint_speed_pct` is the percentage a J instruction is written with. It is separate
+    from `speed_mm_s` because the two are different quantities: an L move has a TCP rate,
+    a J move is a fraction of the joint rates the controller is configured with. The
+    shipped value is the site's 5% (2026-10-29): every J instruction in the delivered
+    program is a move that scans nothing, and a wrist turning at 50% next to the part is
+    the one thing in the program that cannot be verified offline.
     """
 
     type: str
     termination: str
     speed_mm_s: float
+    joint_speed_pct: float = 5.0
+
+
+def usable_limits(mechanical_deg, soft_deg, usage_frac: float = 1.0):
+    """The envelope the planner may actually command, per axis.
+
+    Two steps, in this order, and the order matters: shrink the DATASHEET envelope to its
+    central `usage_frac`, then intersect with what the controller enforces. Shrinking after
+    the intersection double-counts - the controller's own soft limit is already a
+    configured safety, and taking another 5 % off it is how J2 ended up commanding -83 deg
+    on a machine whose controller stops at -60 (MOTN-017, G:1 A:2).
+
+    `usage_frac` is 1.0 in the shipped configuration: the site's reserve is a flat
+    `joint_margin_deg` (5-10 deg) at each end, not a share of the range, because a share is
+    a different number of degrees on every axis (18.5 on J1, 6.8 on J2, 36 on J4). The
+    fraction is still supported - measured about the CENTRE of the datasheet range, so an
+    asymmetric axis stays honest - for a site that wants a proportional band.
+
+    The result is a hard envelope, not a report: every pose the gate accepts is inside it,
+    and `Robot.feasible` then requires `joint_margin_deg` of room at each end of it.
+    """
+    fraction = float(usage_frac)
+    usable = []
+    for (low, high), (soft_low, soft_high) in zip(mechanical_deg, soft_deg, strict=True):
+        low, high = float(low), float(high)
+        centre = 0.5 * (low + high)
+        half = 0.5 * (high - low) * fraction
+        usable.append((max(centre - half, float(soft_low)),
+                       min(centre + half, float(soft_high))))
+    return tuple(usable)
 
 
 @dataclass(frozen=True)
@@ -221,11 +287,20 @@ class RobotParams:
     pose bank was replaced - only the tool did, which is what a re-taught UTOOL looks
     like. `docs/robot-calibration.md` is the procedure.
 
-    `soft_limits_deg` is what the controller actually enforces. It is inferred, not read
-    off the machine yet (three joints sat exactly on integer values in the captured
-    samples, and the 2026-10-23 bank has two poses sitting 0.68 deg inside the J5 floor,
-    which is the SRVO-115 pose), so it is kept separate from the mechanical envelope: the
-    planner uses the intersection, and `limits_source` in the report says so.
+    `mechanical_limits_deg` is the FANUC datasheet envelope for the R-2000iC/125L
+    (floor standard version, reach 2655) supplied for this cell: J1 +-185, J2 -90..+46,
+    J3 -122..+190, J4 +-360, J5 +-125, J6 +-360. `model` is a report label only - the
+    kinematics comes from the fitted geometry above, so renaming the arm moves no number.
+    `soft_limits_deg` is what the controller actually enforces; it is kept separate so a
+    narrower pendant setting can be written in without touching the datasheet, and the
+    planner intersects the two.
+
+    `limits_usage_frac` is a share of the datasheet envelope (1.0 = the whole of it), and
+    `joint_margin_deg` is the reserve kept at each end on top of that. The site asked for
+    the second alone on 2026-10-28: a percentage of the range is a different reserve on
+    every axis (18.5 deg on J1, 6.8 on J2, 36 on J4) and nothing about the machine justifies
+    that; 5-10 deg is a number a workshop can reason about. The gate judges against the
+    limits MINUS that margin, so "5 deg reserved" is what the delivered path satisfies.
 
     `enabled=False` skips the whole gate, which is what keeps the pre-2026-10-22 result
     reproducible bit for bit.
@@ -259,11 +334,29 @@ class RobotParams:
 
     mechanical_limits_deg: tuple[tuple[float, float], ...]
     soft_limits_deg: tuple[tuple[float, float], ...]
+    limits_usage_frac: float
 
     joint_margin_deg: float
     j5_min_abs_deg: float
     max_step_deg: float
     wrist_identified: bool
+    # The third letter of every CONFIG string: "auto" follows the measured rule (`T` for
+    # J5 < 0, 8 pendant-labelled poses on 2026-10-23), "T"/"F" pins it. This cell needs "T":
+    # its ROBOGUIDE refuses an `N U F, ...` block at import with ASBN-023 "Configuration
+    # error" - the whole file, not the point. Pinning is safe because the two wrist branches
+    # are the SAME TCP pose (J5 negated, J4/J6 turned 180), so the scanner sees no difference;
+    # what it buys is a program that loads.
+    config_wrist_letter: str = "auto"
+
+    # The CONFIG families the cell is allowed to use, as letter triples (shoulder, elbow,
+    # wrist). Empty means "any family the solver finds". This is not a preference, it is a
+    # correctness boundary: on 2026-10-28 a delivered point whose only in-envelope solution
+    # was `F D T` reached the controller as J2 = 143.06 deg and stopped the program with
+    # MOTN-017 (G:1, A:2,3). The closed form's front/back family numbers J2 around -40 for
+    # that posture while the controller reports ~143 for it, so the family cannot be
+    # validated against the limits this config carries - and it is not needed either: every
+    # point of the program that ran on the cell (COV90.LS) is `N U T`.
+    allowed_configs: tuple[str, ...] = ()
 
     @classmethod
     def disabled(cls) -> RobotParams:
@@ -278,12 +371,15 @@ class RobotParams:
             wrist_tilt_deg=(-90.0, -90.0),
             tool_xyz_mm=(-248.001, -26.674, 584.158),
             tool_ypr_deg=(179.279, -45.934, 172.758),
-            mechanical_limits_deg=((-185.0, 185.0), (-136.0, 136.0), (-301.0, 301.0),
-                                   (-720.0, 720.0), (-250.0, 250.0), (-720.0, 720.0)),
-            soft_limits_deg=((-185.0, 185.0), (-60.0, 136.0), (-301.0, 301.0),
-                             (-720.0, 720.0), (-125.0, 125.0), (-360.0, 360.0)),
+            mechanical_limits_deg=((-185.0, 185.0), (-90.0, 46.0), (-122.0, 190.0),
+                                   (-360.0, 360.0), (-125.0, 125.0), (-360.0, 360.0)),
+            soft_limits_deg=((-185.0, 185.0), (-60.0, 46.0), (-122.0, 190.0),
+                             (-360.0, 360.0), (-125.0, 125.0), (-360.0, 360.0)),
+            limits_usage_frac=1.0,
             joint_margin_deg=5.0, j5_min_abs_deg=8.0, max_step_deg=40.0,
             wrist_identified=True,
+            config_wrist_letter="auto",
+            allowed_configs=(),
         )
 
 
@@ -572,6 +668,13 @@ def _optional_member(annotation: Any):
 MOTION_TYPES = ("J", "L")
 TERMINATIONS = ("FINE", "CNT0", "CNT100")
 POOL_MODES = ("full", "grid", "rails")
+# The third letter of a FANUC CONFIG string: "auto" derives it from the sign of J5 (the
+# measured rule), "T"/"F" pins it for a controller that refuses one of them.
+WRIST_LETTERS = ("AUTO", "T", "F")
+# The three letters of a CONFIG family: shoulder side, elbow side, wrist flip.
+CONFIG_SHOULDERS = ("F", "N")
+CONFIG_ELBOWS = ("U", "D")
+CONFIG_WRISTS = ("T", "F")
 
 
 def _validate(config: PlannerConfig) -> None:
@@ -591,6 +694,10 @@ def _validate(config: PlannerConfig) -> None:
         )
     if scanner.max_candidates <= 0:
         raise ValueError("'max_candidates' must be positive")
+    if scanner.tilt_azimuths < 1:
+        raise ValueError("'tilt_azimuths' must be at least 1: it is how many directions "
+                         "around the surface normal the tilt fan sweeps, so 0 would leave "
+                         "the ladder unable to tilt at all")
     if scanner.refine_rounds < 0:
         raise ValueError("'refine_rounds' cannot be negative")
     if scanner.standoff_mm <= 0.0 or target.sample_grid_mm <= 0.0:
@@ -622,6 +729,9 @@ def _validate(config: PlannerConfig) -> None:
                          f"not {config.motion.termination!r}")
     if config.motion.speed_mm_s <= 0.0:
         raise ValueError("'motion.speed_mm_s' must be positive")
+    if not 0.0 < config.motion.joint_speed_pct <= 100.0:
+        raise ValueError("'motion.joint_speed_pct' must be in (0, 100]: FANUC writes a J "
+                         "instruction's speed as a percentage of the joint rates")
 
 
 def _validate_strokes(stroke: StrokeParams) -> None:
@@ -647,6 +757,9 @@ def _validate_strokes(stroke: StrokeParams) -> None:
                          f"not {stroke.cost_model!r}")
     if stroke.transition_corners_estimate < 0.0:
         raise ValueError("'transition_corners_estimate' cannot be negative")
+    if stroke.retract_mode not in RETRACT_MODES:
+        raise ValueError(f"'retract_mode' must be one of {RETRACT_MODES}, "
+                         f"not {stroke.retract_mode!r}")
     if not 0 <= stroke.connector_level <= 2:
         raise ValueError("'connector_level' must be in [0, 2]: 2 is the retract-and-"
                          "reorient route, 1 drops the reorient point, 0 also allows a "
@@ -712,10 +825,29 @@ def _validate_robot(robot: RobotParams) -> None:
         raise ValueError("'robot.joint_margin_deg' cannot be negative")
     if robot.max_step_deg <= 0.0:
         raise ValueError("'robot.max_step_deg' must be positive")
-    j5_low, j5_high = robot.soft_limits_deg[4]
+    if str(robot.config_wrist_letter).upper() not in WRIST_LETTERS:
+        raise ValueError(f"'robot.config_wrist_letter' must be one of {WRIST_LETTERS}, "
+                         f"not {robot.config_wrist_letter!r}")
+    for family in robot.allowed_configs:
+        letters = str(family).upper().split()
+        if (len(letters) != 3 or letters[0] not in CONFIG_SHOULDERS
+                or letters[1] not in CONFIG_ELBOWS or letters[2] not in CONFIG_WRISTS):
+            raise ValueError(
+                f"'robot.allowed_configs' entry {family!r} is not a CONFIG family: write "
+                "three letters, e.g. 'N U T' (shoulder F/N, elbow U/D, wrist T/F)")
+    if not 0.0 < robot.limits_usage_frac <= 1.0:
+        raise ValueError("'robot.limits_usage_frac' must be in (0, 1]: it is the share of "
+                         "each axis range, measured from the range centre, that the "
+                         "planner may command")
+    # The J5 band is judged inside the ENVELOPE THE GATE USES, not the datasheet: a share
+    # of 0.9 already shaves 12.5 deg off each end of +-125, so validating against the raw
+    # limits would accept a j5_min_abs_deg that the shrunk band cannot hold.
+    j5_low, j5_high = usable_limits(robot.mechanical_limits_deg, robot.soft_limits_deg,
+                                    robot.limits_usage_frac)[4]
     if robot.j5_min_abs_deg >= (j5_high - j5_low) / 2.0:
-        raise ValueError("'robot.j5_min_abs_deg' leaves no usable J5 band inside the soft "
-                         f"limits [{j5_low}, {j5_high}]")
+        raise ValueError("'robot.j5_min_abs_deg' leaves no usable J5 band inside the usable "
+                         f"limits [{j5_low:g}, {j5_high:g}] at "
+                         f"limits_usage_frac={robot.limits_usage_frac:g}")
     if robot.j5_min_abs_deg <= 0.0:
         raise ValueError("'robot.j5_min_abs_deg' must be positive: J5 = 0 is the wrist "
                          "singularity, not a safe centre")

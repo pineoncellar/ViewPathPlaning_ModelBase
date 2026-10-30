@@ -44,7 +44,7 @@ from scanplan.report import (
 from scanplan.roboguide.adapt import export as export_ls
 from scanplan.roboguide.wpr import normalise_prog_name
 from scanplan.scene import StationDescription, load_station
-from scanplan.sheet_split import split_sheet
+from scanplan.target_surface import ScanRegion
 from scanview import load_target_samples, render_run, save_target_samples
 
 from .cad_import import mesh_from_bytes, to_stl_bytes
@@ -54,6 +54,12 @@ _MAX_STL_BYTES = 120 * 1024 * 1024
 _MAX_REQUEST_BYTES = 380 * 1024 * 1024
 _SAFE_RUN_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _SAFE_ARTIFACT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,96}$")
+
+# The page sends one entry per surface the operator picked. More than this is a mis-click,
+# not a plan, and the triangles per pick are capped so a pathological pick cannot exhaust
+# the request limit before the meshes are even read.
+_MAX_SCAN_FACES = 32
+_MAX_SCAN_FACE_TRIANGLES = 40_000
 
 # --- progress board --------------------------------------------------------
 #
@@ -137,6 +143,56 @@ def _pose_matrix(pose: dict, name: str) -> np.ndarray:
     matrix[:3, :3] = wpr_to_rot(*wpr)
     matrix[:3, 3] = position
     return matrix
+
+
+def _scan_regions(data: dict, transform: np.ndarray) -> list[ScanRegion]:
+    """The scan faces picked in the 3D view, moved into the station frame.
+
+    The page picks on the uploaded meshes, which are in vehicle coordinates, while the
+    planner works on the registered station - so the same rigid transform that positions
+    the part moves the picks. A pick is the patch's own triangles, which is what makes the
+    target boundary exact: the planner keeps the samples that land inside those triangles.
+    """
+    raw = data.get("scan_regions")
+    if raw in (None, [], {}):
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("scan_regions must be a list of the surfaces picked in 3D")
+    if len(raw) > _MAX_SCAN_FACES:
+        raise ValueError(f"pick at most {_MAX_SCAN_FACES} scan faces")
+    rotation = np.asarray(transform, dtype=float)[:3, :3]
+    translation = np.asarray(transform, dtype=float)[:3, 3]
+    regions: list[ScanRegion] = []
+    for index, entry in enumerate(raw):
+        name = f"scan face {index + 1}"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{name} must be an object")
+        normal = _vector(entry.get("normal"), f"{name} normal")
+        length = float(np.linalg.norm(normal))
+        if length <= 0.0:
+            raise ValueError(f"{name} normal must not be zero length")
+        origin = _vector(entry.get("origin"), f"{name} origin")
+        tolerance_mm = float(entry.get("tolerance_mm", 0.5))
+        if not np.isfinite(tolerance_mm) or not 0.01 <= tolerance_mm <= 50.0:
+            raise ValueError(f"{name} tolerance must be between 0.01 and 50 mm")
+        patches = entry.get("triangles")
+        if not isinstance(patches, list) or not patches:
+            raise ValueError(f"{name} carries no triangles: pick the surface again")
+        if len(patches) > _MAX_SCAN_FACE_TRIANGLES:
+            raise ValueError(f"{name} has more than {_MAX_SCAN_FACE_TRIANGLES} triangles")
+        triangles = np.asarray(patches, dtype=float)
+        if triangles.ndim != 3 or triangles.shape[1:] != (3, 3) \
+                or not np.isfinite(triangles).all():
+            raise ValueError(f"{name} triangles must be a list of three [x, y, z] corners")
+        regions.append(
+            ScanRegion(
+                triangles=triangles @ rotation.T + translation,
+                normal=rotation @ (normal / length),
+                origin=rotation @ origin + translation,
+                tolerance_mm=tolerance_mm,
+            )
+        )
+    return regions
 
 
 def _registration_from_payload(data: dict) -> tuple[RigidRegistration, list[np.ndarray]]:
@@ -384,6 +440,7 @@ def _public_config() -> dict:
         "motion": config.motion.type,
         "termination": config.motion.termination,
         "speed_mm_s": float(config.motion.speed_mm_s),
+        "joint_speed_pct": float(config.motion.joint_speed_pct),
         "config_source": config.source,
         "parameter_sources": dict(config.parameter_sources),
     }
@@ -417,6 +474,7 @@ def _export_options(config, viewpoints, data: dict) -> dict:
         return {
             "motion": config.motion.type,
             "speed": f"{config.motion.speed_mm_s:g} mm/sec",
+            "joint_speed": f"{config.motion.joint_speed_pct:g}%",
             "termination": config.motion.termination,
             "order": False,
         }
@@ -486,6 +544,7 @@ def solve_job(data: dict, progress=None) -> dict:
     combined_base[:3, 3] = registration.translation
     combined_base = combined_base @ base_reset
     scan_axis_target = registration.rotation @ face_axis_vehicle
+    scan_regions = _scan_regions(data, combined_part)
 
     requested_run_id = str(data.get("run_id") or (
         datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
@@ -547,17 +606,23 @@ def solve_job(data: dict, progress=None) -> dict:
         station = load_station(description, cloud_seed=config.seed)
         announce("segmentation", 0.10, "station loaded")
         axis_in_measured = registration.rotation @ face_axis_vehicle
-        split = split_sheet(
-            station.part,
-            band_deg=config.target.band_deg,
-            knn=config.target.knn,
-            seed=config.seed,
-            through_axis=axis_in_measured,
-        )
-        announce("segmentation", 0.12, "blank split")
-        result = plan(station, config, face="upper", split=split,
+        # The blank split is NOT built here. Handing `plan()` a precomputed one looked
+        # harmless - same mesh, same parameters - but the split seeds the sign of the local
+        # sheet normal from a single through-thickness axis, so a different axis reassigns
+        # whole regions between "upper" and "lower". On station 20261028_193014 the exact
+        # measured axis gave 53.8% coverage while the axis `plan()` derives itself gave
+        # 99.0% on the SAME station file: the run was planning a face made of the wrong
+        # regions, and the delivery stage then dropped eight strokes it could not reach.
+        # One source of truth for the split, so the page and the CLI cannot disagree.
+        #
+        # The picked scan faces are SUPPLEMENTARY: they are added to the main scan face
+        # inside `build_target`, so the split is not needed here and the main face stays
+        # exactly the one the axis implies. One source of truth for the split, so the page
+        # and the CLI cannot disagree.
+        result = plan(station, config, face="upper",
+                      regions=scan_regions or None,
                       progress=lambda stage, fraction, detail="": announce(
-                          stage, 0.12 + 0.78 * fraction, detail))
+                          stage, 0.10 + 0.80 * fraction, detail))
         announce("report", 0.92, "planning finished")
         result.report["installation_registration"] = {
             "measured_frame": registration.frame_label,
@@ -577,6 +642,7 @@ def solve_job(data: dict, progress=None) -> dict:
             prog_name=prog_name,
             uframe=output_uframe,
             utool=int(data.get("utool", 1)),
+            robot=config.robot,
             **options,
         )
         announce("export", 0.98, "program exported")
@@ -671,10 +737,28 @@ def solve_job(data: dict, progress=None) -> dict:
         "target_points": int(result.report.get("target_points", 0)),
         "uncovered_points": int(result.report.get("uncovered_points", 0)),
         "target_face_mm2": float(result.report.get("target_face_mm2", 0.0)),
+        "supplementary_mm2": float(
+            result.report.get("definition", {}).get("supplementary_area_mm2", 0.0)),
+        "supplementary_faces": int(
+            result.report.get("definition", {}).get("supplementary_faces", 0)),
         "face": str(result.report.get("face", "")),
         "uncovered_by_reason": result.report.get("uncovered_by_reason", {}),
         "scan_face_axis_vehicle": face_axis_vehicle.tolist(),
         "scan_face_axis_measured_frame": scan_axis_target.tolist(),
+        # The picks come back in vehicle coordinates so a replan from this result - or from
+        # the history entry it is stored in - scans the same surfaces again.
+        "scan_regions_vehicle": [
+            {
+                "origin": _vehicle_point(combined_part, region.origin),
+                "normal": _vehicle_axis(combined_part, region.normal),
+                "tolerance_mm": round(float(region.tolerance_mm), 3),
+                "triangles": [
+                    [_vehicle_point(combined_part, corner) for corner in triangle]
+                    for triangle in region.triangles
+                ],
+            }
+            for region in scan_regions
+        ],
         "measured_frame": registration.frame_label,
         "registration_rms_error_mm": registration.rms_error_mm,
         "registration_max_error_mm": registration.max_error_mm,
@@ -826,6 +910,7 @@ def _relocation_export_options(run_dir: Path, prog_name: str) -> dict:
     return {
         "motion": str(program.get("motion") or "J"),
         "speed": str(program.get("speed") or "100%"),
+        "joint_speed": str(program.get("joint_speed") or "50%"),
         "termination": str(program.get("termination") or "FINE"),
     }
 
