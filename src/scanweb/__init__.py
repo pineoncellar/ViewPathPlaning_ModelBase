@@ -35,10 +35,12 @@ import trimesh
 from scanplan.config import (
     FAST_MIN_SAMPLE_GRID_MM,
     FAST_SAMPLE_GRID_MM,
+    PLAN_MODES,
     ROUTE_STYLES,
     fast_preset,
     load_config,
     override,
+    plan_preset,
     route_preset,
 )
 from scanplan.pipeline import plan, write_outputs
@@ -306,6 +308,25 @@ def _write_planning_report(path: Path, *, run_id: str, prog_name: str,
             "程序的点数与形状与 <code>direct</code> 档不同，两档的覆盖率<b>不能互相作为"
             "回归基准</b>。</div></section>"
         )
+    plan_settings = route.get("plan_mode_settings") or {}
+    if route.get("plan_mode") and route.get("plan_mode") != "standard":
+        # The plan mode changes WHICH items the selection may pick, so a coverage figure from
+        # one is not a regression test for the other - and the three numbers it stands for
+        # are what makes the difference reproducible two weeks later.
+        route_banner += (
+            '<section><div class="warn"><b>本次运行使用规划模式 '
+            f'{html.escape(str(route.get("plan_mode")))}</b>：倾斜种子族铺在 '
+            f'{int(plan_settings.get("side_scan_azimuths") or 1) * 2} 个方向（每 '
+            f'{float(plan_settings.get("side_scan_spacing_mm") or 0.0):g} mm 一颗），'
+            f'关节包络用满量程的 '
+            f'{float(plan_settings.get("joint_span_fraction") or 1.0):g}、余量 '
+            f'{float(plan_settings.get("joint_margin_deg") or 0.0):g}°，'
+            f'一条扫描带按 '
+            f'{float(plan_settings.get("stroke_corner_cost") or 2.0):g} 个转角计价。'
+            "这个模式会让更多区域被<b>扫</b>而不是被<b>停</b>，代价是点数上升、"
+            "并且贴着关节限位跑；与 <code>standard</code> 档的结果<b>不能互相作为回归"
+            "基准</b>。</div></section>"
+        )
     body = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>扫描规划报告 · {html.escape(prog_name)}</title>
@@ -438,6 +459,14 @@ def _public_config() -> dict:
         "route_style": config.stroke.route_style,
         "route_styles": list(ROUTE_STYLES),
         "route_connector": config.stroke.connector,
+        # What one sweep costs the selection next to a pose's 1.0. A page control because it
+        # is the only knob that decides how much of the part is swept rather than stopped on,
+        # and the arithmetic is counter-intuitive enough that it is worth being able to try.
+        "stroke_corner_cost": float(config.stroke.stroke_corner_cost),
+        # The plan mode and what it stands for, so the page can label the choice with the
+        # numbers it will actually use.
+        "plan_mode": config.stroke.plan_mode,
+        "plan_modes": list(PLAN_MODES),
     }
 
 
@@ -463,6 +492,29 @@ def _coverage_target(raw):
         raise ValueError("覆盖率目标必须填百分数，或留空 / 勾选「不设上限」") from error
     if not 0.0 < value <= 100.0:
         raise ValueError("覆盖率目标必须大于 0 且不超过 100，或留空 / 勾选「不设上限」")
+    return value
+
+
+def _stroke_corner_cost(raw):
+    """One page value for `stroke.stroke_corner_cost`, refused here rather than clamped.
+
+    Below 1.0 is refused with a note rather than silently floored: the page would be asking
+    the planner to believe a sweep costs less than the single stop it still has to make.
+    There is no upper bound - a site may deliberately make bands dearer to get fewer of
+    them - but 2.0 is the true count of corners a band needs, so anything at or above it
+    reproduces the counting exactly.
+    """
+    if raw is _KEEP:
+        return _KEEP
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return _KEEP
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("扫描带角价必须填数字（1.0 ~ 2.0 是有效区间）") from error
+    if value < 1.0:
+        raise ValueError("扫描带角价不能小于 1.0：一条带至少也要一个停点。"
+                         "1.0 = 一条带按一个位姿计价，2.0 = 真实要的两个转角")
     return value
 
 
@@ -505,6 +557,14 @@ def _delivery_config(data: dict):
     target = _coverage_target(data.get("coverage_target_pct", _KEEP))
     if target is not _KEEP:
         config = override(config, target={"coverage_target_pct": target})
+    corner_cost = _stroke_corner_cost(data.get("stroke_corner_cost", _KEEP))
+    plan_mode_value = data.get("plan_mode", _KEEP)
+    if plan_mode_value is not _KEEP and plan_mode_value not in (None, ""):
+        if str(plan_mode_value) not in PLAN_MODES:
+            raise ValueError(f"规划模式必须是 {PLAN_MODES} 之一，不是 {plan_mode_value!r}")
+        config = plan_preset(config, str(plan_mode_value))
+    if corner_cost is not _KEEP:
+        config = override(config, stroke={"stroke_corner_cost": corner_cost})
     if data.get("fast"):
         grid = data.get("fast_grid_mm")
         config = fast_preset(
@@ -1693,6 +1753,12 @@ def _clean_setup(body: dict) -> dict:
     style = str(body.get("route_style") or "direct")
     if style not in ROUTE_STYLES:
         raise ValueError(f"route_style must be one of {ROUTE_STYLES}")
+    plan_mode = str(body.get("plan_mode") or "standard")
+    if plan_mode not in PLAN_MODES:
+        raise ValueError(f"plan_mode must be one of {PLAN_MODES}")
+    # `None` on the way in means "the shipped value": the sentinel is not serialisable, and a
+    # setup file that stored it would fail to save rather than plan.
+    corner_cost = _stroke_corner_cost(body.get("stroke_corner_cost", _KEEP))
 
     raw_names = body.get("model_names")
     model_names = {}
@@ -1717,6 +1783,8 @@ def _clean_setup(body: dict) -> dict:
         "fast_no_occlusion": bool(body.get("fast_no_occlusion")),
         "route_style": style,
         "coverage_target_pct": _coverage_target(body.get("coverage_target_pct")),
+        "stroke_corner_cost": (None if corner_cost is _KEEP else corner_cost),
+        "plan_mode": plan_mode,
         "model_names": model_names,
     }
 

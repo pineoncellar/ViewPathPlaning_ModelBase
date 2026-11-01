@@ -206,7 +206,24 @@ def route_block(config: PlannerConfig) -> dict:
         "order_axis_weight_mm_per_deg": float(stroke.order_axis_weight_mm_per_deg),
         "order_j6_weight_mm_per_deg": float(
             getattr(stroke, "order_j6_weight_mm_per_deg", 0.0)),
-        "caveat": ("`direct` and `tidy` exchange point count and program shape; their "
-                   "coverage figures describe the same target surface but different paths, "
-                   "so a figure from one is not a regression test for the other"),
+        # The plan mode is a SEPARATE axis from the route style: it decides which items the
+        # selection may choose from and what they cost, and it is the one that changes how
+        # much of the part is swept. Recorded with the three numbers it stands for, because
+        # "this run used banded" is not comparable with "this run used standard" and the
+        # reader has to be able to see why without opening the configuration.
+        "plan_mode": str(getattr(stroke, "plan_mode", "standard")),
+        "plan_mode_settings": {
+            "side_scan_azimuths": int(getattr(stroke, "side_scan_azimuths", 1)),
+            "side_scan_spacing_mm": float(getattr(stroke, "side_scan_spacing_mm", 0.0)),
+            "side_scan_wall_deg": float(getattr(stroke, "side_scan_wall_deg", 0.0)),
+            "side_scan_max_seeds": int(getattr(stroke, "side_scan_max_seeds", 0)),
+            "stroke_corner_cost": float(getattr(stroke, "stroke_corner_cost", 2.0)),
+            "joint_span_fraction": float(getattr(robot, "joint_span_fraction", 1.0)),
+            "joint_margin_deg": float(robot.joint_margin_deg),
+        },
+        "caveat": ("`direct` and `tidy` exchange point count and program shape, and "
+                   "`standard` and `banded` exchange point count for how much of the part "
+                   "is swept; their coverage figures describe the same target surface but "
+                   "different paths, so a figure from one is not a regression test for the "
+                   "other"),
     }

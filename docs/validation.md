@@ -149,6 +149,26 @@
 `kinematics.j6.available` 是 `true`。它不是就说明 `robot.enabled` 还是 `false`，下面所有数都没有
 意义——模块 10/12 整段没跑。
 
+**规划模式 `banded`（2026-11-01 新增，快跑已验证、正式网格未验证）。** 换模式之后先看三行：
+
+| 数 | 从哪读 | 怎么判断 |
+|---|---|---|
+| `stroke_plan.delivered_strokes` / `delivered_stops` | 报告 | **「几条带 + 几个停点」**。`banded` 的目标是把停点压到 0；实测同一工位 99% 目标下从 5 带 + 18 停变成 11 带 + 3 停（门开）/ 11 带 + 0 停（门关） |
+| `program.interrupts.reorient` | 报告 | 应该跟着降。实测 22 → 13（门开）/ 9（门关） |
+| `route.plan_mode_settings` | 报告 | 记录实际生效的五个数；**两个不同模式的覆盖率不能互相作为回归基准** |
+
+`banded` 的两个已知代价，验收时必须一起看：
+
+- `kinematics.min_margin_deg` 会掉到 0.03° 量级——这是模式的本意（不再自设舒适区），但它意味着
+  **贴着控制器限位跑**，ROBOGUIDE 里必须复核。`standard` 档是 5.4°。
+- `kinematics.j6.literal_max_deg` 可能变大：实测 `banded` 有一次 132.4° 的 J6 换向，而 `standard`
+  最坏 48.6°。倾斜带的空间朝向更杂，排序给 J6 计价只有 `tidy` 档开着（10 mm/度）；若这个数不可接受，
+  先把 `stroke.order_j6_weight_mm_per_deg` 抬到 20 再跑一次。
+
+**倾斜种子族是否真的活了。** 2026-11-01 之前它是死的（光轴算反，朝零件背面）。一条快速自检：
+`trace` 一次 `side_scan_seeds` 的光轴与内法向夹角，应当等于 `side_scan_tilt_deg`（45°），不是 135°。
+活的族会在 `banded` 档把带铺到 `x` 全宽、倾角 3°–85°；死的时候所有带都是同一侧、倾角 12°–27°。
+
 跑起来之后按这个顺序读：
 
 | 数 | 从哪读 | 怎么判断 |

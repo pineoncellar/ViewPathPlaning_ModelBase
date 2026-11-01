@@ -240,6 +240,62 @@ class StrokeParams:
     # the two sequence prices that make the arm hold one CONFIG family. Written into the
     # report so "why is this program shaped differently" is answerable two weeks later.
     route_style: str = "direct"
+    # What one SWEEP costs the selection, in corners, next to a single pose's 1.0. Only read
+    # when `cost_model` is `corners`.
+    #
+    # This is the one price in the planner that is a preference rather than a count, and it
+    # is the only lever that decides how much of the part is swept instead of stopped on.
+    # The arithmetic it overrides: a stop covers one footprint, and a band pays a SECOND stop
+    # for whatever the extra length buys - so at the true count of 2.0 a band shorter than
+    # about twice a footprint loses to the two poses that would cover the same area. That is
+    # correct accounting, and on a curved panel it means the tail arrives as stops rather
+    # than as bands.
+    #
+    #   2.0  the count itself: every corner a band really needs. The pre-2026-11-01 value.
+    #   1.5  a band is charged half a corner for its far end.
+    #   1.0  a band is charged like a pose, i.e. the sweep is preferred wherever it fits.
+    #
+    # It never changes what is deliverable - feasibility is decided by the connector and the
+    # gate - only which of two answers that cover the same area is chosen, so it is reported
+    # beside the run it shaped.
+    stroke_corner_cost: float = 2.0
+    # How many azimuths the TILTED seed family is laid on, and how far apart those seeds are.
+    #
+    # The head-on ladder is laid on one aim grid and grown along two tangent lines. A wall
+    # or a clamped rim is not merely under-served by it, it is unreachable by it: the
+    # footprint lies parallel to the wall, so the wall's own surface is at 90 degrees of
+    # incidence a few millimetres off the bend. What does reach it is the same ladder tilted
+    # far off the normal from the FREE side - and which side is free is not known in advance,
+    # so the tilt has to be swept round the normal.
+    #
+    #   side_scan_azimuths  1 = one tangent direction, both signs: the pre-2026-11-01 family,
+    #                       and exactly the two axes this code used before the key existed.
+    #                       6 = twelve axes, 30 degrees apart, sweeping the whole circle.
+    #   side_scan_spacing_mm 0.0 = `aim_grid_mm * 2`, the pre-2026-11-01 rule. A wall is a few
+    #                       millimetres wide and `aim_grid_mm` is 100, so 0.0 seeds the tilted
+    #                       family once every 200 mm and misses most of it.
+    #
+    # Every extra azimuth is a grown stroke and a set of rays, which is why 1 and 0.0 ship.
+    side_scan_azimuths: int = 1
+    side_scan_spacing_mm: float = 0.0
+    # Only seed the tilted family on samples whose normal is at least this many degrees off
+    # the face's dominant normal: side walls, bends, and the rim a clamp shades. 0.0 seeds it
+    # everywhere, which is the pre-2026-11-01 behaviour - and on a 1 m2 panel that is a few
+    # thousand seeds, each grown into two bands, which turned a 4-minute run into something
+    # that had not finished in twenty. A wall is a small fraction of the area and all of the
+    # reason the family exists, so the filter is what makes the dense version affordable.
+    side_scan_wall_deg: float = 0.0
+    # A hard ceiling on how many SEEDS the tilted family may emit in total (aim points x
+    # tangent directions x signs). 0 means no ceiling, which is the pre-2026-11-01 behaviour
+    # and is what made the dense version unusable: on a 1 m2 panel the family grew from 52
+    # seeds to a few thousand and a 4-minute run had not finished in twenty. The ceiling is
+    # spent by thinning the aim points evenly, so a capped family still covers the whole
+    # wall instead of the first corner of it.
+    side_scan_max_seeds: int = 0
+    # Which named set of candidate, selection and gate settings is in force. A LABEL, expanded
+    # by `plan_preset` - see PLAN_PRESETS. `standard` is the shipped behaviour and expands to
+    # nothing at all.
+    plan_mode: str = "standard"
     # What one degree of J6 costs the ordering, in millimetres of travel, on top of the pose
     # change `order_axis_weight_mm_per_deg` prices. A separate term because it is a separate
     # cost: two poses a few degrees apart can still need 180 deg of J6, and J6 is the axis
@@ -697,6 +753,82 @@ def _route_values(config: PlannerConfig, style: str) -> PlannerConfig:
     return replacement
 
 
+#: Which plan mode the page and the command line offer.
+PLAN_MODES: tuple[str, ...] = ("standard", "banded")
+
+#: What each plan mode expands to. `standard` is spelled out as the values the shipped
+#: configuration already carries, so asking for it is the identity on any file - that is what
+#: makes "no mode chosen" reproduce the old runs exactly.
+#:
+#: `banded` is ONE decision split into the three things that have to move together, because
+#: moving any one of them alone does nothing measurable (measured 2026-11-01 on the track-scan
+#: station, same 10 mm grid, same 99% target):
+#:
+#:   side_scan_azimuths / spacing   the tilted seed family is laid on 12 axes 30 degrees
+#:                                  apart and every 40 mm instead of 2 axes every 200 mm, so
+#:                                  walls, bends and clamped rims get bands at all. Without
+#:                                  this the other two have nothing to choose.
+#:   joint_span_fraction / margin   the gate stops shrinking each axis to 90% and reserving
+#:                                  5 more degrees. A tilted band leaves the shrunken
+#:                                  envelope halfway along and `gate_ok` drops the WHOLE band,
+#:                                  not the part that left: measured 43 grown candidates with
+#:                                  the shrink and 216 without, same station and grid. This is
+#:                                  the item that makes a station ride its limits, which is
+#:                                  why it is a mode and not a default.
+#:   stroke_corner_cost             a band is charged one corner like a pose instead of the
+#:                                  two it really needs, so a 150-300 mm band stops losing to
+#:                                  the two stops that cover the same area.
+PLAN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
+    "standard": {
+        "stroke": {"plan_mode": "standard", "side_scan_azimuths": 1,
+                   "side_scan_spacing_mm": 0.0, "side_scan_wall_deg": 0.0,
+                   "side_scan_max_seeds": 0, "stroke_corner_cost": 2.0},
+        "robot": {"joint_span_fraction": 0.9, "joint_margin_deg": 5.0},
+    },
+    "banded": {
+        "stroke": {"plan_mode": "banded", "side_scan_azimuths": 3,
+                   "side_scan_spacing_mm": 60.0, "side_scan_wall_deg": 45.0,
+                   "side_scan_max_seeds": 96, "stroke_corner_cost": 1.0},
+        # Zero margin and a full span on purpose, and it is the honest description of what
+        # this mode does: it asks the planner to use the envelope the controller enforces
+        # instead of a self-imposed smaller one. The poses are still inside the soft limits
+        # and still clear of the J5 singularity, so nothing here is unreachable - it is
+        # "no self-imposed comfort zone", not "ignore the limits".
+        "robot": {"joint_span_fraction": 1.0, "joint_margin_deg": 0.0},
+    },
+}
+
+
+def _preset_values(config: PlannerConfig, table: dict[str, dict[str, Any]]) -> PlannerConfig:
+    """`config` with one preset's settings applied, unvalidated."""
+    replacement = config
+    for name, changes in table.items():
+        section = getattr(replacement, name)
+        replacement = replace(replacement, **{name: replace(section, **changes)})
+    return replacement
+
+
+def plan_preset(config: PlannerConfig, mode: str | None = None) -> PlannerConfig:
+    """Expand `stroke.plan_mode` into the candidate, gate and price settings it names.
+
+    Same shape as `route_preset`, and for the same reason: one expansion shared by the page
+    and the command line cannot drift. `mode=None` applies the label the configuration
+    already carries.
+
+    It is deliberately a SEPARATE axis from `route_style`. A plan mode decides what gets
+    selected (which candidate families exist, how big the envelope is, what a band costs);
+    a route style decides how the selected items are connected. Both can be asked for at
+    once, and neither implies the other.
+    """
+    chosen = str(config.stroke.plan_mode if mode is None else mode)
+    chosen = chosen.strip().lower()
+    if chosen not in PLAN_MODES:
+        raise ValueError(f"'plan_mode' must be one of {PLAN_MODES}, not {mode!r}")
+    replacement = _preset_values(config, PLAN_PRESETS[chosen])
+    _validate(replacement)
+    return replacement
+
+
 def route_preset(config: PlannerConfig, style: str | None = None) -> PlannerConfig:
     """Expand `stroke.route_style` into the settings it names.
 
@@ -779,6 +911,11 @@ def _build(data: dict[str, Any], source: str, override: str | None,
                          f"{config.stroke.route_style!r}")
     if config.stroke.route_style != "direct":
         config = _route_values(config, config.stroke.route_style)
+    if config.stroke.plan_mode not in PLAN_MODES:
+        raise ValueError(f"'stroke.plan_mode' must be one of {PLAN_MODES}, not "
+                         f"{config.stroke.plan_mode!r}")
+    if config.stroke.plan_mode != "standard":
+        config = _preset_values(config, PLAN_PRESETS[config.stroke.plan_mode])
     _validate(config)
     return config
 
@@ -991,6 +1128,31 @@ def _validate_strokes(stroke: StrokeParams) -> None:
     if stroke.route_style not in ROUTE_STYLES:
         raise ValueError(f"'stroke.route_style' must be one of {ROUTE_STYLES}, not "
                          f"{stroke.route_style!r}")
+    if stroke.stroke_corner_cost <= 0.0:
+        raise ValueError("'stroke.stroke_corner_cost' must be positive: it is what one "
+                         "sweep costs the selection next to a pose's 1.0, and 2.0 is the "
+                         "count of corners a band really needs")
+    if stroke.cost_model == "corners" and stroke.stroke_corner_cost < 1.0:
+        raise ValueError("'stroke.stroke_corner_cost' below 1.0 would price a sweep as "
+                         "cheaper than the single stop it still has to make; 1.0 is the "
+                         "floor, i.e. 'a band costs like a pose'")
+    if stroke.side_scan_azimuths < 1:
+        raise ValueError("'stroke.side_scan_azimuths' must be at least 1: it is how many "
+                         "tangent directions the tilted seed family is laid on, and 1 is "
+                         "the pre-2026-11-01 rule (one tangent, both signs)")
+    if stroke.side_scan_spacing_mm < 0.0:
+        raise ValueError("'stroke.side_scan_spacing_mm' cannot be negative: 0.0 means "
+                         "'twice aim_grid_mm', which is the pre-2026-11-01 rule")
+    if not 0.0 <= stroke.side_scan_wall_deg < 90.0:
+        raise ValueError("'stroke.side_scan_wall_deg' must be in [0, 90): it is how far a "
+                         "sample's normal has to lean off the face's dominant normal before "
+                         "the tilted family is seeded there, and 0.0 means 'everywhere'")
+    if stroke.side_scan_max_seeds < 0:
+        raise ValueError("'stroke.side_scan_max_seeds' cannot be negative: 0 means no "
+                         "ceiling, which is the pre-2026-11-01 behaviour")
+    if stroke.plan_mode not in PLAN_MODES:
+        raise ValueError(f"'stroke.plan_mode' must be one of {PLAN_MODES}, not "
+                         f"{stroke.plan_mode!r}")
     if stroke.max_stroke_mm < 0.0:
         raise ValueError("'max_stroke_mm' cannot be negative")
     if stroke.min_stroke_mm < 0.0:

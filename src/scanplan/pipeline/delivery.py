@@ -89,12 +89,23 @@ def _group_selection(combined: CoverageResult, coverage: CoverageResult,
     into a search over one number instead of a re-run at a coarser resolution. `tie` breaks
     exact area ties by joint room, and `weight` is the skeleton preference - both are None
     unless the caller has a reason, so the default path is unchanged.
+
+    `stroke.stroke_corner_cost` is the one price in here that is a PREFERENCE rather than a
+    count, and it is the only lever that decides how much of the part is swept instead of
+    stopped on. One stop covers one footprint; a sweep costs a second stop for whatever the
+    band length adds. At the true count (2.0) a band shorter than about twice a footprint
+    loses to the two poses that would cover the same area, which is arithmetically correct
+    and is not what a scanning cell is bought for - so the count is exposed and a site can
+    decide how much of the tail it wants swept. It never changes what is deliverable, only
+    which of two covering answers is chosen.
     """
     stop = float(cfg.stroke.stop_cost_mm)
     transition = float(cfg.stroke.transition_corners_estimate)
     n_poses = len(coverage.poses)
     if cfg.stroke.cost_model == "corners":
-        costs = [1.0 + transition] * n_poses + [2.0 + transition] * len(stroke_cov.strokes)
+        band = float(getattr(cfg.stroke, "stroke_corner_cost", 2.0))
+        costs = ([1.0 + transition] * n_poses
+                 + [band + transition] * len(stroke_cov.strokes))
     else:
         costs = ([stop] * n_poses
                  + [stroke.length_mm + stop for stroke in stroke_cov.strokes])

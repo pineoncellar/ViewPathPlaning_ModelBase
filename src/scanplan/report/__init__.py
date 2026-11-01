@@ -143,7 +143,7 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
         "approach": approach_block(config=config, station=station, target=target,
                                    viewpoints=viewpoints, path=path),
         "stroke_plan": stroke_block(strokes, path, swept_coverage_pct,
-                                    pose_only_coverage_pct),
+                                    pose_only_coverage_pct, config),
         "angle_diversity": angle_diversity_block(coverage, selection.chosen, path),
         "kinematics": kinematics_block(config, viewpoints, path, kinematics),
         "budget": budget_block(config, path),

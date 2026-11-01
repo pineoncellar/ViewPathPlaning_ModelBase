@@ -505,8 +505,17 @@ class StrokeBuilder:
 
         A head-on sweep cannot reach a standing wall: the footprint is parallel to it and the
         incidence climbs past the limit within a few millimetres. Tilting the axis puts the
-        footprint across the wall instead. Two tilt directions are laid, towards each tangent,
-        because which one is free depends on the neighbouring geometry.
+        footprint across the wall instead.
+
+        The tilt is swept `side_scan_azimuths` ways round the normal, both signs, because
+        WHICH SIDE IS FREE is not known in advance - the clamp is on one side and open air on
+        the other. The default of 1 is the pre-2026-11-01 family (one tangent, both signs)
+        and reproduces it exactly; the shipped configuration asks for 1, the `banded` plan
+        mode asks for 6, which is twelve axes 30 degrees apart.
+
+        The spacing matters as much as the azimuths, and for the same reason: a wall is a few
+        millimetres wide, so seeding this family on the face's aim grid (100 mm) misses most
+        of it. `side_scan_spacing_mm` 0.0 keeps the old "twice aim_grid_mm" rule.
 
         The shading caveat is real and is why this family is switchable: a tilted sweep sees
         the surface at the incidence the limit allows, so its data is worse than a head-on
@@ -522,21 +531,61 @@ class StrokeBuilder:
         normals = np.asarray(normals, dtype=float).reshape(-1, 3)
         if len(points) == 0:
             return []
+        spacing = float(self.params.side_scan_spacing_mm)
+        if spacing <= 0.0:
+            # Twice the aim spacing: the family exists to reach what the head-on ladder
+            # cannot, not to compete with it on area it already covers, and every seed costs
+            # a grown stroke and a set of rays.
+            spacing = float(aim_grid_mm) * 2.0
+        wall_deg = float(getattr(self.params, "side_scan_wall_deg", 0.0))
+        if wall_deg > 0.0:
+            # Only the walls and bends: everything else is what the head-on ladder is for, and
+            # seeding it here is thousands of bands nobody needed (measured: 4 minutes -> not
+            # finished in 20).
+            dominant = unit(normals.mean(axis=0))
+            if not np.isfinite(dominant).all() or float(np.linalg.norm(dominant)) < 0.5:
+                return []
+            cosine = np.clip(normals @ dominant, -1.0, 1.0)
+            leaning = np.degrees(np.arccos(cosine)) >= wall_deg
+            if not leaning.any():
+                return []
+            points, normals = points[leaning], normals[leaning]
+        turns = max(1, int(self.params.side_scan_azimuths))
+        aims = aim_indices(points, spacing)
+        ceiling = int(getattr(self.params, "side_scan_max_seeds", 0) or 0)
+        if ceiling > 0:
+            per_aim = turns * 2
+            budget = max(1, ceiling // per_aim)
+            if len(aims) > budget:
+                # Even thinning, so a capped family still covers the whole wall rather than
+                # the first corner of it.
+                step = max(1, int(np.ceil(len(aims) / budget)))
+                aims = aims[::step][:budget]
         chosen: list[tuple[ScannerPose, int]] = []
-        # Twice the aim spacing: the family exists to reach what the head-on ladder cannot,
-        # not to compete with it on area it already covers, and every seed costs a grown
-        # stroke and a set of rays. At the aim spacing this tripled the stroke stage for a
-        # fraction of a percent.
-        for index in aim_indices(points, float(aim_grid_mm) * 2.0):
+        for index in aims:
             normal = unit(normals[index])
-            first, _second = tangents(normal)
-            for sign in (1.0, -1.0):
-                axis = -tilt_axis(-normal, first * sign, tilt)
-                roll = roll_for_axis(axis) if self.params.lock_roll else 0.0
-                chosen.append((ScannerPose(position=points[index] + normal
-                                           * float(self.cfg.scanner.standoff_mm),
-                                           axis=axis, roll_deg=roll),
-                               int(index) + int(seed_offset)))
+            inward = -normal
+            first, second = tangents(normal)
+            for step in range(turns):
+                # Half a turn, both signs: `turns = 1` is exactly the single tangent this
+                # family was always meant to use.
+                angle = np.pi * step / turns
+                tangent = np.cos(angle) * first + np.sin(angle) * second
+                for sign in (1.0, -1.0):
+                    # NO leading minus, unlike the code this replaces. `tilt_axis(inward, t,
+                    # tilt)` is already the pose tilted `tilt` off the inward normal towards
+                    # `t`; negating it put the axis 180 - tilt from inward instead, i.e. 135
+                    # degrees at the shipped 45, looking at the BACK of the surface with an
+                    # incidence cosine of -0.707. Every stroke grown from such a seed covered
+                    # nothing and `_reaches_any` refused it at the first extension step, so
+                    # this whole family produced no bands at all - which is why a plan on a
+                    # curved panel came out swept on one side and stopped on the other.
+                    axis = tilt_axis(inward, tangent * sign, tilt)
+                    roll = roll_for_axis(axis) if self.params.lock_roll else 0.0
+                    chosen.append((ScannerPose(position=points[index] + normal
+                                               * float(self.cfg.scanner.standoff_mm),
+                                               axis=axis, roll_deg=roll),
+                                   int(index) + int(seed_offset)))
         return chosen
 
     def grow(self, seed: ScannerPose, seed_index: int) -> list[Stroke]:

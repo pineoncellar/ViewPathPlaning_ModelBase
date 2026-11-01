@@ -890,6 +890,24 @@ function showCoverageTarget(value) {
   $("coverageTarget").value = Number.isFinite(numeric) ? String(numeric) : String(value);
 }
 
+// 扫描带角价：一条带在选择阶段算几个转角（单点恒为 1）。
+// 越界就原样回传，让服务端拒绝并说明原因，而不是在这里悄悄夹到边界值。
+function strokeCornerCostInput() {
+  const raw = $("strokeCornerCost").value.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : raw;
+}
+
+function requireStrokeCornerCost() {
+  const value = strokeCornerCostInput();
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || value < 1 || value > 2) {
+    throw new Error("扫描带角价必须是 1.0 ~ 2.0（1.0 = 一条带按一个位姿算，2.0 = 真实两个转角）");
+  }
+  return value;
+}
+
 function payload(includeMeshes) {
   if (state.picked.length !== state.pointCount) {
     throw new Error("请在 3D 模型上依次选取 " + state.pointCount + " 个定位点");
@@ -913,6 +931,8 @@ function payload(includeMeshes) {
     fast_no_occlusion: $("fastMode").value === "fast" && $("fastNoOcclusion").checked,
     route_style: $("routeStyle").value,
     coverage_target_pct: coverageTargetInput(),
+    stroke_corner_cost: strokeCornerCostInput(),
+    plan_mode: $("planMode").value,
     run_name: runName || undefined,
     run_id: /^[A-Za-z0-9_-]{1,64}$/.test(runName) ? runName : undefined
   };
@@ -1242,8 +1262,9 @@ async function solve() {
   if (state.solving) return;
   try {
     payload(false);
-    // 覆盖率目标在发请求前就验一遍：填错了不该等到传完模型才失败
+    // 覆盖率目标和扫描带角价都在发请求前就验一遍：填错了不该等到传完模型才失败
     requireCoverageTarget();
+    requireStrokeCornerCost();
   } catch (error) {
     $("formFeedback").textContent = error.message;
     toast(error.message);
@@ -2161,6 +2182,8 @@ function currentSetup() {
     fast_no_occlusion: $("fastNoOcclusion").checked,
     route_style: $("routeStyle").value,
     coverage_target_pct: coverageTargetInput(),
+    stroke_corner_cost: strokeCornerCostInput(),
+    plan_mode: $("planMode").value,
     model_names: {
       part: state.models.part ? state.models.part.sourceName : "",
       support: state.models.support ? state.models.support.sourceName : "",
@@ -2289,8 +2312,13 @@ async function loadSelectedSetup() {
     $("fastNoOcclusion").disabled = $("fastMode").value !== "fast";
     $("fastNoOcclusion").checked = $("fastMode").value === "fast" && Boolean(saved.fast_no_occlusion);
     if ($("routeStyle") && saved.route_style) $("routeStyle").value = saved.route_style;
+    if ($("planMode") && saved.plan_mode) $("planMode").value = saved.plan_mode;
     if (saved.coverage_target_pct !== undefined) {
       showCoverageTarget(saved.coverage_target_pct);
+    }
+    if ($("strokeCornerCost") && saved.stroke_corner_cost !== undefined
+        && saved.stroke_corner_cost !== null) {
+      $("strokeCornerCost").value = String(saved.stroke_corner_cost);
     }
 
     updateAxisBadge("方案：" + (saved.scan_face_axis ? AXIS_LABELS[saved.scan_face_axis] : "未记录"));
@@ -2358,6 +2386,18 @@ async function applyServerDefaults() {  try {
     const style = $("routeStyle");
     if (style && config.route_style && config.route_styles && config.route_styles.includes(config.route_style)) {
       style.value = config.route_style;
+    }
+    // Same reasoning for the band price: it is a configuration value, and silently planning
+    // with a different one would make two runs of the same part incomparable.
+    if ($("strokeCornerCost") && config.stroke_corner_cost !== undefined
+        && config.stroke_corner_cost !== null) {
+      $("strokeCornerCost").value = String(config.stroke_corner_cost);
+    }
+    // And for the plan mode, which decides what the selection may even consider.
+    const planMode = $("planMode");
+    if (planMode && config.plan_mode && config.plan_modes
+        && config.plan_modes.includes(config.plan_mode)) {
+      planMode.value = config.plan_mode;
     }
   } catch (_error) {
     /* keep the built-in default */

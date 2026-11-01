@@ -14,10 +14,12 @@ from ..config import (
     FACES,
     FAST_MIN_SAMPLE_GRID_MM,
     FAST_SAMPLE_GRID_MM,
+    PLAN_MODES,
     ROUTE_STYLES,
     fast_preset,
     load_config,
     override,
+    plan_preset,
     route_preset,
 )
 from ..raycast import backend_name
@@ -66,6 +68,20 @@ def configure(subparsers) -> None:
                               "'direct' is the shipped chain (a joint move between sweeps), "
                               "'tidy' flies straight and sidesteps only when blocked, so the "
                               "program reads as fewer, straighter transitions")
+    planner.add_argument("--plan-mode", dest="plan_mode", choices=PLAN_MODES,
+                         help="what the selection is ALLOWED to use: 'standard' is the "
+                              "shipped behaviour, 'banded' adds a dense tilted seed family, "
+                              "gives up the self-imposed joint envelope shrink and prices a "
+                              "band like a pose, so more of the part is swept instead of "
+                              "stopped on - it costs point count and it rides the joint "
+                              "limits")
+    planner.add_argument("--stroke-corner-cost", dest="stroke_corner_cost", type=float,
+                         metavar="CORNERS",
+                         help="what one SWEEP costs the selection next to a single pose's "
+                              "1.0, when stroke.cost_model is 'corners'. 2.0 is the true "
+                              "count of corners a band needs and 1.0 prices it like a pose, "
+                              "which sweeps more of the part at the same coverage. Range "
+                              "[1.0, 2.0] is the useful part")
     planner.add_argument("--face", choices=FACES, help="which face of the blank to scan")
     planner.add_argument("--tracker", help="tracker pose 'x,y,z' if the station has none")
     planner.add_argument("--tracker-aim", help="tracker aim point 'x,y,z'")
@@ -96,6 +112,15 @@ def run(args, parser: argparse.ArgumentParser) -> int:
             f"{cfg.robot.config_change_cost_deg:g} deg, wrist flip "
             f"{cfg.robot.wrist_flip_cost_deg:g} deg - the point count and the program "
             "shape will differ from a 'direct' run on the same part")
+
+    if cfg.stroke.plan_mode != "standard":
+        say(f"plan mode '{cfg.stroke.plan_mode}': tilted seed family on "
+            f"{int(cfg.stroke.side_scan_azimuths) * 2} axes every "
+            f"{cfg.stroke.side_scan_spacing_mm:g} mm, joint envelope "
+            f"{cfg.robot.joint_span_fraction:g} of span with "
+            f"{cfg.robot.joint_margin_deg:g} deg margin, a band priced at "
+            f"{cfg.stroke.stroke_corner_cost:g} corner(s) - more of the part is swept, "
+            "at the cost of point count and of riding the joint limits")
 
     if cfg.fast.enabled:
         say(f"FAST run: {', '.join(cfg.fast.layers) or 'preset'}; "
@@ -148,6 +173,17 @@ def _apply_overrides(cfg, args, parser: argparse.ArgumentParser):
                      "lines off is only honest inside a run that says it is fast")
     if getattr(args, "route_style", None):
         cfg = route_preset(cfg, args.route_style)
+    if getattr(args, "plan_mode", None):
+        # A separate axis from the route style, and applied first: the mode decides WHICH
+        # items are selected, the style decides how they are connected, so an explicit
+        # --stroke-corner-cost below still wins over the mode's own price.
+        cfg = plan_preset(cfg, args.plan_mode)
+    if getattr(args, "stroke_corner_cost", None) is not None:
+        # After the route preset, so an explicit flag wins over whatever a style names -
+        # this is a site's own judgement about how much of the tail it wants swept, not
+        # part of a route's shape. `override` validates, and the ValueError it raises is
+        # reported by the same handler that reads the configuration file.
+        cfg = override(cfg, stroke={"stroke_corner_cost": float(args.stroke_corner_cost)})
     if args.fast:
         grid = FAST_SAMPLE_GRID_MM if args.fast_grid is None else float(args.fast_grid)
         if grid < FAST_MIN_SAMPLE_GRID_MM:

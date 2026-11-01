@@ -53,10 +53,16 @@ def summary_lines(report: dict) -> list[str]:
         ]
     strokes = report.get("stroke_plan", {})
     if strokes.get("enabled") and strokes.get("delivered"):
-        lines.append(f"strokes                "
-                     f"{strokes.get('delivered_strokes') or strokes['candidates']} delivered "
-                     f"of {strokes['candidates']} candidates, swept coverage "
-                     f"{strokes['swept_coverage_pct']:.2f}%")
+        bands = strokes.get("delivered_strokes") or 0
+        stops = strokes.get("delivered_stops")
+        price = strokes.get("stroke_corner_cost")
+        lines.append(
+            f"strokes                {bands} band(s) + "
+            + ("? stop(s)" if stops is None else f"{int(stops)} stop(s)")
+            + f" of {strokes['candidates']} candidates"
+            + ("" if price is None else f", band priced at {float(price):g} corner(s)")
+            + (f", swept coverage {strokes['swept_coverage_pct']:.2f}%"
+               if strokes.get("swept_coverage_pct") is not None else ""))
         for violation in path.get("constraint_violations", []):
             lines.append(f"CONSTRAINT             {violation}")
     approach = report.get("approach") or {}

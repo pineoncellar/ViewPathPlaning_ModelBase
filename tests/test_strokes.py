@@ -152,17 +152,31 @@ def test_a_longer_stroke_covers_the_extra_length_and_nothing_else(bench, bench_c
 
 
 def test_grown_strokes_respect_the_bounds_and_the_segment_they_claim(bench, cfg):
+    """Every grown band is inside the length bounds, perpendicular to its own axis, and fits.
+
+    The axis is NOT asserted to be head-on any more: `pool_mode: full` also grows the tilted
+    side-scan family, which looks at the plate 45 degrees off the normal by construction. That
+    assertion used to pass only because the tilted family was silently dead - its axis was
+    computed 135 degrees off inward and every band it grew covered nothing (fixed 2026-11-01).
+    """
     samples = grid_samples(-400.0, 400.0, -300.0, 300.0, PLATE_TOP_MM, 10.0)
     builder = StrokeBuilder(samples, bench, ScannerModel(cfg.scanner), cfg)
     grown = builder.generate(samples.points, samples.normals, aim_grid_mm=100.0)
     assert grown, "the generator produced nothing on a plate it can see"
     top = np.array([0.0, 0.0, 1.0])
+    tilt = float(cfg.stroke.side_scan_tilt_deg)
     for stroke in grown:
         assert cfg.stroke.min_stroke_mm <= stroke.length_mm <= cfg.stroke.max_stroke_mm + 1e-6
-        assert np.allclose(np.asarray(stroke.axis), -top, atol=1e-6)
+        axis = np.asarray(stroke.axis, dtype=float)
+        angle = float(np.degrees(np.arccos(np.clip(float(np.dot(axis, -top)), -1.0, 1.0))))
+        assert min(angle, 180.0 - angle) <= tilt + 1e-6, (
+            f"a grown band looks {angle:.1f} deg off the inward normal; the families only "
+            f"emit head-on and side-scan (<= {tilt:g} deg) axes")
+        # and it must look AT the plate, not through it
+        assert float(np.dot(axis, top)) < 0.0
         # the axis is perpendicular to the direction of travel: the head slides, it does not
         # dive towards or away from the surface
-        assert abs(float(np.dot(stroke.unit_direction, stroke.axis))) < 1e-9
+        assert abs(float(np.dot(stroke.unit_direction, stroke.axis))) < 1e-6
         fits, margin = builder.fits_at(stroke.check_positions_mm(cfg.stroke.check_step_mm))
         assert fits and margin > 0.0
 
