@@ -53,7 +53,8 @@ New-NetFirewallRule -DisplayName "ScanPlan Web 8765" -Direction Inbound `
   通了就不插任何点，直线被挡时绕光轴垂直方向侧移一个等待点，侧移也不成才回落 `直连` 的链路
   ——**不会因为要"整齐"就丢扫描带**。`整齐` 同时给"换臂型（CONFIG 族）"和"腕翻转"计价，
   避免为省几十度行程让整臂甩一圈。两档的点数与覆盖率**不能互相作为回归基准**；运行结果与
-  下载的报告里都有 `route` 块记录实际生效值。命令行对应 `--route-style`。
+  下载的报告里都有 `route` 块记录实际生效值。配置键是 `stroke.route_style`，命令行对应
+  `--route-style`。
 - **覆盖率目标（%）**：默认取配置里的 `target.coverage_target_pct`（`configs/scanner_trackscan49.json`
   是 90）。达到目标后选择阶段立即停手，**并且跳过针对漏扫区的二次瞄准**（`refinement` 整轮不跑）——
   零件上那些成片的斜坡、孔沿缺口就是这样留下的。想补上就把目标抬到 99~100，或勾「不设上限」

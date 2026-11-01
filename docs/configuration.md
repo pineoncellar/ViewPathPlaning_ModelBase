@@ -345,7 +345,9 @@ uv run scanplan plan --station input/<工位>.json --config configs/fast.json --
 - `coverage_report.json`：`parameter_provenance`（每个参数的出处）、`surface_profile`
   （bias、派生出的有效值、逐键来源）、`kinematics`（限位来源、J5 直方图、分支直方图、
   min margin、最大步长与超限点数）、`budget`（verdict、每档 λ 的试验记录）、
-  `fast_mode`（是否快速模式、改了哪几层、视线遮挡是否建模）；
+  `fast_mode`（是否快速模式、改了哪几层、视线遮挡是否建模）、
+  `route`（路线风格、实际生效的连接器与换臂型/腕翻转两个代价）、
+  `evaluation`（各拒绝原因的计数，含 `rejected_inside_part` 与 `inside_part_unchecked`）；
 - `summary.txt`：Joints 与 Budget 两行（没开关节门时不出现 Joints）；快速模式另有一行
   `FAST MODE`；
 - 一条守着的不变量：`coverage_pct` **等于**路径里所有覆盖点的并集；`swept_coverage_pct`
