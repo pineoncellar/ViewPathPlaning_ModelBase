@@ -1,4 +1,4 @@
-"""A self-contained 3D view of a station and its planned scanner viewpoints.
+﻿"""A self-contained 3D view of a station and its planned scanner viewpoints.
 
 The entry points, in the order a run uses them:
 
@@ -103,7 +103,7 @@ def render_run(viewpoints_path, out_dir, *, config=None, station=None, part=None
 
     cfg = load_config(config)
     description = _station_description(station, part, fixture, base)
-    meshes = load_models(description)
+    meshes = load_models(description)[:3]
 
     samples = source.with_name(TARGET_FILE_NAME)
     if not samples.exists():
@@ -172,3 +172,4 @@ __all__ = [
     "write_viewer",
     "write_viewer_from_run",
 ]
+
