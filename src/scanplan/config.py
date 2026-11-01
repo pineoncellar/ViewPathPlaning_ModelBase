@@ -17,12 +17,23 @@ from __future__ import annotations
 
 import json
 import types
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import MISSING, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 DEFAULT_CONFIG_NAME = "scanner_trackscan49.json"
 FACES = ("upper", "lower", "auto")
+# Slot A (stage 2): how candidates are rolled. Declared here rather than in `policies` so
+# the config validator can name the alternatives without importing the stage's code.
+ROLL_MODES = ("locked", "discrete")
+# Slot B (stage 3): how the head travels between two sweeps. Two levels only - a single
+# joint move, then the lift ladder.
+CONNECTOR_MODES = ("direct-then-lift", "straight-then-lateral")
+# The route style is a NAME for a set of settings, not a setting of its own: it exists so a
+# page control can switch the whole chain at once, and `route_preset` is the only thing that
+# reads it. `direct` is the identity - it leaves every other key alone, which is what keeps
+# the shipped behaviour exactly what it was before the style existed.
+ROUTE_STYLES = ("direct", "tidy")
 # How the delivered program is assembled. `path` checks the motion between every pair of
 # delivered points; `lean` delivers the poses alone, exactly like v1, and promises nothing
 # about what the head does between them.
@@ -59,6 +70,13 @@ class ScannerParams:
     max_candidates: int
     refine_rounds: int
     refine_aim_grid_mm: float
+    # Slot A (stage 2): which rolls a candidate is generated at.  `locked` pins one
+    # roll per optical axis and re-tries others only when the joint gate refuses the
+    # pose; `discrete` uses every entry in `rolls_deg`.  Locked is the default because
+    # the discrete convention measured four J6 steps of 74-95 degrees on the reference
+    # station for no scan benefit - but it is a trade-off, not a law, which is why it
+    # is a key rather than a constant.
+    roll_mode: str = "locked"
 
 
 @dataclass(frozen=True)
@@ -134,6 +152,10 @@ class StrokeParams:
     * `order_axis_weight_mm_per_deg` prices a pose change in the ordering. Distance alone
       ignores the axis, so two adjacent strokes 60 degrees apart in pose look free to
       travel between and cost a large re-orientation instead.
+    * `order_j6_weight_mm_per_deg` prices the WRIST TWIST in the same cost. It is the only
+      lever that moves J6 on a station where every pose has one solution, because J6 is
+      decided by which pair of strokes the ordering puts next to each other, not by the
+      branch search - see `docs/validation.md` for how to measure it.
 
     The last three belong to the merged coverage/continuity design (2026-10-22):
 
@@ -166,6 +188,15 @@ class StrokeParams:
     * `side_scan_tilt_deg` adds a family of seeds whose optical axis is tilted off the
       surface normal by this angle, for the walls and deep pockets a head-on sweep cannot
       reach. 0 disables the family.
+    * `joint_connector` makes the connector a single joint move from one sweep's end to the
+      next sweep's start. It exists because the retract corners were the problem: in the
+      99% run, 7 of 50 delivered points had no joint solution at all and every one of them
+      was a retract or reorient corner, while none of the 27 scanning points did. A joint
+      move interpolates all six axes linearly, so two legal endpoints cannot produce an
+      illegal middle, and it needs no corner in between.
+    * `joint_step_deg` is how finely that joint move is sampled when its swept TCP path is
+      checked for clearance. Degrees rather than millimetres because the TCP of a
+      wrist-heavy move can travel hundreds of millimetres per degree of J6.
     """
 
     enabled: bool
@@ -192,6 +223,96 @@ class StrokeParams:
     repair_budget_share: float
     pool_mode: str
     side_scan_tilt_deg: float
+    # Primary connector primitive: one joint move from a sweep's end to the next sweep's
+    # start, no retract corner, no CONFIG, no middle to exceed. Off (or with the kinematic
+    # gate off) falls back to the retract routes, which is also the pre-2026-10-29 behaviour.
+    joint_connector: bool = True
+    # Joint resolution used to sample the swept TCP path of a joint move for clearance.
+    # In degrees, not millimetres, because a wrist-heavy move can swing hundreds of
+    # millimetres of TCP per degree of J6.
+    joint_step_deg: float = 5.0
+    # Slot B (stage 3): which connector chain runs between two sweeps. `direct-then-lift`
+    # is the shipped implementation - one joint move, then the lift ladder. The level of
+    # that ladder is still `connector_level`; this key names the policy, not its depth.
+    connector: str = "direct-then-lift"
+    # Which named set of connector and cost settings is in force. A LABEL, expanded by
+    # `route_preset`: `direct` changes nothing, `tidy` swaps in `straight-then-lateral` and
+    # the two sequence prices that make the arm hold one CONFIG family. Written into the
+    # report so "why is this program shaped differently" is answerable two weeks later.
+    route_style: str = "direct"
+    # What one SWEEP costs the selection, in corners, next to a single pose's 1.0. Only read
+    # when `cost_model` is `corners`.
+    #
+    # This is the one price in the planner that is a preference rather than a count, and it
+    # is the only lever that decides how much of the part is swept instead of stopped on.
+    # The arithmetic it overrides: a stop covers one footprint, and a band pays a SECOND stop
+    # for whatever the extra length buys - so at the true count of 2.0 a band shorter than
+    # about twice a footprint loses to the two poses that would cover the same area. That is
+    # correct accounting, and on a curved panel it means the tail arrives as stops rather
+    # than as bands.
+    #
+    #   2.0  the count itself: every corner a band really needs. The pre-2026-11-01 value.
+    #   1.5  a band is charged half a corner for its far end.
+    #   1.0  a band is charged like a pose, i.e. the sweep is preferred wherever it fits.
+    #
+    # It never changes what is deliverable - feasibility is decided by the connector and the
+    # gate - only which of two answers that cover the same area is chosen, so it is reported
+    # beside the run it shaped.
+    stroke_corner_cost: float = 2.0
+    # How many azimuths the TILTED seed family is laid on, and how far apart those seeds are.
+    #
+    # The head-on ladder is laid on one aim grid and grown along two tangent lines. A wall
+    # or a clamped rim is not merely under-served by it, it is unreachable by it: the
+    # footprint lies parallel to the wall, so the wall's own surface is at 90 degrees of
+    # incidence a few millimetres off the bend. What does reach it is the same ladder tilted
+    # far off the normal from the FREE side - and which side is free is not known in advance,
+    # so the tilt has to be swept round the normal.
+    #
+    #   side_scan_azimuths  1 = one tangent direction, both signs: the pre-2026-11-01 family,
+    #                       and exactly the two axes this code used before the key existed.
+    #                       6 = twelve axes, 30 degrees apart, sweeping the whole circle.
+    #   side_scan_spacing_mm 0.0 = `aim_grid_mm * 2`, the pre-2026-11-01 rule. A wall is a few
+    #                       millimetres wide and `aim_grid_mm` is 100, so 0.0 seeds the tilted
+    #                       family once every 200 mm and misses most of it.
+    #
+    # Every extra azimuth is a grown stroke and a set of rays, which is why 1 and 0.0 ship.
+    side_scan_azimuths: int = 1
+    side_scan_spacing_mm: float = 0.0
+    # Only seed the tilted family on samples whose normal is at least this many degrees off
+    # the face's dominant normal: side walls, bends, and the rim a clamp shades. 0.0 seeds it
+    # everywhere, which is the pre-2026-11-01 behaviour - and on a 1 m2 panel that is a few
+    # thousand seeds, each grown into two bands, which turned a 4-minute run into something
+    # that had not finished in twenty. A wall is a small fraction of the area and all of the
+    # reason the family exists, so the filter is what makes the dense version affordable.
+    side_scan_wall_deg: float = 0.0
+    # A hard ceiling on how many SEEDS the tilted family may emit in total (aim points x
+    # tangent directions x signs). 0 means no ceiling, which is the pre-2026-11-01 behaviour
+    # and is what made the dense version unusable: on a 1 m2 panel the family grew from 52
+    # seeds to a few thousand and a 4-minute run had not finished in twenty. The ceiling is
+    # spent by thinning the aim points evenly, so a capped family still covers the whole
+    # wall instead of the first corner of it.
+    side_scan_max_seeds: int = 0
+    # Which named set of candidate, selection and gate settings is in force. A LABEL, expanded
+    # by `plan_preset` - see PLAN_PRESETS. `standard` is the shipped behaviour and expands to
+    # nothing at all.
+    plan_mode: str = "standard"
+    # What one degree of J6 costs the ordering, in millimetres of travel, on top of the pose
+    # change `order_axis_weight_mm_per_deg` prices. A separate term because it is a separate
+    # cost: two poses a few degrees apart can still need 180 deg of J6, and J6 is the axis
+    # that slides the scanner sideways along the surface - the one direction the 45 mm body
+    # sphere cannot see. Charging only the pose change leaves that out, and the ordering then
+    # zig-zags across the part and spends the wrist on it.
+    #
+    # Measured on the 2026-11-01 station (30 delivered poses, uniform 180-flip parity): the
+    # run's own order cost 1056 deg of J6 with a worst step of 175; travel only 1353; this
+    # term at 10 gives 544 with a worst step of 63 for 8 % more travel, and at 20 gives 409
+    # for 16 % more. The knee is 10-20 because below it the wrist still pays for ordering
+    # errors and above it the search is choosing J6 over the part it has to reach.
+    #
+    # It is the ONLY lever that moves J6 on a station where every pose has one joint
+    # solution: the branch search then has nothing to choose, and `robot.j6_weight` is inert.
+    # 0.0 is "not priced", i.e. the behaviour before 2026-11-01.
+    order_j6_weight_mm_per_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -200,11 +321,39 @@ class MotionParams:
 
     Speed is a floor setting, not a planning variable; it is carried here only so the
     program has one source for it instead of a flag and a config that can disagree.
+
+    `joint_speed_ladder` is the same idea for the JOINT moves, and it is a ladder rather than
+    one number because a joint move is the one place where the danger scales with the size of
+    the move: a few degrees of J6 is nothing, a hundred and eighty swings the scanner through a
+    400 mm arc about the flange. Each entry is `[biggest single-axis change in degrees, speed
+    in percent]`, read top to bottom, and the last entry's degree value MUST be `null` - that
+    is the catch-all bucket, so a move always has a speed. `[[null, 100.0]]` is the pre-2026-10-30
+    behaviour (every joint move at the controller default) and is what a config without this key
+    gets, so an old file exports the same program it always did.
+
+    The scan speed is NOT in here on purpose: a linear sweep is flown at `speed_mm_s`, and the
+    coverage figure was computed for that speed. The ladder only ever reaches `J` instructions.
     """
 
     type: str
     termination: str
     speed_mm_s: float
+    joint_speed_ladder: tuple[tuple[float | None, float], ...] = ((None, 100.0),)
+
+    def joint_speed_pct(self, step_deg: float | None) -> float:
+        """The percentage to command for a joint move whose biggest axis change is `step_deg`.
+
+        `None` means "the size is not known" - the first point of a program has no predecessor
+        to measure against - and it takes the LAST bucket, which is the slowest one by
+        construction. Guessing fast for an unmeasured move is the one direction that cannot be
+        undone once the program is on the controller.
+        """
+        if step_deg is None:
+            return float(self.joint_speed_ladder[-1][1])
+        for limit, speed in self.joint_speed_ladder:
+            if limit is None or float(step_deg) <= float(limit):
+                return float(speed)
+        return float(self.joint_speed_ladder[-1][1])
 
 
 @dataclass(frozen=True)
@@ -221,11 +370,33 @@ class RobotParams:
     pose bank was replaced - only the tool did, which is what a re-taught UTOOL looks
     like. `docs/robot-calibration.md` is the procedure.
 
-    `soft_limits_deg` is what the controller actually enforces. It is inferred, not read
-    off the machine yet (three joints sat exactly on integer values in the captured
-    samples, and the 2026-10-23 bank has two poses sitting 0.68 deg inside the J5 floor,
-    which is the SRVO-115 pose), so it is kept separate from the mechanical envelope: the
-    planner uses the intersection, and `limits_source` in the report says so.
+    `soft_limits_deg` is what the controller actually enforces, and it is NOT the datasheet
+    envelope. Since 2026-10-29 the six rows are READ OFF the pendant
+    (`MENU > SYSTEM > Axis Limit`), not inferred:
+
+    | axis | lower   | upper  |
+    |------|---------|--------|
+    | J1   | -185.00 | 185.00 |
+    | J2   |  -60.00 |  76.00 |
+    | J3   | -120.71 | 180.00 |
+    | J4   | -360.00 | 360.00 |
+    | J5   | -125.00 | 125.00 |
+    | J6   | -360.00 | 360.00 |
+
+    Two of these ended a long argument. J2's ceiling is +76, not the +136 the datasheet
+    suggested, and J3's floor is -120.71, not -185. The old -185 floor is what let the
+    planner emit `F`-shoulder solutions with J3 near -175: those poses were written to a
+    joint-representation program, the controller re-expressed J3 as -175 + 360 = 185, found
+    that above its +180 ceiling as well, and alarmed `MOTN-017 (G:1, A:2,3)`. The whole `F`
+    branch was unreachable and the model was calling it reachable.
+
+    `joint_span_fraction` is the "do not ride the limits" policy: each axis is only used
+    inside a fraction of its span, measured about the span's CENTRE. At 0.9 with the numbers
+    above the usable envelope is J1 +-166.5, J2 [-53.2, 69.2], J3 [-105.69, 164.97],
+    J4 +-324, J5 +-112.5, J6 +-324; `joint_margin_deg` is applied inside that again. The
+    reason it exists: J5 = -122 alarmed in ROBOGUIDE although -125 is the documented limit,
+    and a pose that sits three degrees from a limit is not one the machine will hold. The
+    tests are what keep this honest - see `test_kinematics.py`.
 
     `enabled=False` skips the whole gate, which is what keeps the pre-2026-10-22 result
     reproducible bit for bit.
@@ -264,6 +435,47 @@ class RobotParams:
     j5_min_abs_deg: float
     max_step_deg: float
     wrist_identified: bool
+    # Degrees of J6 change above which a segment is LISTED in the report. Reported, never
+    # enforced: refusing such a move means dropping the sweep behind it, and the coverage
+    # that sweep carried. The lever arm below is what makes the number mean something.
+    j6_report_deg: float = 90.0
+    joint_span_fraction: float = 0.9
+    # Which wrist branch a delivered solution may use: `T` (J5 negative), `F` (J5 positive)
+    # or `any`. `T` is the site default because the program writes Cartesian points with the
+    # constant CONFIG `N U T` - see `Robot.solutions` for the two measurements behind it.
+    wrist_flip_policy: str = "T"
+    # How many times its own size a J6 change counts for when the planner chooses BETWEEN
+    # otherwise comparable solutions. 1.0 is "count it like any other axis", i.e. the
+    # behaviour before 2026-10-30. J6 turns the flange about the tool axis, and the scanner
+    # sits 249 mm off that axis, so one degree of J6 slides it 4.35 mm sideways - along the
+    # part rather than towards it, which is the one direction the 45 mm body sphere cannot
+    # see anything in. This is a preference, never a limit: it cannot make an infeasible
+    # solution feasible, and it never drops a sweep. 1.5 is the merged default: it still
+    # cannot invent an alternative, but when one exists it now prefers the arm to turn.
+    j6_weight: float = 1.5
+    # A J6 step above this costs an extra penalty in the sequencing (`path._J6_OVER_CAP_COST`),
+    # which is still a cost rather than a refusal. None turns the cap off.
+    j6_max_step_deg: float | None = None
+    # A SECOND charge on J6, added on top of the all-axis step. `j6_weight` above only bites
+    # when J6 is the largest axis of the move, so a 20 deg twist next to a 100 deg arm swing
+    # is free under it; this one pays per degree of J6 whatever the rest of the move does,
+    # which is what "keep the total J6 travel small" needs. The two charge different things
+    # - one the worst step, one the running sum - and a site may want either, both or
+    # neither. 0.0 is the behaviour before 2026-11-01, so the default changes nothing.
+    j6_travel_weight: float = 0.0
+    # What it costs the sequencing to change the arm's CONFIG family between two points.
+    # Zero is the behaviour every program before 2026-11-01 was written with, and it is the
+    # default on purpose: the letters say which posture the arm is in, and two postures for
+    # one tool pose are not two nearby joint vectors - the controller swings the whole arm
+    # round to get from one to the other (measured 2026-10-28: J1 167.6 deg out and J3
+    # 158.8 deg back in, mid-scan). Nothing in the delivery geometry models that swing, so a
+    # zero here prices it as free. Charged, never refused: a point whose only solution sits
+    # in another family keeps it.
+    config_change_cost_deg: float = 0.0
+    # What a wrist flip (J5 changing sign) costs the sequencing. A joint move interpolates
+    # J5 linearly, so a sign change sends the wrist through the singularity where the arm
+    # whips round. 180 is what every item-level sequence used before it was configurable.
+    wrist_flip_cost_deg: float = 180.0
 
     @classmethod
     def disabled(cls) -> RobotParams:
@@ -280,10 +492,10 @@ class RobotParams:
             tool_ypr_deg=(179.279, -45.934, 172.758),
             mechanical_limits_deg=((-185.0, 185.0), (-136.0, 136.0), (-301.0, 301.0),
                                    (-720.0, 720.0), (-250.0, 250.0), (-720.0, 720.0)),
-            soft_limits_deg=((-185.0, 185.0), (-60.0, 136.0), (-301.0, 301.0),
-                             (-720.0, 720.0), (-125.0, 125.0), (-360.0, 360.0)),
+            soft_limits_deg=((-185.0, 185.0), (-60.0, 76.0), (-120.71, 180.0),
+                             (-360.0, 360.0), (-125.0, 125.0), (-360.0, 360.0)),
             joint_margin_deg=5.0, j5_min_abs_deg=8.0, max_step_deg=40.0,
-            wrist_identified=True,
+            wrist_identified=True, joint_span_fraction=0.9, wrist_flip_policy="T",
         )
 
 
@@ -342,6 +554,39 @@ def surface_profile(bias: float) -> dict[str, dict[str, float]]:
     return {"stroke": derived}
 
 
+# The sampling grid a fast run is allowed to use, and the coarsest value it must not
+# exceed. 10 mm is what the 2026-10-28 A/B measured 7.7x end to end on the real part
+# (3 mm: 1724 s, 10 mm: 223 s, `face: auto` both); 8 mm is the floor, so a "fast" run
+# that is still at 3 mm is refused instead of being trusted for being labelled fast.
+FAST_SAMPLE_GRID_MM = 10.0
+FAST_MIN_SAMPLE_GRID_MM = 8.0
+
+
+@dataclass(frozen=True)
+class FastParams:
+    """The two things a fast run changes that no ordinary key can express.
+
+    Everything else a fast run does - the sampling grid, which face - is written into
+    the ordinary keys by :func:`fast_preset`, so the report shows the value actually in
+    force instead of a flag nobody can audit. What is left here is the state itself and
+    the one semantic switch: whether lines of sight are modelled at all.
+
+    `layers` is the record of what the preset changed, carried so the report can say
+    "this run was fast, and here is what that meant" without re-deriving it from the
+    numbers - which would be circular, because the numbers are the thing not to trust.
+
+    The default is off, and off must be bit-for-bit the pre-2026-10-28 behaviour.
+    """
+
+    enabled: bool
+    no_occlusion: bool
+    layers: tuple[str, ...] = ()
+
+    @classmethod
+    def disabled(cls) -> FastParams:
+        return cls(enabled=False, no_occlusion=False, layers=())
+
+
 @dataclass(frozen=True)
 class PlannerConfig:
     scanner: ScannerParams
@@ -352,6 +597,7 @@ class PlannerConfig:
     occlusion_tol_mm: float
     seed: int
     robot: RobotParams = field(default_factory=RobotParams.disabled)
+    fast: FastParams = field(default_factory=FastParams.disabled)
     source: str = ""
     override: str | None = None
     # Where each surface-derived `stroke` value came from: `base`, `profile(bias=x)` or
@@ -435,8 +681,179 @@ def override(config: PlannerConfig, **sections) -> PlannerConfig:
     return replacement
 
 
+def fast_preset(config: PlannerConfig, *, grid: float = FAST_SAMPLE_GRID_MM,
+                no_occlusion: bool = False,
+                single_face: bool = True) -> PlannerConfig:
+    """The fast run: coarse sampling grid, one face, and the state that says so.
+
+    `single_face=False` is for a caller that already plans one face on its own terms (the
+    web UI always asks for the upper face), so the preset must not claim a speedup it did
+    not cause - the report's `layers` says exactly what was changed.
+
+    Deliberately NOT in this preset:
+
+    * `stroke.check_step_mm` / `extend_step_mm`. They look like an easy 1.5-2.5x, but
+      `check_step_mm` is also the sampling step `RobotArm.along` uses for a straight move
+      in the joint screen, so coarsening it here would make the very check a fast run
+      exists to feed coarser than the motion it is checking.
+    * `stroke.enabled = False`. The J5 over-travel in `output/run_j5_real_upper.log`
+      happens along the straight sweeps, so a path without sweeps cannot reproduce it.
+
+    The grid and the face are written into `target`, not carried as flags, so the report
+    shows what actually ran.
+    """
+    layers = ["sample_grid"]
+    target: dict[str, object] = {"sample_grid_mm": float(grid)}
+    if single_face:
+        layers.append("single_face")
+        target["face"] = "upper"
+    if no_occlusion:
+        layers.append("no_occlusion")
+    return override(
+        config,
+        target=target,
+        fast={"enabled": True, "no_occlusion": bool(no_occlusion),
+              "layers": tuple(layers)},
+    )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return read_json(path)
+
+
+#: What each route style expands to. `direct` is spelled out rather than left empty so that
+#: asking for it explicitly restores the shipped chain even if the file it is applied to
+#: carries a `tidy` value; it deliberately does NOT name `robot.j6_weight`, which is the
+#: site's own cost preference rather than part of the route's shape.
+#:
+#: `tidy` keeps `joint_connector` ON even though the chain it belongs to is the fallback:
+#: the joint move is what stops "make it straight" from meaning "lose the sweep", and a style
+#: whose fallback could not fly would trade coverage for appearance.
+ROUTE_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
+    "direct": {
+        "stroke": {"route_style": "direct", "connector": "direct-then-lift",
+                   "joint_connector": True},
+        "robot": {"config_change_cost_deg": 0.0, "wrist_flip_cost_deg": 180.0},
+    },
+    "tidy": {
+        "stroke": {"route_style": "tidy", "connector": "straight-then-lateral",
+                   "joint_connector": True, "order_j6_weight_mm_per_deg": 10.0},
+        "robot": {"config_change_cost_deg": 240.0, "wrist_flip_cost_deg": 1000.0,
+                  "j6_weight": 0.5},
+    },
+}
+
+
+def _route_values(config: PlannerConfig, style: str) -> PlannerConfig:
+    """`config` with one style's settings applied, unvalidated."""
+    replacement = config
+    for name, changes in ROUTE_PRESETS[style].items():
+        section = getattr(replacement, name)
+        replacement = replace(replacement, **{name: replace(section, **changes)})
+    return replacement
+
+
+#: Which plan mode the page and the command line offer.
+PLAN_MODES: tuple[str, ...] = ("standard", "banded")
+
+#: What each plan mode expands to. `standard` is spelled out as the values the shipped
+#: configuration already carries, so asking for it is the identity on any file - that is what
+#: makes "no mode chosen" reproduce the old runs exactly.
+#:
+#: `banded` is ONE decision split into the three things that have to move together, because
+#: moving any one of them alone does nothing measurable (measured 2026-11-01 on the track-scan
+#: station, same 10 mm grid, same 99% target):
+#:
+#:   side_scan_azimuths / spacing   the tilted seed family is laid on 12 axes 30 degrees
+#:                                  apart and every 40 mm instead of 2 axes every 200 mm, so
+#:                                  walls, bends and clamped rims get bands at all. Without
+#:                                  this the other two have nothing to choose.
+#:   joint_span_fraction / margin   the gate stops shrinking each axis to 90% and reserving
+#:                                  5 more degrees. A tilted band leaves the shrunken
+#:                                  envelope halfway along and `gate_ok` drops the WHOLE band,
+#:                                  not the part that left: measured 43 grown candidates with
+#:                                  the shrink and 216 without, same station and grid. This is
+#:                                  the item that makes a station ride its limits, which is
+#:                                  why it is a mode and not a default.
+#:   stroke_corner_cost             a band is charged one corner like a pose instead of the
+#:                                  two it really needs, so a 150-300 mm band stops losing to
+#:                                  the two stops that cover the same area.
+PLAN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
+    "standard": {
+        "stroke": {"plan_mode": "standard", "side_scan_azimuths": 1,
+                   "side_scan_spacing_mm": 0.0, "side_scan_wall_deg": 0.0,
+                   "side_scan_max_seeds": 0, "stroke_corner_cost": 2.0},
+        "robot": {"joint_span_fraction": 0.9, "joint_margin_deg": 5.0},
+    },
+    "banded": {
+        "stroke": {"plan_mode": "banded", "side_scan_azimuths": 3,
+                   "side_scan_spacing_mm": 60.0, "side_scan_wall_deg": 45.0,
+                   "side_scan_max_seeds": 96, "stroke_corner_cost": 1.0},
+        # Zero margin and a full span on purpose, and it is the honest description of what
+        # this mode does: it asks the planner to use the envelope the controller enforces
+        # instead of a self-imposed smaller one. The poses are still inside the soft limits
+        # and still clear of the J5 singularity, so nothing here is unreachable - it is
+        # "no self-imposed comfort zone", not "ignore the limits".
+        "robot": {"joint_span_fraction": 1.0, "joint_margin_deg": 0.0},
+    },
+}
+
+
+def _preset_values(config: PlannerConfig, table: dict[str, dict[str, Any]]) -> PlannerConfig:
+    """`config` with one preset's settings applied, unvalidated."""
+    replacement = config
+    for name, changes in table.items():
+        section = getattr(replacement, name)
+        replacement = replace(replacement, **{name: replace(section, **changes)})
+    return replacement
+
+
+def plan_preset(config: PlannerConfig, mode: str | None = None) -> PlannerConfig:
+    """Expand `stroke.plan_mode` into the candidate, gate and price settings it names.
+
+    Same shape as `route_preset`, and for the same reason: one expansion shared by the page
+    and the command line cannot drift. `mode=None` applies the label the configuration
+    already carries.
+
+    It is deliberately a SEPARATE axis from `route_style`. A plan mode decides what gets
+    selected (which candidate families exist, how big the envelope is, what a band costs);
+    a route style decides how the selected items are connected. Both can be asked for at
+    once, and neither implies the other.
+    """
+    chosen = str(config.stroke.plan_mode if mode is None else mode)
+    chosen = chosen.strip().lower()
+    if chosen not in PLAN_MODES:
+        raise ValueError(f"'plan_mode' must be one of {PLAN_MODES}, not {mode!r}")
+    replacement = _preset_values(config, PLAN_PRESETS[chosen])
+    _validate(replacement)
+    return replacement
+
+
+def route_preset(config: PlannerConfig, style: str | None = None) -> PlannerConfig:
+    """Expand `stroke.route_style` into the settings it names.
+
+    One expansion for the page and the command line, so the two cannot drift apart - the
+    same reason `fast_preset` exists. `style=None` means "the style this configuration
+    already carries", which is what a caller that only wants the file's own label applied
+    passes.
+
+    `direct` restores the shipped connector and the two sequence prices to the values every
+    program before this key existed was written with, and leaves everything else -
+    `j6_weight` above all - exactly as the file set it. On the shipped configuration it is
+    therefore the identity, which is what makes "no style chosen" reproduce the old runs
+    byte for byte.
+
+    The style owns the keys it names. A file that writes `route_style: tidy` AND
+    `j6_weight: 1.0` gets 0.5 at the top level, because the preset is the single writer of
+    that set; the report then shows the value that actually ran.
+    """
+    chosen = str(config.stroke.route_style if style is None else style)
+    chosen = chosen.strip().lower()
+    if chosen not in ROUTE_STYLES:
+        raise ValueError(f"'route_style' must be one of {ROUTE_STYLES}, not {style!r}")
+    replacement = _route_values(config, chosen)
+    _validate(replacement)
+    return replacement
 
 
 def read_json(path: str | Path) -> Any:
@@ -471,6 +888,8 @@ def _build(data: dict[str, Any], source: str, override: str | None,
     motion = _section(data, "motion", MotionParams)
     robot = (_section(data, "robot", RobotParams) if "robot" in data
              else RobotParams.disabled())
+    fast = (_section(data, "fast", FastParams) if "fast" in data
+            else FastParams.disabled())
     config = PlannerConfig(
         scanner=scanner,
         target=target,
@@ -480,16 +899,29 @@ def _build(data: dict[str, Any], source: str, override: str | None,
         occlusion_tol_mm=float(data["occlusion_tol_mm"]),
         seed=int(data["seed"]),
         robot=robot,
+        fast=fast,
         source=source,
         override=override,
         parameter_sources=dict(parameter_sources or {}),
     )
+    # A file may carry `route_style: tidy` and nothing else; the label is expanded here, so
+    # no consumer can read a style that the rest of the configuration does not implement.
+    if config.stroke.route_style not in ROUTE_STYLES:
+        raise ValueError(f"'stroke.route_style' must be one of {ROUTE_STYLES}, not "
+                         f"{config.stroke.route_style!r}")
+    if config.stroke.route_style != "direct":
+        config = _route_values(config, config.stroke.route_style)
+    if config.stroke.plan_mode not in PLAN_MODES:
+        raise ValueError(f"'stroke.plan_mode' must be one of {PLAN_MODES}, not "
+                         f"{config.stroke.plan_mode!r}")
+    if config.stroke.plan_mode != "standard":
+        config = _preset_values(config, PLAN_PRESETS[config.stroke.plan_mode])
     _validate(config)
     return config
 
 
 def _reject_unknown(data: dict[str, Any]) -> None:
-    known = {"scanner", "target", "tracker", "stroke", "motion", "robot",
+    known = {"scanner", "target", "tracker", "stroke", "motion", "robot", "fast",
              "occlusion_tol_mm", "seed"}
     unknown = sorted(k for k in data if k not in known and not k.startswith("_"))
     if unknown:
@@ -502,6 +934,7 @@ def _reject_unknown(data: dict[str, Any]) -> None:
         ("stroke", StrokeParams),
         ("motion", MotionParams),
         ("robot", RobotParams),
+        ("fast", FastParams),
     ):
         body = data.get(section, {})
         allowed = {f.name for f in fields(cls)}
@@ -513,7 +946,13 @@ def _reject_unknown(data: dict[str, Any]) -> None:
 def _section(data: dict[str, Any], name: str, cls: type) -> Any:
     body = {k: v for k, v in data.get(name, {}).items() if not k.startswith("_")}
     hints = get_type_hints(cls)
-    missing = sorted(f.name for f in fields(cls) if f.name not in body)
+    # A field with a default is optional in the file. That is what lets a new key land
+    # without turning every existing config into an error, which matters here because the
+    # default is how "off" is spelled: `motion.joint_speed_ladder` absent means "one speed
+    # for every joint move", i.e. the program this repository exported before 2026-10-30.
+    missing = sorted(f.name for f in fields(cls)
+                     if f.name not in body
+                     and f.default is MISSING and f.default_factory is MISSING)
     if missing:
         raise ValueError(f"section '{name}' is missing {missing}")
     converted = {key: _coerce(hints[key], value) for key, value in body.items()}
@@ -572,6 +1011,7 @@ def _optional_member(annotation: Any):
 MOTION_TYPES = ("J", "L")
 TERMINATIONS = ("FINE", "CNT0", "CNT100")
 POOL_MODES = ("full", "grid", "rails")
+WRIST_FLIP_POLICIES = ("T", "F", "any")
 
 
 def _validate(config: PlannerConfig) -> None:
@@ -589,6 +1029,9 @@ def _validate(config: PlannerConfig) -> None:
         raise ValueError(
             "'max_incidence_deg' must be in (0, 90] - it is an angle to the surface normal"
         )
+    if scanner.roll_mode not in ROLL_MODES:
+        raise ValueError(f"'scanner.roll_mode' must be one of {ROLL_MODES}, not "
+                         f"{scanner.roll_mode!r}")
     if scanner.max_candidates <= 0:
         raise ValueError("'max_candidates' must be positive")
     if scanner.refine_rounds < 0:
@@ -614,6 +1057,7 @@ def _validate(config: PlannerConfig) -> None:
     _validate_strokes(config.stroke)
     _validate_surface(target)
     _validate_robot(config.robot)
+    _validate_fast(config)
     if config.motion.type not in MOTION_TYPES:
         raise ValueError(f"'motion.type' must be one of {MOTION_TYPES}, "
                          f"not {config.motion.type!r}")
@@ -622,9 +1066,93 @@ def _validate(config: PlannerConfig) -> None:
                          f"not {config.motion.termination!r}")
     if config.motion.speed_mm_s <= 0.0:
         raise ValueError("'motion.speed_mm_s' must be positive")
+    _validate_joint_speed_ladder(config.motion.joint_speed_ladder)
+
+
+def _validate_joint_speed_ladder(ladder) -> None:
+    """The buckets must ascend and the last one must be the catch-all.
+
+    Refused rather than repaired: a ladder with two equal thresholds has an unreachable
+    bucket, and one that does not end in `null` leaves large moves with no speed at all -
+    both are typos that would otherwise show up as a program with the wrong speed on the
+    floor, which is exactly the kind of thing nobody notices until an alarm.
+    """
+    if not ladder:
+        raise ValueError("'motion.joint_speed_ladder' cannot be empty: the largest joint "
+                         "moves would have no speed")
+    last = len(ladder) - 1
+    previous = None
+    for index, entry in enumerate(ladder):
+        if len(entry) != 2:
+            raise ValueError(f"'motion.joint_speed_ladder' entry {entry!r} must be "
+                             "[degrees, percent]")
+        limit, speed = entry
+        if not 0.0 < float(speed) <= 100.0:
+            raise ValueError(f"'motion.joint_speed_ladder' speed {speed!r} must be in "
+                             "(0, 100] percent")
+        if index == last:
+            if limit is not None:
+                raise ValueError(
+                    "'motion.joint_speed_ladder' must end with a null limit: it is the "
+                    "catch-all bucket, and without it a move larger than the last threshold "
+                    "has no speed")
+            continue
+        if limit is None:
+            raise ValueError(f"'motion.joint_speed_ladder' entry {index + 1} is null but is "
+                             "not the last: everything after it would be unreachable")
+        if float(limit) <= 0.0:
+            raise ValueError("'motion.joint_speed_ladder' limits must be positive")
+        if previous is not None and float(limit) <= previous:
+            raise ValueError("'motion.joint_speed_ladder' limits must strictly increase")
+        previous = float(limit)
+
+
+def _validate_fast(config: PlannerConfig) -> None:
+    fast = config.fast
+    if fast.no_occlusion and not fast.enabled:
+        # Turning sight lines off on its own would quietly change what "coverage" means
+        # in a run that does not announce itself as fast.
+        raise ValueError("'fast.no_occlusion' needs 'fast.enabled': switching the "
+                         "occlusion test off is only honest inside a fast run")
+    if fast.enabled and config.target.sample_grid_mm < FAST_MIN_SAMPLE_GRID_MM:
+        raise ValueError(
+            f"a fast run needs target.sample_grid_mm >= {FAST_MIN_SAMPLE_GRID_MM:g} mm, "
+            f"not {config.target.sample_grid_mm:g}: at the shipped grid it would cost the "
+            "same time as an accurate run and only be slower to distrust")
 
 
 def _validate_strokes(stroke: StrokeParams) -> None:
+    if stroke.connector not in CONNECTOR_MODES:
+        raise ValueError(f"'stroke.connector' must be one of {CONNECTOR_MODES}, not "
+                         f"{stroke.connector!r}")
+    if stroke.route_style not in ROUTE_STYLES:
+        raise ValueError(f"'stroke.route_style' must be one of {ROUTE_STYLES}, not "
+                         f"{stroke.route_style!r}")
+    if stroke.stroke_corner_cost <= 0.0:
+        raise ValueError("'stroke.stroke_corner_cost' must be positive: it is what one "
+                         "sweep costs the selection next to a pose's 1.0, and 2.0 is the "
+                         "count of corners a band really needs")
+    if stroke.cost_model == "corners" and stroke.stroke_corner_cost < 1.0:
+        raise ValueError("'stroke.stroke_corner_cost' below 1.0 would price a sweep as "
+                         "cheaper than the single stop it still has to make; 1.0 is the "
+                         "floor, i.e. 'a band costs like a pose'")
+    if stroke.side_scan_azimuths < 1:
+        raise ValueError("'stroke.side_scan_azimuths' must be at least 1: it is how many "
+                         "tangent directions the tilted seed family is laid on, and 1 is "
+                         "the pre-2026-11-01 rule (one tangent, both signs)")
+    if stroke.side_scan_spacing_mm < 0.0:
+        raise ValueError("'stroke.side_scan_spacing_mm' cannot be negative: 0.0 means "
+                         "'twice aim_grid_mm', which is the pre-2026-11-01 rule")
+    if not 0.0 <= stroke.side_scan_wall_deg < 90.0:
+        raise ValueError("'stroke.side_scan_wall_deg' must be in [0, 90): it is how far a "
+                         "sample's normal has to lean off the face's dominant normal before "
+                         "the tilted family is seeded there, and 0.0 means 'everywhere'")
+    if stroke.side_scan_max_seeds < 0:
+        raise ValueError("'stroke.side_scan_max_seeds' cannot be negative: 0 means no "
+                         "ceiling, which is the pre-2026-11-01 behaviour")
+    if stroke.plan_mode not in PLAN_MODES:
+        raise ValueError(f"'stroke.plan_mode' must be one of {PLAN_MODES}, not "
+                         f"{stroke.plan_mode!r}")
     if stroke.max_stroke_mm < 0.0:
         raise ValueError("'max_stroke_mm' cannot be negative")
     if stroke.min_stroke_mm < 0.0:
@@ -642,6 +1170,8 @@ def _validate_strokes(stroke: StrokeParams) -> None:
         raise ValueError("'max_prune_rounds' cannot be negative")
     if stroke.max_rot_deg_per_mm <= 0.0:
         raise ValueError("'max_rot_deg_per_mm' must be positive")
+    if stroke.joint_step_deg <= 0.0:
+        raise ValueError("'joint_step_deg' must be positive")
     if stroke.cost_model not in COST_MODELS:
         raise ValueError(f"'cost_model' must be one of {COST_MODELS}, "
                          f"not {stroke.cost_model!r}")
@@ -653,6 +1183,9 @@ def _validate_strokes(stroke: StrokeParams) -> None:
                          "straight move between two identical poses")
     if stroke.order_axis_weight_mm_per_deg < 0.0:
         raise ValueError("'order_axis_weight_mm_per_deg' cannot be negative")
+    if stroke.order_j6_weight_mm_per_deg < 0.0:
+        raise ValueError("'order_j6_weight_mm_per_deg' cannot be negative: it is a price per "
+                         "degree of wrist twist, and 0.0 is 'not priced'")
     if stroke.parallel_weight <= 0.0:
         raise ValueError("'parallel_weight' must be positive: it multiplies the gain of "
                          "the parallel bands, so zero would delete the skeleton")
@@ -678,6 +1211,14 @@ def _validate_surface(target: TargetParams) -> None:
 
 
 def _validate_robot(robot: RobotParams) -> None:
+    # The two sequence prices and the J6 travel charge are meaningful whether or not the
+    # gate is on: a pose-only delivery still chooses a branch for every point, and a negative
+    # price would reward the change it exists to avoid.
+    for name in ("config_change_cost_deg", "wrist_flip_cost_deg", "j6_travel_weight"):
+        if getattr(robot, name) < 0.0:
+            raise ValueError(f"'robot.{name}' cannot be negative: it is a cost added to the "
+                             "alternative that carries the change, so a negative value "
+                             "would reward the change it exists to avoid")
     if not robot.enabled:
         return
     for name in ("upper_arm_mm", "forearm_mm", "forearm_offset_mm"):
@@ -710,8 +1251,20 @@ def _validate_robot(robot: RobotParams) -> None:
                     "cannot be more permissive than the arm")
     if robot.joint_margin_deg < 0.0:
         raise ValueError("'robot.joint_margin_deg' cannot be negative")
+    if not 0.0 < robot.joint_span_fraction <= 1.0:
+        raise ValueError("'robot.joint_span_fraction' must be in (0, 1]: it is the fraction "
+                         "of each axis span the planner may use, so 1.0 means 'right up to "
+                         "the limit', which is what the alarm-prone poses looked like")
     if robot.max_step_deg <= 0.0:
         raise ValueError("'robot.max_step_deg' must be positive")
+    if robot.j6_weight <= 0.0:
+        raise ValueError("'robot.j6_weight' must be positive: it multiplies the cost of a "
+                         "J6 change when two solutions are compared, and 1.0 is 'no "
+                         "preference'")
+    if robot.wrist_flip_policy not in WRIST_FLIP_POLICIES:
+        raise ValueError(f"'robot.wrist_flip_policy' must be one of "
+                         f"{WRIST_FLIP_POLICIES}, not {robot.wrist_flip_policy!r}: it picks "
+                         "which wrist branch the delivered program may use")
     j5_low, j5_high = robot.soft_limits_deg[4]
     if robot.j5_min_abs_deg >= (j5_high - j5_low) / 2.0:
         raise ValueError("'robot.j5_min_abs_deg' leaves no usable J5 band inside the soft "
@@ -719,3 +1272,5 @@ def _validate_robot(robot: RobotParams) -> None:
     if robot.j5_min_abs_deg <= 0.0:
         raise ValueError("'robot.j5_min_abs_deg' must be positive: J5 = 0 is the wrist "
                          "singularity, not a safe centre")
+
+

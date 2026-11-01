@@ -33,6 +33,17 @@
             <label class="field-label" for="runName">本次运行名称</label>
             <input class="text-input" id="runName" maxlength="64" placeholder="留空则按时间自动命名">
 
+            <div class="section-label"><span>方案</span><small>重启程序后一键恢复模型、定位点与坐标</small></div>
+            <div class="axis-row">
+              <select class="text-input" id="setupSelect" aria-label="已保存的方案">
+                <option value="">（尚未保存方案）</option>
+              </select>
+              <button class="secondary-button" id="saveSetup" type="button">保存当前配置</button>
+              <button class="secondary-button" id="loadSetup" type="button">读取</button>
+              <button class="secondary-button" id="deleteSetup" type="button">删除</button>
+            </div>
+            <p class="inline-hint">保存的是「本次运行名称」下的整套现场配置：三个模型文件、在 3D 模型上选的定位点、手动填入的现场坐标，以及扫描面/坐标系/误差限和「高级配置」里的每一个选项（交付模式、规划速度、规划模式、路线风格、覆盖率目标、扫描带角价）。同名保存会覆盖旧的。文件在 <code>output/web_runs/setups/</code> 下，一个方案一个文件夹。</p>
+
             <div class="section-label"><span>工位模型</span><small>毫米单位 · STL / STEP / IGES 等</small></div>
             <div class="upload-grid">
               <label class="upload-card" for="partFile">
@@ -82,16 +93,77 @@
             </div>
             <p class="inline-hint">整车轴：X 前−后+，Y 左−、右+，Z 下−上+。自动推荐会统计模型主平整面的面积；推荐结果可随时手动修改。</p>
 
-            <div class="form-row">
-              <div><label class="field-label" for="scanMode">交付模式</label>
-                <select class="text-input" id="scanMode">
-                  <option value="stroke" selected>扫掠模式 · 连续扫描带</option>
-                  <option value="pose">纯位姿模式（旧版）</option>
-                </select>
-              </div>
-            </div>
-            <p class="inline-hint">扫掠模式把相邻视点连成连续扫描带，覆盖率描述的是真正扫过的区域，LS 里用 L 直线 + CNT0 连续走；纯位姿模式是旧版行为，只给孤立位姿，点与点之间的运动不做任何保证。</p>
+            <details class="advanced-config" id="advancedConfig">
+              <summary class="advanced-summary">
+                <span class="advanced-chevron" aria-hidden="true">›</span>
+                <span class="advanced-titles"><b>高级配置</b><small id="advancedReadout"></small></span>
+                <span class="advanced-flag"><span class="when-closed">展开调整</span><span class="when-open">收起</span></span>
+              </summary>
+              <div class="advanced-body">
+                <div class="form-row">
+                  <div><label class="field-label" for="scanMode">交付模式</label>
+                    <select class="text-input" id="scanMode">
+                      <option value="stroke" selected>扫掠模式 · 连续扫描带</option>
+                      <option value="pose">纯位姿模式（旧版）</option>
+                    </select>
+                  </div>
+                </div>
+                <p class="inline-hint">扫掠模式把相邻视点连成连续扫描带，覆盖率描述的是真正扫过的区域，LS 里用 L 直线 + CNT0 连续走；纯位姿模式是旧版行为，只给孤立位姿，点与点之间的运动不做任何保证。</p>
 
+                <div class="form-row">
+                  <div><label class="field-label" for="fastMode">规划速度</label>
+                    <select class="text-input" id="fastMode">
+                      <option value="accurate">精确 · 3 mm 采样</option>
+                      <option value="fast" selected>快速 · 10 mm 采样（约 2 分钟）</option>
+                    </select>
+                  </div>
+                </div>
+                <label class="check-row"><input id="fastNoOcclusion" type="checkbox">快速模式下跳过遮挡测试（更快，但可能"隔着零件"覆盖到采样点）</label>
+                <p class="inline-hint">快速模式只把采样网格放粗一档（3 mm → 10 mm），不关扫描带、不改关节检查步长——J5 超程正是发生在扫描带的直线扫掠段上。它换来的是"几分钟一条完整路径"，用于反复迭代关节解算；<b>覆盖率数字只描述路径形状，不能当验收依据</b>。报告里会有 <code>fast_mode</code> 块和 <code>FAST MODE</code> 摘要行。</p>
+
+                <div class="form-row">
+                  <div><label class="field-label" for="planMode">规划模式</label>
+                    <select class="text-input" id="planMode">
+                      <option value="standard">标准 · 只扫平板</option>
+                      <option value="banded" selected>扫掠优先 · 侧壁翻边也铺扫描带</option>
+                    </select>
+                  </div>
+                </div>
+                <p class="inline-hint"><b>标准</b>把这三项展开成配置里已有的值（配置一个字不动），但倾斜种子族的
+                  符号修复对两档都生效，所以带会比 2026-11-01 之前多。<b>扫掠优先</b>把三件必须一起动的事一次做完，单独动任何一件都量不出效果（2026-11-01 在同一工位、同一 10 mm 网格、同一 99% 目标下实测）：<br>
+                  ① <b>倾斜种子族铺满一圈</b>——正对的梯子扫不到立着的侧壁和压钳下的翻边（视场与壁面平行，几个毫米外入射角就超限），只有从<b>自由那一侧</b>斜着扫才够得着，而哪一侧自由事先不知道，所以倾角要绕法向转一圈。标准档只铺 1 个方向、每 200 mm 一颗，等于没铺到；这一档铺 3 个方向（6 个轴向、每 60° 一个）、每 60 mm 一颗，只铺在偏离主方向 ≥45° 的墙和翻边上，最多 96 颗、均匀抽稀。<br>
+                  ② <b>关节包络不再自己缩一圈</b>——倾斜的带半路会走出"缩到 90% + 再留 5°"的包络，而 <code>gate_ok</code> 是<b>整条带</b>判死不是截断：同一工位同一网格，缩包络下长出 43 条候选带，放开是 216 条。代价是姿态余量从 5° 降到 0°，也就是<b>贴着控制器限位跑</b>。位姿仍在软限位内、也仍避开 J5 奇异，不是"忽略限位"，是"不额外自设舒适区"。<br>
+                  ③ <b>一条带按一个位姿计价</b>——一个停点只盖一个视场，一条带要多付一个停点去换长度，所以按真实 2.0 算，短于约两个视场的带会输给盖住同样面积的两个单点。这一档按 1.0 算。<br>
+                  结果：更多区域被<b>扫</b>而不是被<b>停</b>，点数和关节换向次数会上升。报告里有 <code>route.plan_mode</code> 与 <code>route.plan_mode_settings</code>，摘要里 <code>strokes</code> 行会写「几条带 + 几个停点」。命令行对应 <code>--plan-mode</code>；它和「路线风格」是两件事，可以任意组合。</p>
+
+                <div class="form-row">
+                  <div><label class="field-label" for="routeStyle">路线风格</label>
+                    <select class="text-input" id="routeStyle">
+                      <option value="direct">直连 · 两条带之间一次关节移动</option>
+                      <option value="tidy" selected>整齐 · 直线直飞，被挡才侧移</option>
+                    </select>
+                  </div>
+                </div>
+                <p class="inline-hint"><b>直连</b>是当前默认：两条扫描带之间走一次关节移动，两端合法就不会在中段出界，代价是 TCP 走弧线，程序看起来是绕的。<b>整齐</b>改成直线直飞——通了就不插任何点，程序里一条指令到位；直线被挡时绕光轴垂直方向侧移一个等待点，仍然不行才回落直连/抬升，<b>不会因为要"整齐"就丢扫描带</b>。同时给"换臂型（CONFIG 族）"和"腕翻转"计价，避免为省几十度行程让整臂甩一圈。两档的点数与覆盖率不能互相作为回归基准；报告里有 <code>route</code> 块，命令行对应 <code>--route-style</code>。</p>
+
+                <div class="form-row">
+                  <div><label class="field-label" for="coverageTarget">覆盖率目标（%）</label>
+                    <input class="text-input error-limit-input" id="coverageTarget" type="number" value="99" min="0.5" max="100" step="0.5">
+                  </div>
+                </div>
+                <label class="check-row"><input id="coverageTargetNone" type="checkbox">不设上限（一直选到再没有新增覆盖为止）</label>
+                <p class="inline-hint">达到目标后选择阶段立即停手，<b>同时跳过针对漏扫区的二次瞄准</b>（refinement 整轮不跑）——斜坡、孔沿那类低产出区域就是这样成片剩下的。想让它们也补上，把目标抬到 99~100 或勾「不设上限」；代价是程序点数、关节重定向次数和单步关节变化一起上涨。留空或勾上等于配置里的 <code>coverage_target_pct: null</code>。结果里多一行 <code>覆盖率目标</code>。</p>
+
+                <div class="form-row">
+                  <div><label class="field-label" for="strokeCornerCost">扫描带角价（转角 / 条）</label>
+                    <input class="text-input error-limit-input" id="strokeCornerCost" type="number" value="2" min="1" max="2" step="0.1">
+                  </div>
+                </div>
+                <p class="inline-hint">选择阶段给一条扫描带算几个转角，单点固定算 1。这是<b>唯一决定「扫」和「停」比例</b>的旋钮：一个停点只盖一个视场，一条带要多付一个停点去换长度，所以按真实的 2.0 算，短于约两个视场的带会输给盖住同样面积的两个单点——算术没错，但那不是买扫描台的目的。<b>2.0</b> 是真实转角数；<b>1.5</b> 是带的远端只算半个转角；<b>1.0</b> 是一条带按一个位姿计价，凡是能扫的地方都优先扫。<b>1.0</b> 时点数会明显变少、带明显变多，但它是偏好不是事实——可达性和能不能交付由关节门和连接器决定，不受这个数影响。命令行对应 <code>--stroke-corner-cost</code>，报告里 <code>stroke_plan</code> 块会记录实际生效的值和「几条带 + 几个停点」。</p>
+
+                <p class="inline-hint">关节限位筛选<b>始终开启</b>：每个候选位姿都要先过逆解，各轴离限位至少 5°，J5 必须落在 ±125 内且远离 0（腕奇异），否则该位姿不进选择、扫描带在半路越界就停止生长。结果里固定有一行 <code>关节筛选：始终开启</code>，报告里有 <code>kinematics</code> 块（J5 直方图、分支直方图、最坏单轴步长、无解点数）。</p>
+              </div>
+            </details>
             <div class="section-label config-title"><span>现场定位点</span><small>先在 3D 模型上点选，再输入实测坐标</small></div>
             <div class="axis-row">
               <span class="field-label" style="margin:0">定位点数量</span>

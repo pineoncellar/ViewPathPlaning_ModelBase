@@ -35,14 +35,14 @@ from scipy.sparse import csr_matrix
 from .config import PlannerConfig
 from .raycast import nearest_across
 from .scanner_model import ScannerModel, ScannerPose, measure_mask
-from .scene import Station
+from .scene import Station, casters_for
 from .target_surface import SampleSet
 
 REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by_base",
            "blocked_by_tracker", "only_poses_that_collide", "unreachable_joint_limit",
            "candidate_found")
-_COUNTER_KEYS = ("rejected_clearance", "rejected_tracker", "rejected_kinematics",
-                 "rejected_no_points", "rays")
+_COUNTER_KEYS = ("rejected_inside_part", "inside_part_unchecked", "rejected_clearance",
+                 "rejected_tracker", "rejected_kinematics", "rejected_no_points", "rays")
 
 
 @dataclass
@@ -121,19 +121,35 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
     n_targets = len(points)
     if len(areas) != n_targets:
         raise ValueError("every sample needs an area")
-    casters = station.obstacles() if obstacles is None else obstacles
+    casters = casters_for(station, cfg) if obstacles is None else obstacles
 
     positions = (np.array([pose.position for pose in poses], dtype=float)
                  if poses else np.zeros((0, 3)))
     tracker_ok = (np.asarray(visible(positions), dtype=bool) if visible is not None
                   else np.ones(len(poses), dtype=bool))
+    # One vectorised parity query for the whole pool, before the per-pose work: the reference
+    # point of a pose that sits INSIDE the sheet cannot be flown, and the pose would otherwise
+    # earn coverage by seeing samples through the material it is buried in. Three rays per
+    # pose against the thousands `measure_mask` casts, so it is not the hot spot.
+    #
+    # Two situations skip it, and both are counted rather than assumed away:
+    # * a run that models no sight lines (`fast.no_occlusion`) casts nothing at the station;
+    # * a part whose parity test disagrees with the obvious answer (`Station.parity_trusted`)
+    #   has no reliable "inside" - asking it would reject poses on a coin toss.
+    checked = bool(casters) and station.parity_trusted
+    buried = (station.inside_part(positions) if checked
+              else np.zeros(len(poses), dtype=bool))
     counters = dict.fromkeys(_COUNTER_KEYS, 0)
+    counters["inside_part_unchecked"] = 0 if checked else len(poses)
 
     sets: list[np.ndarray] = []
     quality: list[np.ndarray] = []
     for index, pose in enumerate(poses):
         rejected = None
-        if not model.body_fits(pose.position, station.clearance_mm(pose.position)[0]):
+        if buried[index]:
+            counters["rejected_inside_part"] += 1
+            rejected = "inside_part"
+        elif not model.body_fits(pose.position, station.clearance_mm(pose.position)[0]):
             counters["rejected_clearance"] += 1
             rejected = "clearance"
         elif not tracker_ok[index]:
@@ -220,7 +236,7 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
     if count == 0:
         return reasons
 
-    casters = station.obstacles() if obstacles is None else obstacles
+    casters = casters_for(station, cfg) if obstacles is None else obstacles
     resolved = np.zeros(count, dtype=bool)
     only_colliding = np.zeros(count, dtype=bool)
     only_limited = np.zeros(count, dtype=bool)

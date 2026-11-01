@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from ..config import PlannerConfig
 from ..path import PathPlan
 
@@ -42,5 +44,55 @@ def program_block(config: PlannerConfig, viewpoints, path: PathPlan | None) -> d
         # Which route every transition took. Without this, "the connector got cheaper" is
         # a claim rather than a measurement.
         "connector_levels": dict(sorted(path.connector_levels.items())),
+        "cost": _cost(config, path),
     })
     return block
+
+
+def _cost(config: PlannerConfig, path: PathPlan) -> dict:
+    """What the program costs, split into the half that converts and the half that does not.
+
+    The linear half converts to seconds because the floor speed is a setting. The joint half
+    does not: turning degrees into seconds needs a joint speed, and no joint speed has been
+    measured on this cell. Reporting only the convertible half would hide the cost of the
+    repositions, and inventing a joint speed would be worse than leaving the number as degrees
+    - so the degrees are reported as degrees and the note says why.
+    """
+    points = list(getattr(path, "points", []) or [])
+    solutions = list(getattr(getattr(path, "branches", None), "solutions", []) or [])
+    linear_mm = 0.0
+    joint_deg = 0.0
+    worst_deg = 0.0
+    linear_segments = 0
+    joint_segments = 0
+    for index in range(1, len(points)):
+        step = float(np.linalg.norm(np.asarray(points[index].position, dtype=float)
+                                    - np.asarray(points[index - 1].position, dtype=float)))
+        motion = str(getattr(points[index], "motion", None) or config.motion.type).upper()
+        if motion == "L":
+            linear_mm += step
+            linear_segments += 1
+            continue
+        joint_segments += 1
+        first = solutions[index - 1] if index - 1 < len(solutions) else None
+        second = solutions[index] if index < len(solutions) else None
+        if first is None or second is None:
+            continue
+        delta = np.abs(np.asarray(second.joints_deg, dtype=float)
+                       - np.asarray(first.joints_deg, dtype=float))
+        joint_deg += float(delta.max())
+        worst_deg = max(worst_deg, float(delta.max()))
+    speed = float(config.motion.speed_mm_s)
+    return {
+        "linear_segments": linear_segments,
+        "linear_mm": round(linear_mm, 1),
+        "linear_seconds_at_floor_speed": (round(linear_mm / speed, 1) if speed > 0.0
+                                          else None),
+        "joint_segments": joint_segments,
+        "joint_move_deg_total": round(joint_deg, 1),
+        "joint_move_deg_worst": round(worst_deg, 1),
+        "note": ("the linear half is seconds because the floor speed is a setting; the joint "
+                 "half stays in degrees because no joint speed has been measured on this cell. "
+                 "Read the degrees as the SHAPE of the transfer cost - a program with five "
+                 "corners and a program with fifty differ mainly here"),
+    }

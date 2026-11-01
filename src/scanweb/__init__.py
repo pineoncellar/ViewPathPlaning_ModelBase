@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import html
 import json
 import re
@@ -31,7 +32,17 @@ from urllib.parse import parse_qs, urlsplit
 import numpy as np
 import trimesh
 
-from scanplan.config import load_config, override
+from scanplan.config import (
+    FAST_MIN_SAMPLE_GRID_MM,
+    FAST_SAMPLE_GRID_MM,
+    PLAN_MODES,
+    ROUTE_STYLES,
+    fast_preset,
+    load_config,
+    override,
+    plan_preset,
+    route_preset,
+)
 from scanplan.pipeline import plan, write_outputs
 from scanplan.registration import RigidRegistration, fit_points
 from scanplan.report import (
@@ -269,6 +280,53 @@ def _write_planning_report(path: Path, *, run_id: str, prog_name: str,
     face_text = ", ".join(f"{value:.4f}" for value in face_axis)
     coverage = float(report.get("coverage_pct", 0))
     target_area = float(report.get("target_face_mm2", 0)) / 1e6
+    fast = report.get("fast_mode", {}) or {}
+    fast_banner = ""
+    if fast.get("enabled"):
+        # A downloadable report outlives the screen it was made on, so the warning has to
+        # be in the file itself and above the numbers, not in a footnote below them.
+        fast_banner = (
+            '<section><div class="warn"><b>本次运行为快速模式</b>：采样网格 '
+            f'{float(fast.get("sample_grid_mm") or 0.0):g} mm，视线遮挡'
+            f'{"已建模" if fast.get("occlusion_modelled") else "未建模"}。'
+            "覆盖率数字只描述路径的形状，<b>不能作为验收依据</b>；引用任何数字前请去掉快速"
+            "模式重跑一次。</div></section>"
+        )
+    route = report.get("route", {}) or {}
+    route_banner = ""
+    if route.get("style") and route.get("style") != "direct":
+        # Same reasoning as the fast banner: two styles exchange point count against program
+        # shape, so a figure from one is not a regression test for the other. The reader has
+        # to be told which one produced this page before they compare it with another run.
+        route_banner = (
+            '<section><div class="warn"><b>本次运行使用路线风格 '
+            f'{html.escape(str(route.get("style")))}</b>：连接器 '
+            f'{html.escape(str(route.get("connector")))}，'
+            f'换臂型计价 {float(route.get("config_change_cost_deg") or 0.0):g}°，'
+            f'腕翻转计价 {float(route.get("wrist_flip_cost_deg") or 0.0):g}°，'
+            f'排序的 J6 计价 {float(route.get("order_j6_weight_mm_per_deg") or 0.0):g} mm/度。'
+            "程序的点数与形状与 <code>direct</code> 档不同，两档的覆盖率<b>不能互相作为"
+            "回归基准</b>。</div></section>"
+        )
+    plan_settings = route.get("plan_mode_settings") or {}
+    if route.get("plan_mode") and route.get("plan_mode") != "standard":
+        # The plan mode changes WHICH items the selection may pick, so a coverage figure from
+        # one is not a regression test for the other - and the three numbers it stands for
+        # are what makes the difference reproducible two weeks later.
+        route_banner += (
+            '<section><div class="warn"><b>本次运行使用规划模式 '
+            f'{html.escape(str(route.get("plan_mode")))}</b>：倾斜种子族铺在 '
+            f'{int(plan_settings.get("side_scan_azimuths") or 1) * 2} 个方向（每 '
+            f'{float(plan_settings.get("side_scan_spacing_mm") or 0.0):g} mm 一颗），'
+            f'关节包络用满量程的 '
+            f'{float(plan_settings.get("joint_span_fraction") or 1.0):g}、余量 '
+            f'{float(plan_settings.get("joint_margin_deg") or 0.0):g}°，'
+            f'一条扫描带按 '
+            f'{float(plan_settings.get("stroke_corner_cost") or 2.0):g} 个转角计价。'
+            "这个模式会让更多区域被<b>扫</b>而不是被<b>停</b>，代价是点数上升、"
+            "并且贴着关节限位跑；与 <code>standard</code> 档的结果<b>不能互相作为回归"
+            "基准</b>。</div></section>"
+        )
     body = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>扫描规划报告 · {html.escape(prog_name)}</title>
@@ -304,6 +362,8 @@ code{{color:#315c82}}
 </style></head><body><main>
 <header><h1>扫描路径规划报告</h1>
 <p>运行编号 {html.escape(run_id)} · 程序 {html.escape(prog_name)}</p></header>
+{fast_banner}
+{route_banner}
 <section><h2>主要结果</h2><div class="metrics">
 <div class="metric"><span>目标面覆盖率</span><b>{coverage:.2f}%</b></div>
 <div class="metric"><span>扫描视点</span><b>{int(report.get('viewpoints', 0))}</b></div>
@@ -366,12 +426,34 @@ def _download_entries(prog_name: str) -> list[dict[str, str]]:
     ]
 
 
+# 高级配置面板的起点值。这不是配置文件的出厂值，两者故意分开：
+#
+# * 出厂值（`PLAN_PRESETS` / `ROUTE_PRESETS` 的默认项，即 standard + direct + 不设覆盖率
+#   上限）是命令行和回归基准的参照，改它等于让 `--plan-mode standard` 变成一句空话；
+# * 这里是 2026-11-01 在同一工位、同一 10 mm 网格、同一 99% 目标下实测出的现场配方，
+#   页面每次规划都会把它看见的这六项原样发回来，所以“屏幕显示什么”就是“这一跑按什么跑”。
+#
+# 放在服务端而不是写死在 `index.html`，是因为 `app.js` 本来就在 `/api/config` 拿起点值：
+# 页面不再自己藏一套默认值，改配方只改这一处。
+SITE_DEFAULTS = {
+    "delivery_mode": "stroke",
+    "fast": True,
+    "plan_mode": "banded",
+    "route_style": "tidy",
+    "coverage_target_pct": 99.0,
+    "stroke_corner_cost": 2.0,
+}
+
+
 def _public_config() -> dict:
     """What the page is allowed to know about the shipped configuration, as defaults.
 
     Only settings a page control can express, and the mode in the page's own vocabulary
     (`stroke` / `pose`) rather than the config's (`path` / `lean`). Everything here is a
     default: the page can still ask for something else, and the run reports what it used.
+
+    There is no `robot_enabled` here on purpose: the joint gate is not a page choice, so a
+    key that describes it would only invite a switch that no longer exists.
     """
     config = load_config()
     return {
@@ -380,13 +462,82 @@ def _public_config() -> dict:
         "surface_bias": float(config.target.surface_bias),
         "max_points": config.target.max_points,
         "pool_mode": config.stroke.pool_mode,
-        "robot_enabled": bool(config.robot.enabled),
         "motion": config.motion.type,
         "termination": config.motion.termination,
         "speed_mm_s": float(config.motion.speed_mm_s),
         "config_source": config.source,
         "parameter_sources": dict(config.parameter_sources),
+        # The two grids, so the page can label the choice with the numbers it will use
+        # instead of hard-coding a promise about how fast a run is.
+        "sample_grid_mm": float(config.target.sample_grid_mm),
+        "fast_grid_mm": FAST_SAMPLE_GRID_MM,
+        "fast_min_grid_mm": FAST_MIN_SAMPLE_GRID_MM,
+        # The route style and what it stands for. The page labels the choice from these
+        # rather than hard-coding "tidy means fewer corners", so renaming a preset cannot
+        # leave the page promising something the planner no longer does.
+        "route_style": config.stroke.route_style,
+        "route_styles": list(ROUTE_STYLES),
+        "route_connector": config.stroke.connector,
+        # What one sweep costs the selection next to a pose's 1.0. A page control because it
+        # is the only knob that decides how much of the part is swept rather than stopped on,
+        # and the arithmetic is counter-intuitive enough that it is worth being able to try.
+        "stroke_corner_cost": float(config.stroke.stroke_corner_cost),
+        # The plan mode and what it stands for, so the page can label the choice with the
+        # numbers it will actually use.
+        "plan_mode": config.stroke.plan_mode,
+        "plan_modes": list(PLAN_MODES),
+        # 页面起点值（见 `SITE_DEFAULTS`）：上面那些键描述的是配置文件，这里描述的是
+        # 折叠面板一打开时的样子。两者可以不同，页面用的是这一份。
+        "defaults": dict(SITE_DEFAULTS),
     }
+
+
+# 覆盖率目标：页面没传这个键就沿用配置（`_KEEP`），显式 null / 空串表示不设上限。
+_KEEP = object()
+
+
+def _coverage_target(raw):
+    """One page value for `target.coverage_target_pct`, refused here rather than clamped.
+
+    `None` and the empty string both mean "no target": the selection then runs until no
+    candidate adds coverage, and only then do the refinement rounds aimed at what is still
+    uncovered run at all. The range check mirrors `config.validate`, so the operator hears
+    it in the page instead of reading a traceback in the server log.
+    """
+    if raw is _KEEP:
+        return _KEEP
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("覆盖率目标必须填百分数，或留空 / 勾选「不设上限」") from error
+    if not 0.0 < value <= 100.0:
+        raise ValueError("覆盖率目标必须大于 0 且不超过 100，或留空 / 勾选「不设上限」")
+    return value
+
+
+def _stroke_corner_cost(raw):
+    """One page value for `stroke.stroke_corner_cost`, refused here rather than clamped.
+
+    Below 1.0 is refused with a note rather than silently floored: the page would be asking
+    the planner to believe a sweep costs less than the single stop it still has to make.
+    There is no upper bound - a site may deliberately make bands dearer to get fewer of
+    them - but 2.0 is the true count of corners a band needs, so anything at or above it
+    reproduces the counting exactly.
+    """
+    if raw is _KEEP:
+        return _KEEP
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return _KEEP
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("扫描带角价必须填数字（1.0 ~ 2.0 是有效区间）") from error
+    if value < 1.0:
+        raise ValueError("扫描带角价不能小于 1.0：一条带至少也要一个停点。"
+                         "1.0 = 一条带按一个位姿计价，2.0 = 真实要的两个转角")
+    return value
 
 
 def _delivery_config(data: dict):
@@ -395,13 +546,55 @@ def _delivery_config(data: dict):
     The two modes differ in the PLANNING unit, not only in the export: "pose" is the v1
     deliverable of isolated stops, so it switches the stroke stage off. Re-sorting the
     export order would not make a stroke plan pose-only.
+
+    The joint gate is forced on. It used to be a checkbox, and unchecking it produced a
+    plan that promises coverage the arm cannot hold - a deliverable with no use on site,
+    so the switch is gone rather than defaulted. `enabled` is the same flag the command
+    line uses, so the page cannot claim a screening it did not run.
+
+    The coverage target IS a page setting because it is a site decision: at the target the
+    selection stops AND the refinement rounds aimed at what is still uncovered are skipped,
+    which is exactly what leaves the sloped areas behind.
+
+    The route style is a page setting for the same kind of reason - it trades point count
+    against how the program reads - and it goes through the same `route_preset` the command
+    line's `--route-style` uses. Omitting the key keeps whatever the configuration file
+    says, so a page that never touches the control plans exactly what it always did.
+
+    Fast mode is applied LAST and by the same `fast_preset` the command line uses, so the
+    page and `scanplan plan --fast` cannot drift apart. `single_face=False` because this
+    job asks for one face already: claiming the preset's face saving here would be a
+    report saying it did something it did not.
     """
     config = load_config(data.get("config_path"))
     mode = str(data.get("delivery_mode") or "stroke").strip().lower()
     if mode not in ("stroke", "pose"):
         raise ValueError("delivery mode must be 'stroke' or 'pose'")
     if mode == "pose":
-        return override(config, stroke={"enabled": False})
+        config = override(config, stroke={"enabled": False})
+    config = override(config, robot={"enabled": True})
+    style = data.get("route_style", _KEEP)
+    if style is not _KEEP and style is not None:
+        config = route_preset(config, str(style))
+    target = _coverage_target(data.get("coverage_target_pct", _KEEP))
+    if target is not _KEEP:
+        config = override(config, target={"coverage_target_pct": target})
+    corner_cost = _stroke_corner_cost(data.get("stroke_corner_cost", _KEEP))
+    plan_mode_value = data.get("plan_mode", _KEEP)
+    if plan_mode_value is not _KEEP and plan_mode_value not in (None, ""):
+        if str(plan_mode_value) not in PLAN_MODES:
+            raise ValueError(f"规划模式必须是 {PLAN_MODES} 之一，不是 {plan_mode_value!r}")
+        config = plan_preset(config, str(plan_mode_value))
+    if corner_cost is not _KEEP:
+        config = override(config, stroke={"stroke_corner_cost": corner_cost})
+    if data.get("fast"):
+        grid = data.get("fast_grid_mm")
+        config = fast_preset(
+            config,
+            grid=FAST_SAMPLE_GRID_MM if grid is None else float(grid),
+            no_occlusion=bool(data.get("fast_no_occlusion")),
+            single_face=False,
+        )
     return config
 
 
@@ -412,18 +605,26 @@ def _export_options(config, viewpoints, data: dict) -> dict:
     unrelated moves. Its motion and termination come from the configuration for the same
     reason - a sweep flown as J/FINE is not the sweep the coverage figure was computed for.
     The pose-only deliverable keeps the permissive J move a reachability review is read with.
+
+    `joint_speed_ladder` rides along in both cases when the configuration prices joint moves
+    by size (`motion.joint_speed_ladder`). It only ever reaches `J` instructions, so the scan
+    speed is untouched either way.
     """
+    ladder = getattr(config.motion, "joint_speed_ladder", None)
+    ladder = [list(entry) for entry in ladder] if ladder and len(ladder) > 1 else None
     if any(point.stroke_id is not None for point in viewpoints):
         return {
             "motion": config.motion.type,
             "speed": f"{config.motion.speed_mm_s:g} mm/sec",
             "termination": config.motion.termination,
+            "joint_speed_ladder": ladder,
             "order": False,
         }
     return {
         "motion": str(data.get("motion", "J")),
         "speed": str(data.get("speed", "100%")),
         "termination": "FINE",
+        "joint_speed_ladder": ladder,
         "order": True,
     }
 
@@ -577,6 +778,9 @@ def solve_job(data: dict, progress=None) -> dict:
             prog_name=prog_name,
             uframe=output_uframe,
             utool=int(data.get("utool", 1)),
+            # The plan's own envelope: the audit re-walks the file and must judge it against
+            # the limits the plan was made in, not against the dataclass defaults.
+            robot_params=config.robot,
             **options,
         )
         announce("export", 0.98, "program exported")
@@ -673,6 +877,16 @@ def solve_job(data: dict, progress=None) -> dict:
         "target_face_mm2": float(result.report.get("target_face_mm2", 0.0)),
         "face": str(result.report.get("face", "")),
         "uncovered_by_reason": result.report.get("uncovered_by_reason", {}),
+        # The report's own `fast_mode` block, passed through rather than re-derived: the
+        # page must not be able to describe a faster run than the one that happened.
+        "fast": result.report.get("fast_mode", {"enabled": False}),
+        # The gate is always on now; the result carries the fact instead of the page
+        # assuming it, because the stored report is what gets read a week later.
+        "robot_enabled": bool(config.robot.enabled),
+        # The target this run actually used, so the page shows the number it ran with
+        # rather than whatever the field happens to hold afterwards.
+        "coverage_target_pct": config.target.coverage_target_pct,
+        "sample_grid_mm": float(config.target.sample_grid_mm),
         "scan_face_axis_vehicle": face_axis_vehicle.tolist(),
         "scan_face_axis_measured_frame": scan_axis_target.tolist(),
         "measured_frame": registration.frame_label,
@@ -764,6 +978,16 @@ def _viewpoint_from_record(record: dict) -> Viewpoint:
 
 
 def _moved_viewpoints(records, delta: np.ndarray) -> list[Viewpoint]:
+    """The planned path rigidly moved into the corrected frame.
+
+    The joint angles are DROPPED, and that is the whole point of this function being more than
+    a coordinate change: a rigid move of the delivered path means the arm is no longer where
+    the plan solved it. Carrying the old `joints_deg` through would put joint blocks in the
+    program that describe the OLD installation - points that import cleanly and then miss by
+    the size of the registration correction. Dropping them leaves the recorded motion, so a
+    transition point becomes a Cartesian point reached by `J`, which is exactly as much as can
+    honestly be claimed about a path that was transformed instead of re-planned.
+    """
     moved: list[Viewpoint] = []
     for record in records:
         viewpoint = _viewpoint_from_record(record)
@@ -771,6 +995,8 @@ def _moved_viewpoints(records, delta: np.ndarray) -> list[Viewpoint]:
             viewpoint,
             position=np.asarray(_moved_point(delta, viewpoint.position), dtype=float),
             axis=np.asarray(_moved_axis(delta, viewpoint.axis), dtype=float),
+            joints_deg=None, config=None, j5_margin_deg=None,
+            representation=("cart" if viewpoint.representation else None),
         ))
     return moved
 
@@ -837,6 +1063,36 @@ def _run_program_name(run_dir: Path) -> str:
         except ValueError:
             continue
     return ""
+
+
+def _robot_params_from_report(report: dict):
+    """The arm parameters a finished run was judged against, rebuilt from its own report.
+
+    A relocation does not re-plan, so there is no configuration object to hand - and the
+    export audit would otherwise walk the file against the dataclass DEFAULTS, i.e. a 5 degree
+    margin inside a 90 % span, which is not the envelope a `banded` run was made in.
+
+    Only the envelope is reconstructed, because that is the only part the audit uses to decide
+    `joint_limit`: the measured geometry, signs and tool all come from the shipped defaults,
+    which are the same numbers the configuration file carries. Set as `limits = usable` with
+    span 1.0 so that `Robot.usable` reproduces the recorded band exactly.
+    """
+    from scanplan.config import RobotParams
+
+    envelope = ((report or {}).get("kinematics") or {}).get("envelope") or {}
+    usable = envelope.get("usable_limits_deg")
+    if not usable:
+        return None
+    band = tuple(tuple(float(value) for value in pair) for pair in usable)
+    return replace(
+        RobotParams.disabled(),
+        enabled=True,
+        mechanical_limits_deg=band,
+        soft_limits_deg=band,
+        joint_span_fraction=1.0,
+        joint_margin_deg=float(envelope.get("margin_deg") or 0.0),
+        wrist_flip_policy=str(envelope.get("wrist_policy") or "T"),
+    )
 
 
 def relocate_job(data: dict, progress=None) -> dict:
@@ -1005,6 +1261,12 @@ def relocate_job(data: dict, progress=None) -> dict:
         contract = export_ls(moved, output, prog_name=prog_name, uframe=uframe,
                              utool=utool,
                              order=not any(vp.stroke_id is not None for vp in moved),
+                             # The audit re-walks the file, so it has to judge it in the same
+                             # envelope the run was planned in. A relocation does not re-plan,
+                             # so the run's own report is the only record of that envelope -
+                             # without it the audit falls back to the dataclass defaults and
+                             # refuses every pose a wider plan deliberately allowed.
+                             robot_params=_robot_params_from_report(old_report),
                              **options)
         contract["frame"]["axes"] = (
             f"Robot UFRAME {uframe} axes; the delivered path was rigidly moved from the "
@@ -1457,9 +1719,245 @@ def _augment_datums(record: dict, run_id: str) -> dict:
     return merged
 
 
+# --- saved setups ----------------------------------------------------------
+#
+# A setup is everything the page had typed and clicked before a run: the three meshes,
+# the datum points taken on the model, and the coordinates typed for them. It exists
+# because restarting the server to change the algorithm used to cost a re-import plus a
+# re-pick, and that is exactly the loop the joint-model work runs in.
+#
+# The MESHES are copied, not referenced: the browser never has a path to give, only the
+# bytes it read. `setup.json` carries the rest, so one file describes a setup and the
+# folder beside it holds what the picks were made against.
+
+SETUP_MODELS = ("part", "support", "base")
+SETUP_NAME_LIMIT = 64
+
+
+def _setups_root() -> Path:
+    root = (Path.cwd() / "output" / "web_runs" / "setups").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _setup_slug(name: str) -> str:
+    """A folder for a setup name, safe for any name an operator types.
+
+    A name the run-id pattern already accepts is used verbatim, so the folder is readable
+    and two such names can never share one. Anything else - a Chinese name, a date, a
+    sentence - is reduced to its safe characters plus a digest of the whole name, which is
+    what keeps "A B" and "A_B" from writing over each other.
+    """
+    if _SAFE_RUN_ID.fullmatch(name):
+        return name
+    # `\w` keeps letters of any script, so a Chinese name stays readable on disk; path
+    # separators are not word characters, which is what makes the result safe.
+    slug = re.sub(r"[^\w\-]+", "_", name, flags=re.UNICODE).strip("_")[:40] or "setup"
+    return f"{slug}-{hashlib.sha1(name.encode('utf-8')).hexdigest()[:8]}"
+
+
+def _setup_coords(value, *, name: str, count: int):
+    """A list of `count` numbers, refused rather than truncated when it is not one."""
+    if not isinstance(value, (list, tuple)) or len(value) != count:
+        raise ValueError(f"{name} must be {count} numbers")
+    numbers = []
+    for item in value:
+        try:
+            number = float(item)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name} must be {count} numbers") from error
+        if not np.isfinite(number):
+            raise ValueError(f"{name} must be {count} finite numbers")
+        numbers.append(number)
+    return numbers
+
+
+def _setup_points(value, *, name: str):
+    if not isinstance(value, list) or len(value) > 4:
+        raise ValueError(f"{name} must be a list of at most 4 points")
+    return [_setup_coords(point, name=name, count=3) for point in value]
+
+
+def _clean_setup(body: dict) -> dict:
+    """The page's configuration, written through a whitelist.
+
+    Whitelisted rather than passed through because this file is read back into form
+    fields on the next start: a stale or hand-edited key must not be able to put anything
+    unexpected in front of an operator who is about to plan a real part.
+    """
+    point_count = body.get("point_count", 3)
+    try:
+        point_count = int(point_count)
+    except (TypeError, ValueError) as error:
+        raise ValueError("point_count must be 3 or 4") from error
+    if point_count not in (3, 4):
+        raise ValueError("point_count must be 3 or 4")
+
+    measured = body.get("measured_points_mm", [])
+    if not isinstance(measured, list) or len(measured) > 4:
+        raise ValueError("measured_points_mm must be a list of at most 4 points")
+    measured_rows = []
+    for row in measured:
+        values = row if isinstance(row, list) else []
+        measured_rows.append([str(value)[:32] for value in values[:3]]
+                             + [""] * (3 - len(values[:3])))
+
+    axis = str(body.get("scan_face_axis") or "+Z")
+    if axis not in ("+X", "-X", "+Y", "-Y", "+Z", "-Z"):
+        raise ValueError("scan_face_axis must be one of the six unit axes")
+    mode = str(body.get("delivery_mode") or "stroke")
+    if mode not in ("stroke", "pose"):
+        raise ValueError("delivery_mode must be 'stroke' or 'pose'")
+    speed = str(body.get("fast") or "accurate")
+    if speed not in ("accurate", "fast"):
+        raise ValueError("fast must be 'accurate' or 'fast'")
+    style = str(body.get("route_style") or "direct")
+    if style not in ROUTE_STYLES:
+        raise ValueError(f"route_style must be one of {ROUTE_STYLES}")
+    plan_mode = str(body.get("plan_mode") or "standard")
+    if plan_mode not in PLAN_MODES:
+        raise ValueError(f"plan_mode must be one of {PLAN_MODES}")
+    # `None` on the way in means "the shipped value": the sentinel is not serialisable, and a
+    # setup file that stored it would fail to save rather than plan.
+    corner_cost = _stroke_corner_cost(body.get("stroke_corner_cost", _KEEP))
+
+    raw_names = body.get("model_names")
+    model_names = {}
+    if isinstance(raw_names, dict):
+        # The filenames the operator chose, so a restored setup shows the same names it
+        # was saved with instead of the canonical `part.stl` / `support.stl`.
+        model_names = {kind: str(value)[:120] for kind, value in raw_names.items()
+                       if kind in SETUP_MODELS and value}
+
+    return {
+        "point_count": point_count,
+        "cad_points_vehicle_mm": _setup_points(
+            body.get("cad_points_vehicle_mm", []), name="cad_points_vehicle_mm"),
+        "measured_points_mm": measured_rows,
+        "scan_face_axis": axis,
+        "uframe": 0 if str(body.get("uframe")) == "0" else 1,
+        "error_limit_mm": str(body.get("error_limit_mm") or "3.0")[:32],
+        "prog_name": str(body.get("prog_name") or "")[:16],
+        "run_name": str(body.get("run_name") or "")[:64],
+        "delivery_mode": mode,
+        "fast": speed,
+        "fast_no_occlusion": bool(body.get("fast_no_occlusion")),
+        "route_style": style,
+        "coverage_target_pct": _coverage_target(body.get("coverage_target_pct")),
+        "stroke_corner_cost": (None if corner_cost is _KEEP else corner_cost),
+        "plan_mode": plan_mode,
+        "model_names": model_names,
+    }
+
+
+def _setup_dir(name: str) -> Path:
+    folder = (_setups_root() / _setup_slug(name)).resolve()
+    if folder.parent != _setups_root():
+        raise ValueError("invalid setup name")
+    return folder
+
+
+def save_setup(data: dict) -> dict:
+    """Store one setup: the meshes as files, everything else in `setup.json`.
+
+    Overwrites a setup of the same name on purpose - "save the current configuration"
+    means the current one, and a version pile beside it would be a different feature.
+    """
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise ValueError("方案名称不能为空")
+    if len(name) > SETUP_NAME_LIMIT:
+        raise ValueError(f"方案名称最多 {SETUP_NAME_LIMIT} 个字符")
+    body = data.get("setup")
+    if not isinstance(body, dict):
+        raise ValueError("setup must be an object")
+    cleaned = _clean_setup(body)
+    models = data.get("models") or {}
+    if not isinstance(models, dict):
+        raise ValueError("models must be an object")
+
+    folder = _setup_dir(name)
+    folder.mkdir(parents=True, exist_ok=True)
+    written = []
+    for kind in SETUP_MODELS:
+        payload = models.get(kind)
+        raw = (b"" if not isinstance(payload, dict) or not payload.get("stl_base64")
+               else _decode_stl_bytes(payload, kind))
+        target = folder / f"{kind}.stl"
+        if raw:
+            target.write_bytes(raw)
+            written.append(kind)
+        elif target.is_file():
+            # A setup describes exactly the meshes it was saved with; a part removed from
+            # the page must not come back from the previous save.
+            target.unlink()
+    record = {
+        "name": name,
+        "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "models": written,
+        "setup": cleaned,
+    }
+    (folder / "setup.json").write_text(
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return record
+
+
+def _setup_record(name: str) -> dict | None:
+    path = _setup_dir(name) / "setup.json"
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _setup_list() -> list[dict]:
+    """Every saved setup, newest first, without the meshes."""
+    entries = []
+    for path in _setups_root().glob("*/setup.json"):
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(loaded, dict):
+            continue
+        entries.append({
+            "name": str(loaded.get("name") or path.parent.name),
+            "saved_at": loaded.get("saved_at"),
+            "models": list(loaded.get("models") or []),
+            "point_count": (loaded.get("setup") or {}).get("point_count", 3),
+        })
+    entries.sort(key=lambda entry: str(entry["saved_at"] or ""), reverse=True)
+    return entries
+
+
+def load_setup(name: str) -> dict:
+    """One setup, meshes included, in the shape the page reassembles in a single click."""
+    record = _setup_record(name)
+    if record is None:
+        raise ValueError(f"没有名为 {name!r} 的方案")
+    folder = _setup_dir(name)
+    models = {}
+    for kind in SETUP_MODELS:
+        path = folder / f"{kind}.stl"
+        if path.is_file():
+            models[kind] = {"stl_base64": base64.b64encode(path.read_bytes()).decode("ascii")}
+    return {**record, "models": models}
+
+
+def delete_setup(name: str) -> bool:
+    folder = _setup_dir(name)
+    if not (folder / "setup.json").is_file():
+        return False
+    shutil.rmtree(folder, ignore_errors=True)
+    return True
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "ScanplanWeb/1.0"
-
     def do_GET(self) -> None:
         route = urlsplit(self.path)
         if route.path in ("/", "/index.html"):
@@ -1501,6 +1999,19 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if route.path == "/api/history":
             self._json_response(200, {"ok": True, "runs": _history_runs()})
+            return
+        if route.path == "/api/setup/list":
+            self._json_response(200, {"ok": True, "setups": _setup_list()})
+            return
+        if route.path == "/api/setup":
+            name = parse_qs(route.query).get("name", [""])[0]
+            if not name:
+                self.send_error(400, "invalid setup name")
+                return
+            try:
+                self._json_response(200, {"ok": True, "setup": load_setup(name)})
+            except ValueError as error:
+                self._json_response(404, {"ok": False, "error": str(error)})
             return
         if route.path == "/api/history/detail":
             query = parse_qs(route.query)
@@ -1582,7 +2093,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path not in (
             "/api/register", "/api/solve", "/api/convert", "/api/history/delete",
-            "/api/relocate",
+            "/api/relocate", "/api/setup/save", "/api/setup/delete",
         ):
             self.send_error(404)
             return
@@ -1639,6 +2150,17 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json_response(
                     200, {"ok": True, "result": _preview_registration(data)}
                 )
+                return
+            if self.path == "/api/setup/save":
+                self._json_response(200, {"ok": True,
+                                         "setup": save_setup(data)})
+                return
+            if self.path == "/api/setup/delete":
+                name = str(data.get("name") or "")
+                if not name:
+                    raise ValueError("方案名称不能为空")
+                self._json_response(200, {"ok": True,
+                                         "deleted": delete_setup(name)})
                 return
             if self.path == "/api/relocate":
                 token = _progress_token(data)

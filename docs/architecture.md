@@ -15,7 +15,7 @@
 | `input/` | **工位数模放这里。** 内容被 gitignore。 | **否** |
 | `output/` | 规划器输出。内容被 gitignore。 | **否** |
 | [`reference/`](../reference) | 冻结保留的原管线，作为回归基线。手册见 [`reference/MANUAL.md`](../reference/MANUAL.md)。 | 是 |
-| `docs/` | 公开文档：索引、架构、命令行、配置、验证与历史记录。 | 是 |
+| `docs/` | 公开文档：索引、架构、命令行、配置、验证与历史记录（三个分支的合并取舍见 [`docs/history/`](history/)）。 | 是 |
 | `samples/` | 原项目自带的公开样例网格与图片。 | 是 |
 
 ## 工位数模

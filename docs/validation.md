@@ -111,3 +111,79 @@
 留一交叉同量级；流程见 [robot-calibration.md](robot-calibration.md)），逆解在 300 组随机
 位姿上往返全通过；`legacy_exhaust` 仍是可用的回归金标（438 点 / 99.75%，与合并前记录的
 405 点 / 99.74% 同一量级）。
+
+## 路线风格与两项新不变量（2026-11-01，**待实测**）
+
+这一节只记"要量什么、怎么读"，**没有数字**——这三条都还没在真实工位上跑过，不要引用这里的
+任何结论当验收依据。
+
+**两档路线（`stroke.route_style`）。** `direct` 是之前的行为，`tidy` 换成"直线直飞 + 8 向侧移"。
+要量的是同一零件、同一 seed、同一 `--fast` 下的七个数：
+
+| 数 | 从哪读 | 说明 |
+|---|---|---|
+| 点数 / 过渡点数 | `viewpoints`、`viewpoints_transition` | `tidy` 预期过渡点明显减少 |
+| 连接器分布 | `program.connector_levels` | `L0-straight` 占比是"直飞生效"的直接证据 |
+| J 指令数 | 数 `.LS` 里的 `J` 行 | 直飞把 3 条指令压成 1 条 |
+| 换族次数 | 报告里的 CONFIG 序列数相邻不同位 | 族罚生效后应下降 |
+| 覆盖率 | `coverage_pct` / `delivered_pct` | **两档不能互相作为回归基准** |
+| 耗时 | `runtime.seconds` | 侧移最多试 8 方向 × 抬升档，只在直线被挡时付费 |
+| 关节审计 | `joint_audit.ok` | 两档都必须是 `true`——不许"整齐但导不出去" |
+
+**读数前先确认三个前提**：1) 两档用的是同一份现场坐标系；2) `coverage_target_pct` 相同
+（否则比的是验收口径而不是算法）；3) 报告里 `route.style` 与你要引用的档位一致。
+
+**位姿不得埋在零件里。** 看 `evaluation.rejected_inside_part` 与 `evaluation.inside_part_unchecked`：
+
+- 两个都是 0 → 检查跑了，这个工位上没有这类位姿（正常）；
+- `rejected_inside_part > 0` → 之前有位姿在拿测不出来的覆盖率，这一版把它们去掉了，
+  覆盖率**变化是修正**，不是回归；
+- `inside_part_unchecked > 0` → 这个网格的奇偶判据不可信（或用了 `--no-occlusion`），
+  这项检查没生效。此时**不要**把覆盖率变化归因于它。
+
+**剪枝不再削穿达标集合。** 日志里出现 `pruning skipped: the selection sits at …%` 说明守卫生效；
+没出现且点数明显少于选择阶段的条数，说明选择确实超了目标 0.5 个百分点以上，剪枝照常执行。
+两种情况都正常，要区分开的是"点数变多"到底是守卫还是别的原因。
+
+**J6 的两个收费口和那道兜底（2026-11-01 新增，同样待实测）。** 前提只有一条：先确认报告里
+`kinematics.j6.available` 是 `true`。它不是就说明 `robot.enabled` 还是 `false`，下面所有数都没有
+意义——模块 10/12 整段没跑。
+
+**规划模式 `banded`（2026-11-01 新增，快跑已验证、正式网格未验证）。** 换模式之后先看三行：
+
+| 数 | 从哪读 | 怎么判断 |
+|---|---|---|
+| `stroke_plan.delivered_strokes` / `delivered_stops` | 报告 | **「几条带 + 几个停点」**。`banded` 的目标是把停点压到 0；实测同一工位 99% 目标下从 5 带 + 18 停变成 11 带 + 3 停（门开）/ 11 带 + 0 停（门关） |
+| `program.interrupts.reorient` | 报告 | 应该跟着降。实测 22 → 13（门开）/ 9（门关） |
+| `route.plan_mode_settings` | 报告 | 记录实际生效的五个数；**两个不同模式的覆盖率不能互相作为回归基准** |
+
+`banded` 的两个已知代价，验收时必须一起看：
+
+- `kinematics.min_margin_deg` 会掉到 0.03° 量级——这是模式的本意（不再自设舒适区），但它意味着
+  **贴着控制器限位跑**，ROBOGUIDE 里必须复核。`standard` 档是 5.4°。
+- `kinematics.j6.literal_max_deg` 可能变大：实测 `banded` 有一次 132.4° 的 J6 换向，而 `standard`
+  最坏 48.6°。倾斜带的空间朝向更杂，排序给 J6 计价只有 `tidy` 档开着（10 mm/度）；若这个数不可接受，
+  先把 `stroke.order_j6_weight_mm_per_deg` 抬到 20 再跑一次。
+
+**倾斜种子族是否真的活了。** 2026-11-01 之前它是死的（光轴算反，朝零件背面）。一条快速自检：
+`trace` 一次 `side_scan_seeds` 的光轴与内法向夹角，应当等于 `side_scan_tilt_deg`（45°），不是 135°。
+活的族会在 `banded` 档把带铺到 `x` 全宽、倾角 3°–85°；死的时候所有带都是同一侧、倾角 12°–27°。
+
+跑起来之后按这个顺序读：
+
+| 数 | 从哪读 | 怎么判断 |
+|---|---|---|
+| `j6.literal_total_deg` | 报告 | J6 字面总行程。开 `j6_travel_weight` 后应下降；不降说明**没有可选项**（见下一条） |
+| `j6.worst` / `literal_max_at` | 报告 | 最坏单段在哪。和 `over_cap` / `over_report` 对得上才算读对 |
+| `j6.over_cap` | 报告 | 超 `j6_max_step_deg` 的段；出厂配置里这个阈值是 `60.0` |
+| `j6.over_report` | 报告 | 超 `j6_report_deg`（90°）的段，只是点名 |
+| **`j6.physical_total_deg` / `physical_max_deg`** | 报告 | **唯一可比的口径**：它按姿态算，不看指令类型。`literal_*` 只数 `J` 段，一旦大量连接器改成 `L`，它就掉到很小，那不是改进，是没被计数 |
+| 程序里 `J` / `L` 的条数 | 数 `.LS` | 2026-11-01 之后直线连接器写成 `L`，所以 `L` 的占比就是"路线有多直" |
+| `path_length_mm` | 报告 | 排序给 J6 计价会拿它换：实测 J6 减半，绕行 +23% |
+| 兜底日志 | 运行日志 | `point N: roll re-tried to hold the J6 step under 60 deg` = 真的换了滚转 |
+| `branch_histogram` | 报告 | 只有一个键、且计数等于点数 → **每个位姿只有一个解**，权重与加法收费都不会有任何效果 |
+
+最后一行是最容易误读的：`wrist_flip_policy = "T"` 下 64/64 个位姿只有一个解，DP 无从选择，
+于是 `j6_weight` 和 `j6_travel_weight` 都不会改变结果，**这不是键没生效，是唯一解**。要验证收费
+逻辑本身，得把策略临时改成 `any` 跑一次对照（那条路会引入 F 分支，不能交付，只用来量数）。
+

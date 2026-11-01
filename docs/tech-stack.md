@@ -185,6 +185,9 @@ src/scanweb/             本机浏览器工位界面
 | 由粗到细补候选 | 对残留漏点用更细的瞄准网格重生成候选，再评估、合并、重选 | [refine.py](../src/scanplan/pipeline/refine.py) |
 | 路径排序 | 贪心最近邻（含进端选择）＋ 单条重定位 ＋ 2-opt 反转；成本里计转角 | [path.py](../src/scanplan/path.py) |
 | 分支分配 | 同一位姿常有多组逆解，用动态规划在相邻点之间挑一组，使关节步数最小（只在机器人门打开时生效） | [path.py](../src/scanplan/path.py) |
+| 带间连接（两档路线） | `direct`：一次关节移动，两端合法则中段不可能出界；`tidy`：直线直飞 → 垂直光轴 8 向侧移 → 回落直连/抬升。由 `stroke.route_style` 成组选择，单个实现注册在 `policies.connector_policy` | [policies.py](../src/scanplan/policies.py)、[path.py](../src/scanplan/path.py) |
+| 位姿不得埋在零件里 | 三轴奇偶射线投票（至少两票）；先用八个远在零件外的角点自检"这个判据在这份网格上可信"，不可信就不作答并计数 | [raycast.py](../src/scanplan/raycast.py)、[scene.py](../src/scanplan/scene.py)、[coverage.py](../src/scanplan/coverage.py) |
+| 剪枝守卫 | 选择超出目标不足 0.5 个百分点时不剪——从已达标的集合里再删只会掉覆盖率，且不会留下任何 `dropped` 记录 | [pipeline/delivery.py](../src/scanplan/pipeline/delivery.py) |
 | 扫描带 | 线段 + 恒定姿态的位姿族，覆盖按整段扫掠合并 | [strokes.py](../src/scanplan/strokes.py) |
 | 扫描段合法性 | 沿段加密取样，用"这个位置还能看到量程内的样本吗"判生长是否成立（KD 球查询，不再逐点打光） | [strokes.py](../src/scanplan/strokes.py) |
 | 候选池分档 | `full` = 瞄准网格 + 导轨线 + 侧扫族；`grid` = 仅瞄准网格（历史行为）；`rails` = 仅导轨线 | [strokes.py](../src/scanplan/strokes.py) |
@@ -394,4 +397,6 @@ v1 行为。
 | 扫描仪/跟踪器参数仍是占位值 | 覆盖率数字只能作指示性参考 | 配置内自带出处注释与两处已知偏差 |
 | 机器人段未标定 | `robot.enabled` 打开后仍是"参考可达性" | 两个现场缺口：软限位准确值、ROBOGUIDE 是否用数据表限位 |
 | 私密设计笔记与 `spike/` 不入版本控制 | 设计笔记随工作副本走，换机器会丢 | 合规要求，不是疏漏；`docs/` 其余文档入库 |
+| 两档路线都未在真实工位实测 | `tidy` 的点数/耗时/覆盖率变化还只是设计预期 | 实测清单见 [validation.md](validation.md#路线风格与两项新不变量2026-11-01待实测) |
+| 奇偶判据在真实零件上召回不全 | 埋在材料里的位姿只能抓到约三成 | 精度在零件上量过：正常工距下 0 误判，见 [configuration.md](configuration.md#两处会静悄悄改数字的地方2026-11-01) |
 | 无库 API 稳定承诺 | 内部模块互调频繁，对外只有 CLI | 对外入口是 `scanplan` 子命令与文件契约 |

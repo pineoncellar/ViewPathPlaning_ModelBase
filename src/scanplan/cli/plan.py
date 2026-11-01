@@ -10,7 +10,18 @@ import numpy as np
 
 from scanview import VIEWER_FILE_NAME
 
-from ..config import FACES, load_config, override
+from ..config import (
+    FACES,
+    FAST_MIN_SAMPLE_GRID_MM,
+    FAST_SAMPLE_GRID_MM,
+    PLAN_MODES,
+    ROUTE_STYLES,
+    fast_preset,
+    load_config,
+    override,
+    plan_preset,
+    route_preset,
+)
 from ..raycast import backend_name
 from ..report import summary_lines
 from ..scene import StationDescription, load_station, load_station_description
@@ -35,10 +46,42 @@ def configure(subparsers) -> None:
     planner.add_argument("--fixture", help="fixture mesh, if no --station is given")
     planner.add_argument("--base", help="base mesh, if no --station is given")
     planner.add_argument("--config", help="configuration override (JSON)")
+    planner.add_argument("--fast", action="store_true",
+                         help="fast run: sample the target on a 10 mm grid and plan one "
+                              "face, so an iteration takes ~2 min instead of ~29. For the "
+                              "SHAPE of the path - the coverage figure is not an "
+                              "acceptance result")
+    planner.add_argument("--fast-grid", type=float, metavar="MM",
+                         help=f"sampling grid for --fast (default "
+                              f"{FAST_SAMPLE_GRID_MM:g}, minimum "
+                              f"{FAST_MIN_SAMPLE_GRID_MM:g})")
+    planner.add_argument("--no-occlusion", action="store_true",
+                         help="inside a fast run, do not test lines of sight at all "
+                              "(faster, but a pose may then 'cover' a sample through the "
+                              "part); requires --fast")
     planner.add_argument("--coverage-target", dest="coverage_target",
                          help="acceptance coverage in percent, or 'none' to run until the "
                               "coverage stops growing; overrides the configuration for "
                               "this run")
+    planner.add_argument("--route-style", dest="route_style", choices=ROUTE_STYLES,
+                         help="which set of connector and sequence settings to plan with: "
+                              "'direct' is the shipped chain (a joint move between sweeps), "
+                              "'tidy' flies straight and sidesteps only when blocked, so the "
+                              "program reads as fewer, straighter transitions")
+    planner.add_argument("--plan-mode", dest="plan_mode", choices=PLAN_MODES,
+                         help="what the selection is ALLOWED to use: 'standard' is the "
+                              "shipped behaviour, 'banded' adds a dense tilted seed family, "
+                              "gives up the self-imposed joint envelope shrink and prices a "
+                              "band like a pose, so more of the part is swept instead of "
+                              "stopped on - it costs point count and it rides the joint "
+                              "limits")
+    planner.add_argument("--stroke-corner-cost", dest="stroke_corner_cost", type=float,
+                         metavar="CORNERS",
+                         help="what one SWEEP costs the selection next to a single pose's "
+                              "1.0, when stroke.cost_model is 'corners'. 2.0 is the true "
+                              "count of corners a band needs and 1.0 prices it like a pose, "
+                              "which sweeps more of the part at the same coverage. Range "
+                              "[1.0, 2.0] is the useful part")
     planner.add_argument("--face", choices=FACES, help="which face of the blank to scan")
     planner.add_argument("--tracker", help="tracker pose 'x,y,z' if the station has none")
     planner.add_argument("--tracker-aim", help="tracker aim point 'x,y,z'")
@@ -62,6 +105,28 @@ def run(args, parser: argparse.ArgumentParser) -> int:
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
         parser.error(f"cannot read the configuration: {error}")
         return 2
+
+    if cfg.stroke.route_style != "direct":
+        say(f"route style '{cfg.stroke.route_style}': connector "
+            f"{cfg.stroke.connector}, CONFIG-family change "
+            f"{cfg.robot.config_change_cost_deg:g} deg, wrist flip "
+            f"{cfg.robot.wrist_flip_cost_deg:g} deg - the point count and the program "
+            "shape will differ from a 'direct' run on the same part")
+
+    if cfg.stroke.plan_mode != "standard":
+        say(f"plan mode '{cfg.stroke.plan_mode}': tilted seed family on "
+            f"{int(cfg.stroke.side_scan_azimuths) * 2} axes every "
+            f"{cfg.stroke.side_scan_spacing_mm:g} mm, joint envelope "
+            f"{cfg.robot.joint_span_fraction:g} of span with "
+            f"{cfg.robot.joint_margin_deg:g} deg margin, a band priced at "
+            f"{cfg.stroke.stroke_corner_cost:g} corner(s) - more of the part is swept, "
+            "at the cost of point count and of riding the joint limits")
+
+    if cfg.fast.enabled:
+        say(f"FAST run: {', '.join(cfg.fast.layers) or 'preset'}; "
+            f"{cfg.target.sample_grid_mm:g} mm grid, face {cfg.target.face}, sight lines "
+            f"{'NOT ' if cfg.fast.no_occlusion else ''}modelled - these numbers describe "
+            "the SHAPE of the path, not an acceptance result")
 
     try:
         description = _station_description(args, parser)
@@ -95,20 +160,49 @@ def run(args, parser: argparse.ArgumentParser) -> int:
 
 
 def _apply_overrides(cfg, args, parser: argparse.ArgumentParser):
-    """Apply the flags that are not part of the configuration file merge."""
-    if args.coverage_target is None:
-        return cfg
-    raw = str(args.coverage_target).strip().lower()
-    if raw in ("none", "null", ""):
-        value = None
-    else:
-        try:
-            value = float(raw)
-        except ValueError:
-            parser.error(f"--coverage-target takes a percentage or 'none', not "
-                         f"{args.coverage_target!r}")
-            return cfg
-    return override(cfg, target={"coverage_target_pct": value})
+    """Apply the flags that are not part of the configuration file merge.
+
+    Order matters and is documented in the log: the JSON file goes on first (in
+    `load_config`), the route style next, the fast preset after it, and an explicit
+    `--coverage-target` last, so the most specific thing said on the command line always wins.
+    """
+    if args.fast_grid is not None and not args.fast:
+        parser.error("--fast-grid only means something with --fast")
+    if args.no_occlusion and not args.fast:
+        parser.error("--no-occlusion only means something with --fast: switching sight "
+                     "lines off is only honest inside a run that says it is fast")
+    if getattr(args, "route_style", None):
+        cfg = route_preset(cfg, args.route_style)
+    if getattr(args, "plan_mode", None):
+        # A separate axis from the route style, and applied first: the mode decides WHICH
+        # items are selected, the style decides how they are connected, so an explicit
+        # --stroke-corner-cost below still wins over the mode's own price.
+        cfg = plan_preset(cfg, args.plan_mode)
+    if getattr(args, "stroke_corner_cost", None) is not None:
+        # After the route preset, so an explicit flag wins over whatever a style names -
+        # this is a site's own judgement about how much of the tail it wants swept, not
+        # part of a route's shape. `override` validates, and the ValueError it raises is
+        # reported by the same handler that reads the configuration file.
+        cfg = override(cfg, stroke={"stroke_corner_cost": float(args.stroke_corner_cost)})
+    if args.fast:
+        grid = FAST_SAMPLE_GRID_MM if args.fast_grid is None else float(args.fast_grid)
+        if grid < FAST_MIN_SAMPLE_GRID_MM:
+            parser.error(f"--fast-grid must be at least {FAST_MIN_SAMPLE_GRID_MM:g} mm; "
+                         f"{grid:g} mm would cost the same time as an accurate run")
+        cfg = fast_preset(cfg, grid=grid, no_occlusion=bool(args.no_occlusion))
+    if args.coverage_target is not None:
+        raw = str(args.coverage_target).strip().lower()
+        if raw in ("none", "null", ""):
+            value = None
+        else:
+            try:
+                value = float(raw)
+            except ValueError:
+                parser.error(f"--coverage-target takes a percentage or 'none', not "
+                             f"{args.coverage_target!r}")
+                return cfg
+        cfg = override(cfg, target={"coverage_target_pct": value})
+    return cfg
 
 
 def _station_description(args, parser: argparse.ArgumentParser) -> StationDescription:

@@ -16,5 +16,6 @@
 | [viewer.md](viewer.md) | 单文件 3D 视图的图层、视场锥与采样点查询、扫描路径回放。 |
 | [prior-work.md](prior-work.md) | 原项目 ViewPathPlaning 的致谢与本仓库相对它的改动对照表。 |
 | [tech-stack.md](tech-stack.md) | 全项目技术栈：运行时、依赖分层、算法与数值技术、数据格式、工程链路。 |
+| [history/](history/) | 三个分支（A `modelbase3-update` / B `joint-audit-and-config` / C `joint-direct-connector`）的合并记录：[merge-notes.md](history/merge-notes.md) 按阶段写决定与理由，[merge-by-module.md](history/merge-by-module.md) 按模块逐条对照"差在哪、最后用了谁"。 |
 
 私有设计笔记不在本目录的公开部分，也不参与版本控制。

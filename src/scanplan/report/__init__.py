@@ -40,21 +40,40 @@ from ..sheet_split import SheetSplit
 from ..strokes import StrokeCoverage
 from ..target_surface import TargetSet
 from ..tracker import Tracker
+
+#: The report schema the acceptance scripts read. Version 2 changed the MEANING of the
+#: joint-step numbers (literal values the program writes, per instruction kind) rather
+#: than adding a key, which is exactly why a version is needed.
+REPORT_SCHEMA_VERSION = 2
+
 from ..viewpoints import (  # noqa: F401  (re-exported for the exporters)
     Viewpoint,
     viewpoints_from_path,
     viewpoints_from_selection,
 )
-from .coverage import angle_diversity_block, cluster_points, coverage_block
+from .approach import approach_block
+from .coverage import (
+    angle_diversity_block,
+    cluster_points,
+    coverage_block,
+    coverage_layers_block,
+)
 from .definition import (
     PLACEHOLDERS_NOTE,
-    SCOPE_NOTE,
     TRACKER_CAVEAT,
     definition_block,
+    fast_block,
     placeholders_block,
     provenance,
+    route_block,
+    scope_note,
 )
-from .kinematics import budget_block, kinematics_block, surface_profile_block
+from .kinematics import (
+    budget_block,
+    failure_attribution_block,
+    kinematics_block,
+    surface_profile_block,
+)
 from .program import program_block
 from .strokes import stroke_block, write_strokes_json
 from .summary import summary_lines, summary_text
@@ -63,8 +82,11 @@ from .writers import plain, write_report
 
 __all__ = [
     "Viewpoint",
+    "approach_block",
     "build_report",
     "cluster_points",
+    "coverage_layers_block",
+    "failure_attribution_block",
     "summary_lines",
     "summary_text",
     "viewpoints_from_path",
@@ -86,19 +108,42 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
                  swept_coverage_pct: float | None = None,
                  pose_only_coverage_pct: float | None = None,
                  runtime: dict | None = None, log=None) -> dict:
-    """The report that has to accompany any viewpoint set (spec 7.2)."""
+    """The report that has to accompany any viewpoint set (spec 7.2).
+
+    `kinematics` is the run's `KinematicGate` when one was in force. It is read twice: for
+    the joint figures, and as the gate the uncovered-sample attribution must ask, so that
+    "the arm cannot hold that pose" is named as such instead of being reported as "a
+    candidate exists but was not selected".
+    """
     say = log or (lambda _message: None)
+    coverage_stats = coverage_block(config=config, model=model, station=station,
+                                    target=target, coverage=coverage, selection=selection,
+                                    gate=kinematics, say=say)
     report = {
+        # The report is a contract with the tools that read it (the exporter, the viewer,
+        # the acceptance scripts). Bump this whenever a block's meaning changes, not only
+        # when a key is added: a report that still says `max_step_deg` but now means the
+        # literal file value is not the same schema.
+        "schema_version": REPORT_SCHEMA_VERSION,
         **definition_block(config=config, target=target, split=split, coverage=coverage),
+        "part_winding": station.winding,
         "viewpoints": len(viewpoints),
         "viewpoints_greedy": sum(1 for vp in viewpoints if vp.source == "greedy"),
         "viewpoints_repair": sum(1 for vp in viewpoints if vp.source == "repair"),
         "viewpoints_transition": sum(1 for vp in viewpoints if vp.role != "coverage"),
-        **coverage_block(config=config, model=model, station=station, target=target,
-                         coverage=coverage, selection=selection, say=say),
+        **coverage_stats,
+        # The same question at three levels, and what was lost at each. Reported separately
+        # because one number cannot say whether the gap is the selection, the connector or
+        # the arm.
+        "coverage_layers": coverage_layers_block(config=config, coverage=coverage,
+                                                 selection=selection, path=path),
+        "failure_attribution": failure_attribution_block(
+            config, path, coverage_stats["uncovered_by_reason"]),
         "program": program_block(config, viewpoints, path),
+        "approach": approach_block(config=config, station=station, target=target,
+                                   viewpoints=viewpoints, path=path),
         "stroke_plan": stroke_block(strokes, path, swept_coverage_pct,
-                                    pose_only_coverage_pct),
+                                    pose_only_coverage_pct, config),
         "angle_diversity": angle_diversity_block(coverage, selection.chosen, path),
         "kinematics": kinematics_block(config, viewpoints, path, kinematics),
         "budget": budget_block(config, path),
@@ -109,7 +154,9 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
             "name": None, "position_mm": None,
             "note": "no tracker pose supplied: the tracker constraint was not applied",
         },
-        "scope": SCOPE_NOTE,
+        "scope": scope_note(config),
+        "fast_mode": fast_block(config),
+        "route": route_block(config),
         "tracker_caveat": TRACKER_CAVEAT,
         "placeholders_note": PLACEHOLDERS_NOTE,
         "placeholders": placeholders_block(config, tracker),
@@ -117,6 +164,8 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
         "evaluation": dict(coverage.counters),
         "alignment_checks": checks,
         "runtime": {"seconds": (runtime or {}).get("seconds"),
-                    "ray_backend": (runtime or {}).get("ray_backend", backend_name())},
+                    "ray_backend": (runtime or {}).get("ray_backend", backend_name()),
+                    "fast": config.fast.enabled},
     }
     return plain(report)
+

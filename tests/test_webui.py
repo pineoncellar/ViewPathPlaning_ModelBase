@@ -50,8 +50,13 @@ def test_the_page_defaults_come_from_the_shipped_configuration():
     config = scanweb._public_config()
     assert config["delivery_mode"] == "stroke"
     assert config["surface_bias"] == pytest.approx(0.5)
-    assert config["robot_enabled"] is False
+    assert config["coverage_target_pct"] == pytest.approx(90.0)
+    assert "robot_enabled" not in config, "the joint gate stopped being a page choice"
     assert config["motion"] in ("J", "L")
+    # The page labels the speed choice with these, so they must describe the same run.
+    assert config["sample_grid_mm"] > 0
+    assert config["fast_grid_mm"] > config["sample_grid_mm"]
+    assert config["fast_min_grid_mm"] <= config["fast_grid_mm"]
     assert set(config["parameter_sources"]) == {
         "stroke.min_gain_mm2_per_step", "stroke.min_stroke_mm", "stroke.seed_dirs",
         "stroke.order_axis_weight_mm_per_deg", "stroke.parallel_weight",
@@ -178,6 +183,190 @@ def test_delivery_mode_reaches_the_planner_not_only_the_exporter():
     assert _delivery_config({"delivery_mode": "pose"}).stroke.enabled is False
     with pytest.raises(ValueError, match="delivery mode"):
         _delivery_config({"delivery_mode": "fast"})
+
+
+def test_the_page_offers_a_fast_run_next_to_the_delivery_mode():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="fastMode"' in page
+    assert 'value="accurate"' in page
+    assert 'value="fast" selected' in page, "the 10 mm grid is what the panel starts on"
+    assert 'id="fastNoOcclusion"' in page
+    assert "不能当验收依据" in page
+    # Fast starts selected, so the sub-option cannot start disabled or it would look
+    # unavailable until the operator switched away and back.
+    assert '<input id="fastNoOcclusion" type="checkbox">' in page
+
+
+def test_fast_reaches_the_planner_through_the_same_preset_the_cli_uses():
+    """Not a second copy of the numbers: the page goes through `fast_preset`."""
+    from scanplan.config import FAST_SAMPLE_GRID_MM
+    from scanweb import _delivery_config
+
+    accurate = _delivery_config({})
+    assert accurate.fast.enabled is False
+
+    fast = _delivery_config({"fast": True})
+    assert fast.fast.enabled is True
+    assert fast.target.sample_grid_mm == FAST_SAMPLE_GRID_MM
+    assert fast.fast.no_occlusion is False
+    # This job already asks for one face, so the preset must not claim that saving.
+    assert fast.fast.layers == ("sample_grid",)
+    assert fast.target.face == accurate.target.face
+
+
+def test_fast_combines_with_the_pose_only_delivery_mode():
+    from scanweb import _delivery_config
+
+    both = _delivery_config({"delivery_mode": "pose", "fast": True})
+    assert both.stroke.enabled is False
+    assert both.fast.enabled is True
+
+
+def test_the_page_no_longer_offers_a_joint_gate_switch():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="robotGate"' not in page
+    # the explanation stays on screen, because what the gate does still has to be visible
+    assert "关节限位筛选" in page and "始终开启" in page
+    # the hint has to say what changes, because the gate can remove coverage
+    assert "kinematics" in page
+
+
+def test_the_page_offers_a_coverage_target_with_an_unlimited_option():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="coverageTarget"' in page
+    assert 'id="coverageTargetNone"' in page
+    assert "不设上限" in page
+    # the hint has to say that the target also stops the refinement, which is the whole
+    # reason the leftover areas look the way they do
+    assert "二次瞄准" in page
+
+
+def test_the_advanced_panel_holds_the_recipe_and_starts_collapsed():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    # One fold for everything an operator sets once per part, so the panel keeps showing the
+    # few things they touch on every run.
+    assert '<details class="advanced-config" id="advancedConfig">' in page
+    assert '<details class="advanced-config" id="advancedConfig" open' not in page
+    for control in ("scanMode", "fastMode", "fastNoOcclusion", "planMode", "routeStyle",
+                    "coverageTarget", "coverageTargetNone", "strokeCornerCost"):
+        assert f'id="{control}"' in page
+    # Folded away or not, the header has to say which recipe is armed; the readout is filled
+    # from the controls themselves so the two cannot drift apart.
+    assert 'id="advancedReadout"' in page
+    # The panel starts on the measured recipe, not on the configuration's identity presets.
+    assert 'value="banded" selected' in page
+    assert 'value="tidy" selected' in page
+    assert 'id="coverageTarget" type="number" value="99"' in page
+
+
+def test_the_recipe_the_panel_starts_on_is_a_plan_the_server_accepts():
+    from scanweb import SITE_DEFAULTS, _delivery_config
+
+    recipe = _delivery_config(dict(SITE_DEFAULTS))
+    assert recipe.stroke.plan_mode == "banded"
+    assert recipe.stroke.route_style == "tidy"
+    assert recipe.stroke.connector == "straight-then-lateral"
+    assert recipe.stroke.stroke_corner_cost == pytest.approx(2.0)
+    assert recipe.target.coverage_target_pct == pytest.approx(99.0)
+    assert recipe.fast.enabled is True
+    assert recipe.stroke.enabled is True
+    # The page is told to start there instead of on the configuration's own defaults, and
+    # the two stay separate: the CLI still plans `standard` unless asked otherwise.
+    assert scanweb._public_config()["defaults"] == SITE_DEFAULTS
+    assert _delivery_config({}).stroke.plan_mode == "standard"
+
+
+def test_the_coverage_target_reaches_the_planner_and_can_be_switched_off():
+    from scanweb import _delivery_config
+
+    shipped = _delivery_config({})
+    assert shipped.target.coverage_target_pct == pytest.approx(90.0), "the shipped value"
+    assert _delivery_config({"coverage_target_pct": 100}).target.coverage_target_pct == 100.0
+    assert _delivery_config(
+        {"coverage_target_pct": "97.5"}).target.coverage_target_pct == pytest.approx(97.5)
+    # null and the empty form field both mean "run until nothing new is covered"
+    assert _delivery_config({"coverage_target_pct": None}).target.coverage_target_pct is None
+    assert _delivery_config({"coverage_target_pct": ""}).target.coverage_target_pct is None
+    for bad in (0, -1, 101, "abc"):
+        with pytest.raises(ValueError, match="覆盖率目标"):
+            _delivery_config({"coverage_target_pct": bad})
+
+
+def test_the_joint_gate_is_always_on_and_cannot_be_switched_off_from_the_page():
+    """The gate is forced on: a plan the arm cannot hold has no use on site."""
+    from scanweb import _delivery_config
+
+    on = _delivery_config({})
+    assert on.robot.enabled is True, "on even though the configuration ships it off"
+    # a leftover key from an old saved setup must not be able to switch it back off
+    assert _delivery_config({"robot_gate": False}).robot.enabled is True
+    # the envelope is the configuration's, untouched by the page
+    assert on.robot.soft_limits_deg == _delivery_config({}).robot.soft_limits_deg
+    assert on.robot.mechanical_limits_deg == _delivery_config({}).robot.mechanical_limits_deg
+
+
+def test_the_page_can_choose_the_route_style_and_omitting_it_keeps_the_file():
+    from scanweb import _delivery_config
+
+    default = _delivery_config({})
+    assert default.stroke.route_style == "direct"
+    assert default.stroke.connector == "direct-then-lift"
+
+    tidy = _delivery_config({"route_style": "tidy"})
+    assert tidy.stroke.connector == "straight-then-lateral"
+    assert tidy.robot.config_change_cost_deg == 240.0
+
+    # The key is absent from a saved setup written before the control existed, and from any
+    # payload that does not include it: that must plan exactly what it planned before.
+    assert _delivery_config({}).stroke == default.stroke
+
+
+def test_an_unknown_route_style_from_the_page_is_refused():
+    from scanweb import _delivery_config
+
+    with pytest.raises(ValueError, match="route_style"):
+        _delivery_config({"route_style": "neat"})
+
+
+def test_no_occlusion_is_only_honoured_inside_a_fast_run():
+    from scanweb import _delivery_config
+
+    assert _delivery_config({"fast": True, "fast_no_occlusion": True}).fast.no_occlusion
+    ignored = _delivery_config({"fast": False, "fast_no_occlusion": True})
+    assert ignored.fast.enabled is False
+    assert ignored.fast.no_occlusion is False
+
+
+def test_the_downloadable_report_carries_the_fast_warning(tmp_path):
+    """The HTML outlives the screen it was made on, so the warning is in the file."""
+    from types import SimpleNamespace
+
+    registration = SimpleNamespace(
+        frame_label="robot_uframe_1",
+        cad_points=[np.zeros(3)], measured_points=[np.zeros(3)],
+        residuals_mm=[np.zeros(3)], rms_error_mm=0.0, max_error_mm=0.0,
+    )
+    report = {"coverage_pct": 99.0, "viewpoints": 1, "target_points": 10,
+              "uncovered_points": 0, "face": "upper", "uncovered_by_reason": {}}
+    fast = {"enabled": True, "sample_grid_mm": 10.0, "occlusion_modelled": False,
+            "layers": ["sample_grid", "no_occlusion"]}
+    body = scanweb._write_planning_report(
+        tmp_path / "fast.html", run_id="r1", prog_name="PART01",
+        report=dict(report, fast_mode=fast), registration=registration,
+        face_axis=np.array([0.0, 0.0, 1.0]), downloads=[],
+    ).read_text(encoding="utf-8")
+    assert "快速模式" in body and "不能作为验收依据" in body
+
+    calm = scanweb._write_planning_report(
+        tmp_path / "calm.html", run_id="r2", prog_name="PART01",
+        report=dict(report, fast_mode={"enabled": False}), registration=registration,
+        face_axis=np.array([0.0, 0.0, 1.0]), downloads=[],
+    ).read_text(encoding="utf-8")
+    assert "快速模式" not in calm
 
 
 def test_a_stroke_plan_is_exported_as_delivered_and_flown_as_configured():
@@ -595,3 +784,184 @@ def test_the_page_shows_server_stages_instead_of_a_time_curve():
     # The old estimator saturated at 99% after a minute and looked stuck; it must not
     # come back as the primary source.
     assert "Math.exp(-seconds / 26)" not in script
+
+# --- saved setups ----------------------------------------------------------
+#
+# The point of a setup is that a restart costs one click instead of a re-import plus a
+# re-pick, so these tests are about the round trip: the same meshes, the same points on
+# them, and the same typed coordinates come back, and saving twice under one name means
+# the second save, not two half-configurations.
+
+
+def setup_stl_bytes(box_mesh) -> str:
+    return base64.b64encode(box_mesh.export(file_type="stl")).decode("ascii")
+
+
+def a_setup(point: float = 1.0, *, name: str = "PART01") -> dict:
+    return {
+        "name": name,
+        "setup": {
+            "point_count": 3,
+            "cad_points_vehicle_mm": [[point, 0.0, 0.0], [100.0, 0.0, 0.0],
+                                      [0.0, 80.0, 0.0]],
+            "measured_points_mm": [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"]],
+            "scan_face_axis": "-Y",
+            "uframe": 0,
+            "error_limit_mm": "2.5",
+            "prog_name": "PART01",
+            "run_name": name,
+            "delivery_mode": "pose",
+            "fast": "fast",
+            "fast_no_occlusion": True,
+            "coverage_target_pct": 97.5,
+            "route_style": "tidy",
+            "plan_mode": "banded",
+            "stroke_corner_cost": 1.5,
+        },
+    }
+
+
+def test_a_saved_setup_returns_the_meshes_and_the_picks(tmp_path, monkeypatch):
+    from scanweb import load_setup, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    support = trimesh.creation.box(extents=[20.0, 20.0, 20.0])
+    payload = a_setup()
+    payload["setup"]["model_names"] = {"part": "零件v2.stl", "support": "夹具.stl"}
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(support)},
+                         "support": {"stl_base64": setup_stl_bytes(support)}}
+    saved = save_setup(payload)
+    assert saved["models"] == ["part", "support"]
+
+    restored = load_setup("PART01")
+    assert restored["setup"]["cad_points_vehicle_mm"][0] == [1.0, 0.0, 0.0]
+    assert restored["setup"]["measured_points_mm"][1] == ["4", "5", "6"]
+    assert restored["setup"]["scan_face_axis"] == "-Y"
+    assert restored["setup"]["uframe"] == 0
+    assert restored["setup"]["delivery_mode"] == "pose"
+    assert restored["setup"]["fast"] == "fast"
+    assert restored["setup"]["fast_no_occlusion"] is True
+    assert restored["setup"]["coverage_target_pct"] == pytest.approx(97.5)
+    # The route style survives a save/restore, or an operator who picked it has to remember
+    # to pick it again every time the program restarts.
+    assert restored["setup"]["route_style"] == "tidy"
+    # Same for the rest of the advanced panel: it is where the sweeps-vs-stops recipe lives,
+    # so losing it on restart would silently plan the part a different way.
+    assert restored["setup"]["plan_mode"] == "banded"
+    assert restored["setup"]["stroke_corner_cost"] == pytest.approx(1.5)
+    assert "robot_gate" not in restored["setup"], "the switch is gone, not just defaulted"
+    # The names the operator picked, so a restore shows the same files, not `part.stl`.
+    assert restored["setup"]["model_names"] == {"part": "零件v2.stl", "support": "夹具.stl"}
+    # The bytes are what the picks were made against, so they must come back identical.
+    assert base64.b64decode(restored["models"]["part"]["stl_base64"]) \
+        == base64.b64decode(payload["models"]["part"]["stl_base64"])
+    assert "base" not in restored["models"]
+
+
+def test_saving_the_same_name_replaces_the_previous_setup(tmp_path, monkeypatch):
+    from scanweb import _setup_list, load_setup, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    payload = a_setup(1.0)
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+    payload = a_setup(9.0)
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+
+    assert len(_setup_list()) == 1
+    assert load_setup("PART01")["setup"]["cad_points_vehicle_mm"][0] == [9.0, 0.0, 0.0]
+
+
+def test_a_setup_describes_exactly_the_meshes_it_was_saved_with(tmp_path, monkeypatch):
+    from scanweb import _setup_dir, load_setup, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    payload = a_setup()
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)},
+                         "support": {"stl_base64": setup_stl_bytes(box)},
+                         "base": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+    assert (_setup_dir("PART01") / "base.stl").is_file()
+
+    payload = a_setup()
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)},
+                         "support": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+    # A part removed from the page must not come back from the previous save.
+    assert not (_setup_dir("PART01") / "base.stl").is_file()
+    assert set(load_setup("PART01")["models"]) == {"part", "support"}
+
+
+def test_a_name_that_is_not_a_run_id_still_gets_its_own_folder(tmp_path, monkeypatch):
+    """Chinese names are normal here, and two of them must not collide."""
+    from scanweb import _setup_dir, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    for name in ("一号件", "A B", "A_B"):
+        payload = a_setup(name=name)
+        payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)}}
+        save_setup(payload)
+    assert _setup_dir("一号件") != _setup_dir("A B")
+    assert _setup_dir("A B") != _setup_dir("A_B")
+    # A Chinese name stays readable on disk instead of collapsing to a hash.
+    assert "一号件" in _setup_dir("一号件").name
+    assert _setup_dir("PART01") == (tmp_path / "output" / "web_runs" / "setups"
+                                    / "PART01").resolve()
+
+
+def test_a_malformed_setup_is_refused_rather_than_stored(tmp_path, monkeypatch):
+    from scanweb import save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    models = {"part": {"stl_base64": setup_stl_bytes(box)}}
+
+    bad_count = a_setup()
+    bad_count["setup"]["point_count"] = 5
+    with pytest.raises(ValueError, match="point_count"):
+        save_setup({**bad_count, "models": models})
+
+    bad_axis = a_setup()
+    bad_axis["setup"]["scan_face_axis"] = "+A"
+    with pytest.raises(ValueError, match="scan_face_axis"):
+        save_setup({**bad_axis, "models": models})
+
+    bad_point = a_setup()
+    bad_point["setup"]["cad_points_vehicle_mm"] = [[1.0, 2.0]]
+    with pytest.raises(ValueError, match="cad_points_vehicle_mm"):
+        save_setup({**bad_point, "models": models})
+
+    with pytest.raises(ValueError, match="方案名称"):
+        save_setup({"name": "  ", "setup": a_setup()["setup"], "models": models})
+
+
+def test_deleting_a_setup_removes_its_folder(tmp_path, monkeypatch):
+    from scanweb import delete_setup, load_setup, save_setup
+
+    monkeypatch.chdir(tmp_path)
+    box = trimesh.creation.box(extents=[10.0, 10.0, 10.0])
+    payload = a_setup()
+    payload["models"] = {"part": {"stl_base64": setup_stl_bytes(box)}}
+    save_setup(payload)
+
+    assert delete_setup("PART01") is True
+    assert delete_setup("PART01") is False
+    with pytest.raises(ValueError, match="没有名为"):
+        load_setup("PART01")
+
+
+def test_the_page_offers_saving_and_restoring_a_setup():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+    script = (Path(scanweb.__file__).parent / "app.js").read_text(encoding="utf-8")
+
+    for element in ("setupSelect", "saveSetup", "loadSetup", "deleteSetup"):
+        assert 'id="' + element + '"' in page
+    assert "/api/setup/list" in script
+    assert "/api/setup/save" in script
+    assert "/api/setup?name=" in script
+    # The meshes travel with the save: without them a restart still needs a re-import.
+    assert "stl_base64" in script

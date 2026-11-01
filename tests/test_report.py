@@ -12,15 +12,19 @@ viewpoint records carry exactly the field names the export contract expects.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from scanplan.candidates import generate
+from scanplan.config import RobotParams
 from scanplan.coverage import attribute_uncovered, evaluate
+from scanplan.kinematics import KinematicGate
 from scanplan.report import (
     build_report,
     cluster_points,
+    coverage_layers_block,
     summary_lines,
     viewpoints_from_selection,
     write_report,
@@ -78,6 +82,15 @@ def test_the_headline_numbers_are_at_the_top_level(planned):
     assert pytest.approx(report["coverage_pct"], abs=0.05) == planned["selection"].coverage_pct
     assert (report["viewpoints_greedy"] + report["viewpoints_repair"]
             == len(planned["viewpoints"]))
+
+
+def test_the_report_always_names_the_route_style(planned):
+    """Two styles give the same part different programs, so the file has to say which ran -
+    otherwise a figure from one is later compared with the other as if it were a regression."""
+    route = planned["report"]["route"]
+    assert route["style"] == planned["config"].stroke.route_style
+    assert route["connector"] == planned["config"].stroke.connector
+    assert "caveat" in route
 
 
 def test_report_states_what_it_does_not_model(planned):
@@ -176,10 +189,175 @@ def test_the_connector_route_mix_is_reported_only_for_a_real_path(planned):
     assert report["program"]["ordering"].startswith("planner order of single poses")
 
 
+def test_the_three_coverage_levels_are_reported_separately(planned):
+    """One number cannot say whether the gap is the selection, the connector or the arm."""
+    layers = planned["report"]["coverage_layers"]
+    assert layers["geometric_pool_pct"] >= layers["delivered_pct"]
+    assert layers["gaps_pct"]["pool_to_delivered"] >= 0.0
+    # this fixture delivers single poses with no path, so the third level is UNKNOWN - and
+    # that is what it must say, not a copy of the second
+    assert layers["execution_verified"] is False
+    assert layers["execution_verified_pct"] is None
+    assert "no claim about the arm" in layers["execution_note"]
+
+
+def test_with_a_path_but_no_arm_the_third_level_points_at_the_switch(planned):
+    from scanplan.path import BranchAssignment, PathPlan
+
+    path = PathPlan(points=[], joint_planned=False, branches=BranchAssignment())
+    block = coverage_layers_block(config=planned["config"], coverage=planned["coverage"],
+                                  selection=planned["selection"], path=path)
+    assert block["execution_verified"] is False
+    assert "robot.enabled is false" in block["execution_note"]
+
+
+def test_the_console_says_unverified_rather_than_repeating_the_headline(planned):
+    text = "\n".join(summary_lines(planned["report"]))
+    assert "coverage layers" in text
+    assert "execution UNVERIFIED" in text
+
+
+def test_a_joint_planned_path_turns_the_third_level_into_a_number(planned):
+    """With the arm checked, all three levels exist and the last equals the delivered one."""
+    from scanplan.path import BranchAssignment, PathPlan
+
+    config = replace(planned["config"],
+                     robot=replace(planned["config"].robot, enabled=True))
+    path = PathPlan(points=[], joint_planned=True, branches=BranchAssignment())
+    block = coverage_layers_block(config=config, coverage=planned["coverage"],
+                                  selection=planned["selection"], path=path)
+    assert block["execution_verified"] is True
+    assert block["execution_verified_pct"] == block["delivered_pct"]
+    assert block["gaps_pct"]["delivered_to_execution"] == 0.0
+
+
+def test_a_point_the_arm_cannot_hold_invalidates_the_third_level(planned):
+    """A delivered point with no solution means the delivered figure counts unreachable area."""
+    from scanplan.path import BranchAssignment, PathPlan
+
+    config = replace(planned["config"], robot=replace(planned["config"].robot, enabled=True))
+    path = PathPlan(points=[], joint_planned=True,
+                    branches=BranchAssignment(failed=[3]))
+    block = coverage_layers_block(config=config, coverage=planned["coverage"],
+                                  selection=planned["selection"], path=path)
+    assert block["execution_verified"] is False
+    assert "no joint solution" in block["execution_note"]
+
+
+def test_the_program_cost_separates_the_convertible_half_from_the_rest(cfg):
+    """Only the linear half converts to seconds; the joint half stays in degrees.
+
+    Converting degrees to seconds needs a joint speed, and none has been measured on this cell.
+    Reporting only the convertible half would hide the cost of the repositions, so the degrees
+    are reported as degrees and the note says why.
+    """
+    from types import SimpleNamespace
+
+    from scanplan.path import BranchAssignment, PathPlan, PathPoint
+    from scanplan.report.program import program_block
+
+    down = np.array([0.0, 0.0, -1.0])
+
+    def corner(x, motion):
+        return PathPoint(position=np.array([x, 0.0, 0.0]), axis=down, roll_deg=0.0,
+                         role="coverage", source="greedy", stroke_id=0, motion=motion)
+
+    first = SimpleNamespace(joints_deg=(0.0, 0.0, 0.0, 0.0, -60.0, 0.0))
+    second = SimpleNamespace(joints_deg=(0.0, 0.0, 0.0, 0.0, -60.0, 90.0))
+    path = PathPlan(points=[corner(0.0, "J"), corner(100.0, "L"), corner(300.0, "J")],
+                    branches=BranchAssignment(solutions=[first, first, second]))
+    cost = program_block(cfg, [], path)["cost"]
+    assert cost["linear_segments"] == 1 and cost["linear_mm"] == 100.0
+    assert cost["linear_seconds_at_floor_speed"] == pytest.approx(
+        100.0 / cfg.motion.speed_mm_s, abs=0.1)
+    assert cost["joint_segments"] == 1
+    assert cost["joint_move_deg_total"] == pytest.approx(90.0)
+    assert cost["joint_move_deg_worst"] == pytest.approx(90.0)
+    assert "seconds" in cost["note"]
+
+
+def test_the_failure_attribution_keeps_the_three_layers_apart(planned):
+    """Sample losses, item drops and refused primitives are different facts."""
+    block = planned["report"]["failure_attribution"]
+    assert block["sample_reasons"] == planned["report"]["uncovered_by_reason"]
+    assert block["item_drop_reasons"] == {}
+    assert block["connector_primitive_refusals"] == {}
+    assert set(block["layers_note"]) == {"sample_reasons", "item_drop_reasons",
+                                        "connector_primitive_refusals"}
+    assert block["joint_gate_enabled"] is False
+
+
+def _refusing_gate():
+    """A gate over an arm too small to hold any pose in the fixture, so it refuses them all."""
+    params = RobotParams.disabled()
+    return KinematicGate(RobotParams(**{**params.__dict__, "enabled": True,
+                                       "upper_arm_mm": 1.0, "forearm_mm": 2.0,
+                                       "forearm_offset_mm": 1.0}))
+
+
+def test_samples_only_a_joint_infeasible_pose_can_see_are_blamed_on_the_arm(planned):
+    """The report must ask the gate the planner used, or the bucket names the wrong fix.
+
+    Selection is stopped at 1% so plenty of visible samples stay uncovered, and every pose is
+    refused by the gate. None of those samples may then be reported as `candidate_found`,
+    which means "a usable candidate exists and was not picked" - a scoring problem - while
+    the truth here is reachability, whose fix is the arm policy or the layout.
+    """
+    coverage = planned["coverage"]
+    selection = select(coverage, coverage.area_mm2, coverage_target_pct=1.0)
+    report = build_report(config=planned["config"], model=planned["model"],
+                          station=planned["station"], split=planned["split"],
+                          target=planned["target"], coverage=coverage,
+                          selection=selection, viewpoints=[],
+                          kinematics=_refusing_gate())
+    reasons = report["uncovered_by_reason"]
+    assert reasons.get("unreachable_joint_limit", 0) > 0
+    assert reasons.get("candidate_found", 0) == 0
+
+
 def test_the_report_says_which_deliverable_it_is(planned):
     strokes = planned["report"]["stroke_plan"]
     assert strokes["enabled"] is False
     assert "same result v1 produces" in strokes["note"]
+
+
+def test_the_approach_block_is_reported_but_never_screens(planned):
+    """It answers "does this plan ask the arm to come from underneath?" and changes nothing.
+
+    Asserting the second half matters more than the first: a number this close to a
+    constraint will be read as one, so the planner's own output must be identical with and
+    without it.
+    """
+    report = planned["report"]
+    block = report["approach"]
+    assert block["report_only"] is True
+    assert block["poses"]["total"] == len(planned["viewpoints"])
+    for key in ("base_top_z_mm", "part_bottom_z_mm", "clearance_part_to_base_mm"):
+        assert isinstance(block[key], float)
+    target = block["target"]
+    assert 0.0 <= target["area_facing_down_pct"] <= 100.0
+
+    again = build_report(config=planned["config"], model=planned["model"],
+                         station=planned["station"], split=planned["split"],
+                         target=planned["target"], coverage=planned["coverage"],
+                         selection=planned["selection"], viewpoints=planned["viewpoints"])
+    for key in ("coverage_pct", "viewpoints", "uncovered_points", "pool_reach_pct"):
+        assert again[key] == report[key]
+
+
+def test_the_j6_block_counts_the_segments_it_says_it_counts(planned):
+    """The lever arm is derived, the histogram adds up, and the worst step is where it says."""
+    block = planned["report"]["kinematics"]["j6"]
+    tool = np.array(planned["config"].robot.tool_xyz_mm, dtype=float)
+    assert block["lever_arm_mm"] == pytest.approx(float(np.hypot(tool[0], tool[1])), abs=0.01)
+    assert block["cap_deg"] == planned["config"].robot.j6_max_step_deg
+    if not block["available"]:
+        assert "fewer than two" in block["reason"]
+        return
+    assert sum(block["histogram"].values()) == block["segments"]
+    if block["literal_max_at"] is not None:
+        assert 1 <= block["literal_max_at"] <= block["segments"]
+    assert block["dominant_segments"] <= block["segments"]
 
 
 def test_the_summary_ends_with_the_caveat(planned):

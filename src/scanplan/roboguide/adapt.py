@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 
 from scanplan.geometry import scanner_frame
-from scanplan.roboguide import ls, wpr
+from scanplan.roboguide import ls, validate, wpr
 
 _MISSING = object()
 
@@ -53,13 +53,23 @@ def _field(item, key: str, default=_MISSING):
     return value
 
 
-def viewpoints_to_points(viewpoints) -> list[dict]:
+def viewpoints_to_points(viewpoints, *, per_point_config: bool = False) -> list[dict]:
     """Turn the planner's viewpoints into the exporter's point table.
 
     The frame comes from `scanner_frame(axis, roll_deg)`: it is orthonormal with
     determinant +1 and its local +Z is the optical axis (scanner towards part),
     which is exactly the pose contract the `.LS` writer and the UTOOL use. Nothing
     else about the viewpoint survives - reachability is not this module's business.
+
+    `per_point_config` is OFF by default, and what is known about it is narrower than "it is
+    refused". A program whose points carried computed letters (`N U F, 0, 0, 0`) came back from
+    ROBOGUIDE as `ASBN-023 Configuration error` on the first P block; the same file with the
+    constant `N U T, 0, 0, 0` loads and runs. But two later programs that changed the letters
+    PER POINT (`N U T` then `F D T`) both imported cleanly, so the per-point form is not what
+    was refused - the remaining suspicion is that `N U F` itself was wrong for those poses,
+    because every pose ever read on the pendant with J5 in [-9, -124] was labelled `T`. The
+    letters here are now derived from the solved joint values rather than guessed, which is
+    exactly what the old file was not doing. Turn it on to confirm; leave it off to ship.
     """
     items = list(viewpoints)
     if not items:
@@ -84,10 +94,20 @@ def viewpoints_to_points(viewpoints) -> list[dict]:
                 "stroke_id": _field(item, "stroke_id", None),
                 "role": _field(item, "role", "coverage"),
                 # Per-point joint evidence, when the kinematic gate ran. `config` is written
-                # into the P[n] block; `joints_deg` is what a joint-representation point
-                # needs, and is None otherwise.
-                "config": _field(item, "config", None),
+                # into the P[n] block only when the caller asks for it; `joints_deg` is what
+                # a joint-representation point needs, and is None otherwise.
+                "config": (_field(item, "config", None) if per_point_config else None),
                 "joints_deg": _field(item, "joints_deg", None),
+                # Per-point motion and representation. A joint-representation point takes the
+                # controller's choice of solution away, so it is the only way a planned branch
+                # reaches the machine; it also forces a `J` instruction, which is why the two
+                # travel together.
+                "motion": _field(item, "motion", None),
+                "representation": _field(item, "representation", None),
+                # Per-point speed, for a caller that priced one move itself. `adapt.export`
+                # fills it in from `joint_speed_ladder` when it is absent, and never
+                # overwrites one that is already here.
+                "speed": _field(item, "speed", None),
             }
         )
     return wpr.unwrap_wpr(points)
@@ -206,6 +226,90 @@ def _extents(points: list[dict]) -> dict:
     return {"min": xyz.min(axis=0).round(3).tolist(), "max": xyz.max(axis=0).round(3).tolist()}
 
 
+def _price_joint_moves(points: list[dict], *, motion: str, ladder, fallback: str
+                       ) -> tuple[list[dict], dict]:
+    """Give every joint move the speed its own size earns, and account for the result.
+
+    The size of a move is the largest single-axis change from the previous point, which is the
+    same measure `path._joint_step_deg` uses and the same one the report prints. Two points
+    matter and are easy to get wrong:
+
+    * the size must be measured on the JOINT readings actually written, after unwrapping, or a
+      reading of +340 next to one of -20 would be priced as a 360 degree move;
+    * the first move has no predecessor. It takes the ladder's last (slowest) bucket rather
+      than a guess, and the contract says so.
+
+    A point that already carries a speed keeps it: a caller that priced a move deliberately
+    should not have it overwritten by this helper.
+    """
+    buckets = [(limit, float(pct)) for limit, pct in ladder]
+    priced: list[dict] = []
+    counts: dict[str, int] = {}
+    degrees: dict[str, float] = {}
+    unknown = False
+    previous = None
+    for index, point in enumerate(points):
+        point = dict(point)
+        is_joint = (str(point.get("motion") or motion).upper() == "J"
+                    or str(point.get("representation") or "").lower() == "joint")
+        if is_joint and not point.get("speed"):
+            joints = point.get("joints_deg")
+            if joints is None:
+                step = None
+            elif previous is None:
+                step = None
+                unknown = True
+            else:
+                delta = np.abs(np.asarray(joints, dtype=float)
+                               - np.asarray(previous, dtype=float))
+                step = float(delta.max())
+            pct = buckets[-1][1]
+            for limit, speed in buckets:
+                if limit is None or (step is not None and step <= float(limit)):
+                    pct = speed
+                    break
+            text = f"{pct:g}%"
+            point["speed"] = text
+            counts[text] = counts.get(text, 0) + 1
+            degrees[text] = degrees.get(text, 0.0) + (0.0 if step is None else step)
+        if point.get("joints_deg") is not None:
+            previous = point["joints_deg"]
+        priced.append(point)
+    return priced, {"joint_moves": counts, "joint_move_deg_total":
+                    {key: round(value, 1) for key, value in degrees.items()},
+                    "unknown_first_move": unknown, "fallback": str(fallback),
+                    "ladder": [[limit, pct] for limit, pct in buckets]}
+
+
+def _motion_speeds(speed: str, joint_speed: str, stats: dict | None) -> dict:
+    """What speed each part of the program runs at, as a report block.
+
+    Deliberately not a duration. Converting degrees to seconds needs a joint speed in
+    degrees per second, and that has never been measured on this machine; a made-up number
+    would read as a promise.
+    """
+    if stats is None:
+        return {
+            "linear_speed": str(speed),
+            "joint_moves": {"all": f"{joint_speed}"},
+            "ladder": None,
+            "note": ("every joint move runs at one speed; set motion.joint_speed_ladder to "
+                     "price them by size"),
+        }
+    return {
+        "linear_speed": str(speed),
+        "joint_speed_fallback": stats["fallback"],
+        "ladder": stats["ladder"],
+        "joint_moves": stats["joint_moves"],
+        "joint_move_deg_total": stats["joint_move_deg_total"],
+        "unknown_first_move": stats["unknown_first_move"],
+        "note": ("joint speeds are a percentage of the controller's joint speed, chosen by "
+                 "the largest single-axis change of each move; the degrees are the sum of that "
+                 "change per bucket, not a duration. The first move has no predecessor, so it "
+                 "takes the slowest bucket - `unknown_first_move` says whether that happened"),
+    }
+
+
 def _contract_blocks(
     prog_name: str,
     *,
@@ -296,7 +400,10 @@ def _contract_blocks(
             "config_note": (
                 "the CONFIG string hints which posture solution to take; if ROBOGUIDE "
                 "calls a pose unreachable, try another configuration before blaming the "
-                "pose (N/F, T, and the three turn numbers)"
+                "pose (N/F, T, and the three turn numbers). Per-point letters are off "
+                "unless asked for: a program carrying them was refused on load with "
+                "ASBN-023 'Configuration error', so only the constant string above has "
+                "been proven to import on this controller"
             ),
             "comment": _COMMENT,
         },
@@ -326,10 +433,15 @@ def export(
     utool=1,
     motion="J",
     speed="100%",
+    joint_speed="100%",
+    joint_speed_ladder=None,
     termination="FINE",
     config="N U T, 0, 0, 0",
+    per_point_config: bool = False,
     joint_blocks: bool = False,
     order=True,
+    allow_unverified: bool = False,
+    robot_params=None,
 ) -> dict:
     """Write `<NAME>.LS`, `<NAME>_points.csv`, `<NAME>_frame.json` and return the contract.
 
@@ -337,14 +449,26 @@ def export(
     ROBOGUIDE world; it re-expresses every point and defaults the UFRAME to 0,
     because the points then need no UFRAME taught by hand.
 
+    `joint_speed_ladder` prices each joint move by its size: an iterable of
+    `(largest single-axis change in degrees, speed percent)` ending in a `None` limit, as in
+    `motion.joint_speed_ladder`. Absent, every joint move keeps `joint_speed`, which is the
+    behaviour of every program this module wrote before 2026-10-30.
+
     `order=True` is refused for a stroke plan. Re-sorting splits each stroke into two
     unrelated moves, which silently voids the sweep the coverage figure was computed
     for - the kind of error that survives every visual check. Passing `stroke_id`
     through therefore forces the delivered order, and asking for a re-sort is an error
     rather than a silent re-sort.
+
+    `robot_params` is the `RobotParams` the plan was made with, and the joint audit walks the
+    program with it. Without one the audit falls back to `RobotParams.disabled()`, i.e. the
+    dataclass DEFAULTS - which happen to agree with the shipped file, so the omission was
+    invisible until a plan was made in a different envelope: a `banded` run (full span, zero
+    margin) then came back as "25 point(s) would not run (joint_limit)" because the audit was
+    demanding the default 5 degrees of margin inside the default 90% span.
     """
     name = wpr.normalise_prog_name(prog_name)
-    points = viewpoints_to_points(viewpoints)
+    points = viewpoints_to_points(viewpoints, per_point_config=per_point_config)
 
     strokes = {point["stroke_id"] for point in points if point["stroke_id"] is not None}
     if strokes and order:
@@ -385,6 +509,13 @@ def export(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if joint_speed_ladder is not None:
+        points, speed_stats = _price_joint_moves(points, motion=motion,
+                                                 ladder=joint_speed_ladder,
+                                                 fallback=joint_speed)
+    else:
+        speed_stats = None
+
     ls_text = ls.build_ls(
         points,
         prog_name=name,
@@ -392,11 +523,34 @@ def export(
         utool=utool,
         motion=motion,
         speed=speed,
+        joint_speed=joint_speed,
         termination=termination,
         config=config,
         comment=_COMMENT,
         joint_blocks=joint_blocks,
     )
+    # Stage 5's gate: the file is audited BEFORE a byte of it is written.  Two independent
+    # checks on purpose - `check_points` re-walks the program with its own Robot (no planner
+    # cache, no planner switch), `check_config_hints` reads the CONFIG column against the
+    # joints it claims to describe.
+    #
+    # The joint walk is a REFUSAL only when the file claims joint evidence.  A pose-only
+    # delivery has no joints to contradict: reachability there is decided in ROBOGUIDE by
+    # design (see README's scope note), so refusing it would silently retire a documented
+    # workflow.  The CONFIG column is always checked, because it is written either way.
+    audit = validate.check_points(points, default_motion=motion, params=robot_params)
+    hints = validate.check_config_hints(points)
+    claims_joints = any(point.get("joints_deg") is not None for point in points)
+    refusals = list(hints["failures"]) + (list(audit["failures"]) if claims_joints else [])
+    if refusals and not allow_unverified:
+        sample = "; ".join(
+            f"P[{item['point']}] {item['reason']}"
+            + (f" ({item['detail']})" if item.get("detail") else "")
+            for item in refusals[:5])
+        raise ValueError(
+            f"refusing to write {name}.LS: {len(refusals)} point(s) would not run "
+            f"({sample}{', ...' if len(refusals) > 5 else ''}). Pass allow_unverified=True "
+            "only to produce a file for review, never for the cell")
     ls_path = out_dir / f"{name}.LS"
     csv_path = out_dir / f"{name}_points.csv"
     frame_path = out_dir / f"{name}_frame.json"
@@ -424,6 +578,15 @@ def export(
     )
     contract["program"]["termination"] = str(termination).upper()
     contract["program"]["strokes"] = sorted(strokes) if strokes else []
+    contract["program"]["motion_speeds"] = _motion_speeds(speed, joint_speed, speed_stats)
+    contract["joint_audit"] = {
+        "ok": audit["ok"] and hints["ok"],
+        "refused": bool(refusals),
+        "allowed_by_override": bool(refusals) and bool(allow_unverified),
+        "joint_side": audit,
+        "config_column": hints,
+    }
+    contract["delivery_check"] = audit
     with frame_path.open("w", encoding="utf-8") as handle:
         json.dump(contract, handle, indent=2)
 
@@ -446,3 +609,4 @@ def export(
             )
 
     return contract
+

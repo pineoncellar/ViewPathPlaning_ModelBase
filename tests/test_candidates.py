@@ -14,7 +14,8 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from scanplan.candidates import aim_indices, dedupe, generate, ladder, refine
+from scanplan.candidates import aim_indices, cap, dedupe, generate, ladder, refine
+from scanplan.policies import DiscreteRolls, LockedRolls
 from scanplan.config import load_config
 from scanplan.scanner_model import ScannerPose
 from scanplan.target_surface import sample_face
@@ -47,7 +48,8 @@ def test_every_aim_point_gets_the_full_distance_tilt_roll_ladder(
         flat_plate, params_placeholder):
     points, normals = grid_samples(flat_plate, 100.0)
     aims = aim_indices(points, params_placeholder.aim_grid_mm)
-    poses = generate(points, normals, params_placeholder, seed=0)
+    poses = generate(points, normals, params_placeholder, seed=0,
+                     policy=DiscreteRolls())
     assert len(aims) > 1
     assert len(poses) == len(aims) * expected_ladder_length(params_placeholder)
     assert {round(pose.roll_deg, 1) for pose in poses} == set(params_placeholder.rolls_deg)
@@ -69,7 +71,8 @@ def test_the_zero_tilt_pose_gets_both_rolls(params_placeholder):
     # prefers.
     point = np.array([[10.0, 10.0, 0.7]])
     normal = np.array([[0.0, 0.0, 1.0]])
-    poses = generate(point, normal, params_placeholder, seed=0)
+    poses = generate(point, normal, params_placeholder, seed=0,
+                     policy=DiscreteRolls())
     head_on = [pose for pose in poses if np.allclose(pose.axis, [0.0, 0.0, -1.0])]
     assert {pose.roll_deg for pose in head_on} == set(params_placeholder.rolls_deg)
     assert len(head_on) == (len(params_placeholder.distances_mm)
@@ -84,7 +87,8 @@ def test_the_two_rolls_cover_different_samples_on_a_wide_target(params_placehold
                      for y in range(-460, 461, 20)], dtype=float)
     normals = np.tile([0.0, 0.0, 1.0], (len(wide), 1))
     head_on = [pose for pose in ladder(np.zeros(3), np.array([0.0, 0.0, 1.0]),
-                                       params_placeholder)
+                                          params_placeholder,
+                                          policy=DiscreteRolls())
                if np.allclose(pose.axis, [0.0, 0.0, -1.0])
                and pose.position[2] == params_placeholder.standoff_mm]
     assert len(head_on) == len(params_placeholder.rolls_deg)
@@ -137,7 +141,8 @@ def test_a_default_pool_is_capped_by_the_configuration(flat_plate, params_tight)
 def test_refine_aims_at_the_leak_and_stays_unique(params_placeholder):
     leak_points = np.array([[10.0, 10.0, 0.7], [180.0, 180.0, 0.7]])
     leak_normals = np.tile([0.0, 0.0, 1.0], (2, 1))
-    poses = refine(leak_points, leak_normals, params_placeholder, seed=0)
+    poses = refine(leak_points, leak_normals, params_placeholder, seed=0,
+                   policy=DiscreteRolls())
     assert len(poses) > 0
     assert len({pose.key() for pose in poses}) == len(poses)
     near_first = [pose for pose in poses
@@ -149,7 +154,8 @@ def test_refine_dedupes_leak_points_that_share_a_cell(params_placeholder):
     # a couple of millimetres apart, well inside the refinement grid: one ladder, not two
     leak_points = np.array([[10.0, 10.0, 0.7], [11.0, 12.0, 0.7]])
     leak_normals = np.tile([0.0, 0.0, 1.0], (2, 1))
-    poses = refine(leak_points, leak_normals, params_placeholder, seed=0)
+    poses = refine(leak_points, leak_normals, params_placeholder, seed=0,
+                   policy=DiscreteRolls())
     assert len(poses) == expected_ladder_length(params_placeholder)
 
 

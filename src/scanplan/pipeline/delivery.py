@@ -26,6 +26,13 @@ from .ranking import _rank_plan
 # never remove anything, which would make the stage pointless by construction.
 PRUNE_TARGET_PCT = 99.0
 
+# How far ABOVE the requirement a selection may sit before pruning is allowed to touch it.
+# The greedy pass stops the moment it crosses the target, so its overshoot is under one item
+# and removal from there can only undershoot. Shaving a set that already sits at the target
+# cost 3.9 points of coverage on the 2026-10-28 station (99.04% selected -> 92.06% delivered)
+# without a single drop being reported, so the guard is not cosmetic.
+PRUNE_SLACK_PCT = 0.5
+
 
 def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
                     model: ScannerModel, gate, kin=None) -> StrokeBuilder | None:
@@ -39,6 +46,33 @@ def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
     if cfg.stroke.max_stroke_mm <= 0.0:
         return None
     return StrokeBuilder(target.samples, station, model, cfg, visible=gate, gate=kin)
+
+
+def _prune_to_target(items: list[Stroke], item_sets: list[np.ndarray],
+                     item_rows: list[int], combined: CoverageResult,
+                     cfg: PlannerConfig, limit_pct: float,
+                     say) -> list[int]:
+    """Which items survive pruning, or all of them when the selection is already at target.
+
+    The guard exists because pruning is only meaningful on an OVERSHOOT. When the selected
+    set already sits within `PRUNE_SLACK_PCT` of the requirement, removing anything takes
+    coverage away from an answer that was already acceptable - and it does so silently,
+    because nothing was "dropped" by the hard gate and the report has no field for it.
+    """
+    if not items or float(combined.target_area_mm2) <= 0.0:
+        return list(range(len(items)))
+    area = np.asarray(combined.area_mm2, dtype=float)
+    seen = np.zeros(int(combined.n_targets), dtype=bool)
+    for row in item_rows:
+        seen[combined.sets[int(row)]] = True
+    selected_pct = 100.0 * float(area[seen].sum()) / float(combined.target_area_mm2)
+    if selected_pct <= limit_pct + PRUNE_SLACK_PCT:
+        say(f"  pruning skipped: the selection sits at {selected_pct:.2f}%, within "
+            f"{PRUNE_SLACK_PCT:g} of the {limit_pct:g}% requirement")
+        return list(range(len(items)))
+    return prune(items, item_sets, list(range(len(items))), combined.area_mm2,
+                 combined.target_area_mm2, target_pct=limit_pct,
+                 max_rounds=cfg.stroke.max_prune_rounds)
 
 
 def _group_selection(combined: CoverageResult, coverage: CoverageResult,
@@ -55,12 +89,23 @@ def _group_selection(combined: CoverageResult, coverage: CoverageResult,
     into a search over one number instead of a re-run at a coarser resolution. `tie` breaks
     exact area ties by joint room, and `weight` is the skeleton preference - both are None
     unless the caller has a reason, so the default path is unchanged.
+
+    `stroke.stroke_corner_cost` is the one price in here that is a PREFERENCE rather than a
+    count, and it is the only lever that decides how much of the part is swept instead of
+    stopped on. One stop covers one footprint; a sweep costs a second stop for whatever the
+    band length adds. At the true count (2.0) a band shorter than about twice a footprint
+    loses to the two poses that would cover the same area, which is arithmetically correct
+    and is not what a scanning cell is bought for - so the count is exposed and a site can
+    decide how much of the tail it wants swept. It never changes what is deliverable, only
+    which of two covering answers is chosen.
     """
     stop = float(cfg.stroke.stop_cost_mm)
     transition = float(cfg.stroke.transition_corners_estimate)
     n_poses = len(coverage.poses)
     if cfg.stroke.cost_model == "corners":
-        costs = [1.0 + transition] * n_poses + [2.0 + transition] * len(stroke_cov.strokes)
+        band = float(getattr(cfg.stroke, "stroke_corner_cost", 2.0))
+        costs = ([1.0 + transition] * n_poses
+                 + [band + transition] * len(stroke_cov.strokes))
     else:
         costs = ([stop] * n_poses
                  + [stroke.length_mm + stop for stroke in stroke_cov.strokes])
@@ -169,13 +214,11 @@ def _one_delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[i
             items.append(stroke_cov.strokes[int(row) - n_poses])
 
     target_pct = cfg.target.coverage_target_pct
-    kept = prune(items, item_sets, list(range(len(items))), combined.area_mm2,
-                 combined.target_area_mm2,
-                 target_pct=PRUNE_TARGET_PCT if target_pct is None else target_pct,
-                 max_rounds=cfg.stroke.max_prune_rounds)
+    limit_pct = PRUNE_TARGET_PCT if target_pct is None else target_pct
+    kept = _prune_to_target(items, item_sets, item_rows, combined, cfg, limit_pct, say)
     if len(kept) < len(items):
         say(f"  pruning: {len(items)} selected items -> {len(kept)} while staying at "
-            f"{(PRUNE_TARGET_PCT if target_pct is None else target_pct):g}%")
+            f"{limit_pct:g}%")
     kept_rows = [item_rows[index] for index in kept]
     path = build_path([items[index] for index in kept], cfg=cfg, station=station,
                       model=model, coverage_index=lambda index: kept_rows[index],
@@ -241,8 +284,18 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
         path.violations.append(
             f"the hard gate removed {len(rejected)} item(s) with no legal connector; "
             "the selection was re-run without them")
-    if kin is not None and kin.active and path.points:
-        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg))
+    if kin is not None and kin.active and path.points and not path.joint_planned:
+        # Only when `build_path` did not do it. It does, whenever the gate is on: the joint
+        # state has to be known BEFORE the connector can be checked, so it is decided there.
+        # Re-running the assignment here would override per-point motion and representation
+        # with a second choice made after the corners were already committed.
+        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg),
+                                     j6_weight=float(cfg.robot.j6_weight),
+                                     j6_cap=getattr(cfg.robot, "j6_max_step_deg", None),
+                                     j6_travel=float(getattr(cfg.robot,
+                                                             "j6_travel_weight", 0.0)),
+                                     config_change_cost_deg=float(
+                                         cfg.robot.config_change_cost_deg))
         path.branches = assignment
         path.max_step_deg = assignment.max_step_deg
         if assignment.failed:
@@ -462,3 +515,4 @@ def _rebuild_selection(combined: CoverageResult, rows, sources: dict[int, str],
         coverage_area_mm2=float(area[covered].sum()),
         target_area_mm2=combined.target_area_mm2,
         sources=np.array(labels, dtype=object))
+

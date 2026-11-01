@@ -3,8 +3,10 @@
 Every module that has to know what a line of sight meets - the sheet split, the
 coverage calculation, the tracker - goes through here, so the decision between
 Embree and trimesh's own intersector is made exactly once. Embree is roughly
-three orders of magnitude faster, but it is an optional extra: when it is missing
-the planner still runs, only slowly.
+three orders of magnitude faster, but only Embree is optional: `rtree` is a hard
+requirement, because trimesh 3.12.7's own intersector builds a triangle bounds
+tree as well. Without `rtree` neither path runs, so a missing one is reported
+here rather than several frames down inside trimesh.
 
 Two things earn this module its own file rather than a helper:
 
@@ -22,6 +24,7 @@ location anyway.
 
 from __future__ import annotations
 
+import importlib
 import sys
 from collections.abc import Mapping
 
@@ -31,7 +34,18 @@ DEFAULT_CHUNK = 250_000
 
 
 def _fallback_intersector_class():
-    """trimesh's own intersector: correct, and about 1600x slower."""
+    """trimesh's own intersector: correct, and about 1600x slower.
+
+    It is not dependency-free: `RayMeshIntersector.intersects_id` passes
+    `mesh.triangles_tree`, and building that imports `rtree`. So rtree is checked
+    here and `None` is returned when it is absent, which `RayCaster` turns into a
+    message naming the missing package instead of a traceback inside trimesh.
+    """
+    try:
+        importlib.import_module("rtree")
+    except (ImportError, OSError):
+        return None
+
     from trimesh.ray import ray_triangle
 
     return ray_triangle.RayMeshIntersector
@@ -46,8 +60,6 @@ def _rebuild_ray_bridge():
     intersector. Dropping the cached failure and importing again recovers the fast
     path. Returns None if the bridge really cannot be imported.
     """
-    import importlib
-
     import trimesh.ray
 
     sys.modules.pop("trimesh.ray.ray_pyembree", None)
@@ -66,8 +78,8 @@ def _intersector_class():
         import embreex
         import embreex.mesh_construction
     except (ImportError, OSError, AttributeError):
-        # A missing rtree or an unloadable native library lands here too; the planner
-        # is allowed to be slow, not broken.
+        # No Embree: fall back to trimesh's own intersector, which is slow but
+        # correct. A missing rtree lands here too, and comes back as None.
         return _fallback_intersector_class(), False
 
     # trimesh's bridge looks for a module named `pyembree`; registering embreex under
@@ -107,6 +119,13 @@ class RayCaster:
     """Nearest-hit queries against one mesh, in chunks so memory stays bounded."""
 
     def __init__(self, mesh, chunk: int = DEFAULT_CHUNK):
+        if _INTERSECTOR_CLASS is None:
+            raise RuntimeError(
+                "ray casting needs `rtree`, which is missing from this environment; "
+                "without it even trimesh's own intersector cannot build its triangle "
+                "tree. Install it with `uv sync --extra embree` (that also adds the "
+                "~1600x faster Embree backend) or `uv add rtree`."
+            )
         self.mesh = mesh
         self.chunk = max(1, int(chunk))
         self._intersector = _INTERSECTOR_CLASS(mesh)
@@ -133,6 +152,29 @@ class RayCaster:
             distance[rows] = np.linalg.norm(hits - origins[rows], axis=1)
             triangle[rows] = np.asarray(index_tri, dtype=np.int64)
         return distance, triangle
+
+
+    def hit_count(self, origins, directions) -> np.ndarray:
+        """How many surfaces of the mesh each ray meets, over the whole ray.
+
+        Parity is the point: an odd count means the origin sits INSIDE a closed shell. A
+        ray that misses counts zero, and the intersector stops after `max_hits` - an even
+        number - so a truncated count still reads as "outside", which is the safe direction
+        for a veto that exists to reject poses rather than accept them.
+        """
+        origins, directions = _as_rays(origins, directions)
+        count = np.zeros(len(origins), dtype=np.int64)
+        for start in range(0, len(origins), self.chunk):
+            stop = min(start + self.chunk, len(origins))
+            _index_tri, index_ray = self._intersector.intersects_id(
+                origins[start:stop], directions[start:stop],
+                multiple_hits=True, return_locations=False,
+            )
+            if len(index_ray) == 0:
+                continue
+            count[start:stop] += np.bincount(np.asarray(index_ray, dtype=np.int64),
+                                             minlength=stop - start)
+        return count
 
 
 def nearest_across(casters: Mapping[str, RayCaster], origins, directions,

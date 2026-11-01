@@ -1,4 +1,4 @@
-"""Load the station models and put them into ONE frame.
+﻿"""Load the station models and put them into ONE frame.
 
 The station is part + fixture + base + tracker. All of them must live in a
 single CAD frame before anything else runs, because every later number
@@ -25,6 +25,7 @@ from scipy.spatial import cKDTree
 from .config import read_json
 from .geometry import sample_surface_seeded
 from .raycast import RayCaster
+from .winding import repair_winding
 
 IDENTITY_4X4 = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
                 (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
@@ -89,14 +90,23 @@ class Station:
     base_cloud_mm: np.ndarray
     fixture_tree: cKDTree
     base_tree: cKDTree
+    # What `winding.repair_winding` did to the part, empty when nothing had to be fixed.
+    # Stage 1 owns this: the split, the sampling and the feature mask all read `face_normals`,
+    # so a mis-wound patch poisons every one of them at once.
+    winding: dict = field(default_factory=dict)
     _obstacles: dict[str, Any] | None = field(default=None, init=False, repr=False,
                                               compare=False)
+    # Cached answer to "may the parity test be trusted on this part?"; see `parity_trusted`.
+    _closed: bool | None = field(default=None, init=False, repr=False, compare=False)
 
     def obstacles(self) -> dict[str, RayCaster]:
         """Ray casters for the three meshes, built on first use and kept.
 
         All three block sight lines, so the coverage stage needs them together, and
         building an intersector per call would dominate a real part's runtime.
+
+        Go through :func:`casters_for` rather than calling this directly: that is where a
+        fast run decides not to model sight lines at all.
         """
         if self._obstacles is None:
             self._obstacles = {
@@ -114,6 +124,76 @@ class Station:
         to_fixture = self.fixture_tree.query(points, k=1)[0]
         to_base = self.base_tree.query(points, k=1)[0]
         return np.minimum(to_fixture, to_base)
+
+    def _parity(self, points) -> np.ndarray:
+        """The raw three-axis parity vote, with no trust check."""
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if len(points) == 0:
+            return np.zeros(0, dtype=bool)
+        caster = self.obstacles()["part"]
+        votes = np.zeros(len(points), dtype=np.int64)
+        for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+            directions = np.broadcast_to(np.asarray(axis, dtype=float), points.shape).copy()
+            votes += caster.hit_count(points, directions) % 2
+        return votes >= 2
+
+    def inside_part(self, points) -> np.ndarray:
+        """Whether each point lies inside the part's own material.
+
+        Every delivered point - a scan position as much as a retract or transition corner -
+        has to sit OUTSIDE the part: the head approaches from outside, and a reference point
+        buried in the sheet is a point no controller can fly. Worse, such a pose still
+        "sees" samples through the very material it is inside, so without this veto it earns
+        coverage it could never measure.
+
+        Measured by parity: a ray leaving the point crosses a closed shell an odd number of
+        times exactly when the point started inside it. Three axis-aligned rays vote,
+        because one ray that grazes an edge, runs along a face or leaves through a hole
+        answers wrongly for the whole point, and a single answer would then be believed.
+
+        Refused unless :attr:`parity_trusted`: on a mesh the vote cannot be relied on, this
+        is not "approximately right", it is a coin toss, and a coin toss that vetoes poses
+        costs coverage with nothing to show for it.
+
+        Measurements on the 2026-10-30 part (110k faces, NOT edge-manifold: T-junctions are
+        normal on a tessellated sheet) say what to expect - recall is partial, precision is
+        not. Probes pushed 0.15 mm under a face were called inside 30 % of the time, i.e.
+        the test misses most buried poses; poses pulled 100-300 mm off a face along its own
+        normal were called inside 0 times out of 600, so it does not invent them. A veto can
+        live with the first number and not with the second.
+        """
+        if not self.parity_trusted:
+            raise ValueError(
+                "ray parity cannot be trusted on this part, so 'inside the part' has no "
+                "answer - callers must check `Station.parity_trusted` first"
+            )
+        return self._parity(points)
+
+    @property
+    def parity_trusted(self) -> bool:
+        """Whether `inside_part` may be believed on THIS mesh.
+
+        Parity needs a closed surface, and a tessellated part usually is not edge-manifold:
+        T-junctions where a finely divided face meets a single-quad rim are normal, and they
+        break `is_watertight` while leaving the surface geometrically closed. So the mesh is
+        judged on the only question that matters - eight points on a box well OUTSIDE the
+        part must all come back outside. A mesh that fails that is never asked anything else,
+        and `inside_part_unchecked` in the report says so.
+
+        Cached: the answer cannot change for a mesh this object holds.
+        """
+        if self._closed is None:
+            bounds = np.asarray(self.part.bounds, dtype=float)
+            middle = bounds.mean(axis=0)
+            # One reach for all three axes: on a 0.7 mm sheet the axis-wise span would put a
+            # probe closer to the surface than the tessellation can resolve.
+            reach = 1.5 * float(np.max(bounds[1] - bounds[0]))
+            corners = np.array([middle + reach * np.array(sign)
+                                for sign in ((-1, -1, -1), (-1, -1, 1), (-1, 1, -1),
+                                             (-1, 1, 1), (1, -1, -1), (1, -1, 1),
+                                             (1, 1, -1), (1, 1, 1))])
+            self._closed = not bool(self._parity(corners).any())
+        return self._closed
 
     def nearest_obstacle_point(self, points) -> np.ndarray:
         """The obstacle sample that `clearance_mm` measured the distance to."""
@@ -136,6 +216,21 @@ class Station:
         if kwargs.get("base_plane_mm") is None and self.description.mounting_plane_z_mm:
             kwargs["base_plane_mm"] = self.description.mounting_plane_z_mm
         return check_alignment(self, **kwargs)
+
+
+def casters_for(station: Station, config) -> dict[str, RayCaster]:
+    """The sight-line blockers for this run: the three meshes, or none at all.
+
+    One function because this is the only place the decision is allowed to be made. A
+    fast run (`fast.no_occlusion`) gets an empty mapping, and `measure_mask` already
+    treats that as "nothing blocks": `nearest_across({})` returns infinity for every ray,
+    so `blocked` is all-false and the mask is exactly `geometry_mask`. Nothing else has to
+    know; nothing else may special-case it.
+
+    Not used by `split_sheet`'s mirror pass, which needs real rays to find the two faces
+    of the blank - without that pass there is no target surface to be fast about.
+    """
+    return {} if config.fast.no_occlusion else station.obstacles()
 
 
 def read_transform(values) -> np.ndarray:
@@ -190,8 +285,14 @@ def load_station_description(path: str | Path) -> StationDescription:
     )
 
 
-def load_models(description: StationDescription) -> tuple[trimesh.Trimesh, ...]:
+def load_models(description: StationDescription, *, repair: bool = True
+                ) -> tuple[trimesh.Trimesh, ...]:
     """The three models in the station frame, without the clearance clouds.
+
+    The part comes back with its winding repaired (stage 1) unless `repair=False`, and the
+    repair record is the fourth element - the caller publishes it in the report, because a
+    run that had to flip 39 % of the "upper" face is a run whose coverage number needs that
+    context next to it.
 
     Kept separate from :func:`load_station` because the 3D view needs the meshes only:
     sampling 400k obstacle points to draw a picture would waste the bulk of its runtime.
@@ -201,14 +302,17 @@ def load_models(description: StationDescription) -> tuple[trimesh.Trimesh, ...]:
     fixture = apply_transform(_load_mesh(description.fixture, "fixture"),
                               read_transform(description.transform_fixture))
     base = _load_mesh(description.base, "base")
-    return part, fixture, base
+    winding: dict = {}
+    if repair:
+        part, winding = repair_winding(part)
+    return part, fixture, base, winding
 
 
 def load_station(description: StationDescription, *, cloud_seed: int,
                  fixture_cloud_points: int = 200_000,
                  base_cloud_points: int = 200_000) -> Station:
-    """Load the three models, realign part and fixture, and sample the obstacles."""
-    part, fixture, base = load_models(description)
+    """Load the three models, repair the part's winding, and sample the obstacles."""
+    part, fixture, base, winding = load_models(description)
 
     fixture_cloud = sample_surface_seeded(
         fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)[0]
@@ -218,6 +322,7 @@ def load_station(description: StationDescription, *, cloud_seed: int,
         part=part, fixture=fixture, base=base, description=description,
         fixture_cloud_mm=fixture_cloud, base_cloud_mm=base_cloud,
         fixture_tree=cKDTree(fixture_cloud), base_tree=cKDTree(base_cloud),
+        winding=winding,
     )
 
 
@@ -558,3 +663,4 @@ def _orientation_shares(mesh) -> dict[str, float]:
         shares[f"+{axis.upper()}"] = positive
         shares[f"-{axis.upper()}"] = negative
     return shares
+

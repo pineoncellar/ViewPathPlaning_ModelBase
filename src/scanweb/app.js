@@ -861,6 +861,68 @@ function updateWorkflow() {
 
 /* ---------- registration and planning ---------- */
 
+// 覆盖率目标：勾了「不设上限」或留空都表示 null，也就是选到没有新增覆盖为止。
+// 非法输入原样回传（服务端还会再验一次），这样配准预览不会因为一个填错的数字整片变红；
+// 真正发规划请求前由 requireCoverageTarget() 当场拦下来。
+function coverageTargetInput() {
+  if ($("coverageTargetNone").checked) return null;
+  const raw = $("coverageTarget").value.trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : raw;
+}
+
+function requireCoverageTarget() {
+  const value = coverageTargetInput();
+  if (value === null) return null;
+  if (typeof value !== "number" || value <= 0 || value > 100) {
+    throw new Error("覆盖率目标必须是 0~100 之间的百分数，或勾选「不设上限」");
+  }
+  return value;
+}
+
+function showCoverageTarget(value) {
+  const unlimited = value === null || value === undefined;
+  $("coverageTargetNone").checked = unlimited;
+  $("coverageTarget").disabled = unlimited;
+  if (unlimited) return;
+  const numeric = Number(value);
+  $("coverageTarget").value = Number.isFinite(numeric) ? String(numeric) : String(value);
+}
+
+// 扫描带角价：一条带在选择阶段算几个转角（单点恒为 1）。
+// 越界就原样回传，让服务端拒绝并说明原因，而不是在这里悄悄夹到边界值。
+function strokeCornerCostInput() {
+  const raw = $("strokeCornerCost").value.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : raw;
+}
+
+function requireStrokeCornerCost() {
+  const value = strokeCornerCostInput();
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || value < 1 || value > 2) {
+    throw new Error("扫描带角价必须是 1.0 ~ 2.0（1.0 = 一条带按一个位姿算，2.0 = 真实两个转角）");
+  }
+  return value;
+}
+
+// 高级配置默认收起，收起时能读到的只有这一行，所以它必须从控件本身推出来，
+// 不能另写一份文案——两份文案迟早会有一份说谎。
+function renderAdvancedReadout() {
+  const readout = $("advancedReadout");
+  if (!readout) return;
+  const target = coverageTargetInput();
+  readout.textContent = [
+    $("scanMode").value === "pose" ? "纯位姿" : "扫掠带",
+    $("fastMode").value === "fast" ? "快速网格" : "精确网格",
+    $("planMode").value === "banded" ? "扫掠优先" : "标准",
+    $("routeStyle").value === "tidy" ? "整齐" : "直连",
+    target === null ? "覆盖率不限" : "覆盖率 " + target + "%"
+  ].join(" · ");
+}
+
 function payload(includeMeshes) {
   if (state.picked.length !== state.pointCount) {
     throw new Error("请在 3D 模型上依次选取 " + state.pointCount + " 个定位点");
@@ -880,6 +942,12 @@ function payload(includeMeshes) {
     max_registration_error_mm: Number($("errorLimit").value),
     prog_name: program,
     delivery_mode: $("scanMode").value,
+    fast: $("fastMode").value === "fast",
+    fast_no_occlusion: $("fastMode").value === "fast" && $("fastNoOcclusion").checked,
+    route_style: $("routeStyle").value,
+    coverage_target_pct: coverageTargetInput(),
+    stroke_corner_cost: strokeCornerCostInput(),
+    plan_mode: $("planMode").value,
     run_name: runName || undefined,
     run_id: /^[A-Za-z0-9_-]{1,64}$/.test(runName) ? runName : undefined
   };
@@ -1209,6 +1277,9 @@ async function solve() {
   if (state.solving) return;
   try {
     payload(false);
+    // 覆盖率目标和扫描带角价都在发请求前就验一遍：填错了不该等到传完模型才失败
+    requireCoverageTarget();
+    requireStrokeCornerCost();
   } catch (error) {
     $("formFeedback").textContent = error.message;
     toast(error.message);
@@ -1318,6 +1389,16 @@ function renderResult(result) {
     ["交付模式", result.delivery_mode === "stroke"
       ? "扫掠模式 · 连续扫描带"
       : "纯位姿模式（旧版）"],
+    ["规划速度", result.fast && result.fast.enabled
+      ? "快速 · " + Number(result.fast.sample_grid_mm).toFixed(0) + " mm 采样 · 遮挡"
+        + (result.fast.occlusion_modelled ? "已建模" : "未建模")
+        + "（数字只描述路径形状，不能当验收依据）"
+      : "精确" + (result.sample_grid_mm
+        ? " · " + Number(result.sample_grid_mm).toFixed(0) + " mm 采样" : "")],
+    ["覆盖率目标", result.coverage_target_pct === null || result.coverage_target_pct === undefined
+      ? "不设上限（一直选到没有新增覆盖为止）"
+      : Number(result.coverage_target_pct).toFixed(1) + " %"],
+    ["关节筛选", "始终开启 · 每点带 CONFIG 与关节解"],
     ["扫描面外法向（整车）", "[" + result.scan_face_axis_vehicle.map((value) => Number(value).toFixed(3)).join(", ") + "]"],
     ["目标面面积", (Number(result.target_face_mm2) / 1e6).toFixed(4) + " m²"],
     ["配准 RMS / 最大误差", result.registration_rms_error_mm.toFixed(3) + " / " + result.registration_max_error_mm.toFixed(3) + " mm"],
@@ -1334,7 +1415,8 @@ function renderResult(result) {
   for (const [label, value] of details) {
     const item = document.createElement("div");
     item.className = "detail-item"
-      + (label === "未覆盖原因" || label === "输出目录" ? " wide" : "");
+      + (label === "未覆盖原因" || label === "输出目录" || label === "规划速度"
+        ? " wide" : "");
     const title = document.createElement("span");
     title.textContent = label;
     const content = document.createElement("b");
@@ -1420,6 +1502,14 @@ function syncSetupFromResult(result) {
   };
   if (result.program_name) $("progName").value = result.program_name;
   if (result.delivery_mode) $("scanMode").value = result.delivery_mode;
+  const wasFast = !!(result.fast && result.fast.enabled);
+  $("fastMode").value = wasFast ? "fast" : "accurate";
+  $("fastNoOcclusion").checked = wasFast && !result.fast.occlusion_modelled;
+  $("fastNoOcclusion").disabled = !wasFast;
+  if (result.coverage_target_pct !== undefined) {
+    showCoverageTarget(result.coverage_target_pct);
+  }
+  renderAdvancedReadout();
   if (Number.isFinite(Number(result.uframe))) {
     $("measureFrame").value = String(Number(result.uframe));
   }
@@ -1676,6 +1766,20 @@ function bindEvents() {
     updateAxisBadge("手动选择：" + AXIS_LABELS[currentAxis()]);
     requestRender();
   });
+  $("fastMode").addEventListener("change", () => {
+    const fast = $("fastMode").value === "fast";
+    $("fastNoOcclusion").disabled = !fast;
+    if (!fast) $("fastNoOcclusion").checked = false;
+  });
+  // 收起状态下那行摘要跟着面板里任何一个控件走，不用逐个控件挂监听。
+  const advanced = $("advancedConfig");
+  if (advanced) {
+    advanced.addEventListener("change", renderAdvancedReadout);
+    advanced.addEventListener("input", renderAdvancedReadout);
+  }
+  $("coverageTargetNone").addEventListener("change", () => {
+    $("coverageTarget").disabled = $("coverageTargetNone").checked;
+  });
   $("measureFrame").addEventListener("change", () => {
     state.registration = null;
     updateSolveAvailability();
@@ -1713,6 +1817,9 @@ function bindEvents() {
   });
   $("solveButton").addEventListener("click", solve);
   $("relocateButton").addEventListener("click", relocate);
+  $("saveSetup").addEventListener("click", saveCurrentSetup);
+  $("loadSetup").addEventListener("click", loadSelectedSetup);
+  $("deleteSetup").addEventListener("click", deleteSelectedSetup);
   $("relocateLimit").addEventListener("input", () => {
     $("errorLimit").value = $("relocateLimit").value;
     state.registration = null;
@@ -2070,25 +2177,267 @@ async function deleteHistoryRun(run) {
   }
 }
 
-// Defaults come from the configuration the server will actually run, so the screen and
-// the plan cannot disagree about which deliverable is being asked for. The page keeps
-// working if the endpoint is unavailable: its own default stays in place.
-async function applyServerDefaults() {
+/* ---------- saved setups ---------- */
+
+// A setup is the whole on-site configuration: the three meshes, the points picked on the
+// model, and the coordinates typed for them. It exists so restarting the server to change
+// the algorithm does not cost a re-import plus a re-pick - which is exactly the loop the
+// joint-model work runs in. The meshes travel as bytes because the browser has no path to
+// give; the server copies them beside the JSON.
+
+function setupName() {
+  return $("runName").value.trim() || $("progName").value.trim().toUpperCase();
+}
+
+function currentSetup() {
+  return {
+    point_count: state.pointCount,
+    cad_points_vehicle_mm: state.picked.slice(0, state.pointCount),
+    measured_points_mm: state.measured.slice(0, state.pointCount),
+    scan_face_axis: currentAxis(),
+    uframe: $("measureFrame").value,
+    error_limit_mm: $("errorLimit").value,
+    prog_name: $("progName").value.trim().toUpperCase(),
+    run_name: $("runName").value.trim(),
+    delivery_mode: $("scanMode").value,
+    fast: $("fastMode").value,
+    fast_no_occlusion: $("fastNoOcclusion").checked,
+    route_style: $("routeStyle").value,
+    coverage_target_pct: coverageTargetInput(),
+    stroke_corner_cost: strokeCornerCostInput(),
+    plan_mode: $("planMode").value,
+    model_names: {
+      part: state.models.part ? state.models.part.sourceName : "",
+      support: state.models.support ? state.models.support.sourceName : "",
+      base: state.models.base ? state.models.base.sourceName : ""
+    }
+  };
+}
+
+async function refreshSetups(keep) {
+  const select = $("setupSelect");
+  if (!select) return;
+  const wanted = keep || select.value;
   try {
+    const response = await fetch("/api/setup/list");
+    const body = await response.json();
+    const setups = (body && body.setups) || [];
+    select.replaceChildren();
+    if (!setups.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "（尚未保存方案）";
+      select.append(option);
+      return;
+    }
+    for (const setup of setups) {
+      const option = document.createElement("option");
+      option.value = setup.name;
+      const saved = setup.saved_at ? " · " + String(setup.saved_at).replace("T", " ").slice(0, 19) : "";
+      option.textContent = setup.name + " · " + (setup.models || []).length + " 模型 · P"
+        + (setup.point_count || 3) + saved;
+      select.append(option);
+    }
+    if (wanted && [...select.options].some((option) => option.value === wanted)) select.value = wanted;
+  } catch (_error) {
+    /* the panel keeps working without the list */
+  }
+}
+
+async function saveCurrentSetup() {
+  const name = setupName();
+  if (!name) {
+    toast("先填写「本次运行名称」或 LS 程序名，用它作为方案名");
+    return;
+  }
+  if (!state.models.part || !state.models.support) {
+    toast("至少导入零件与夹具之后再保存方案");
+    return;
+  }
+  $("saveSetup").disabled = true;
+  try {
+    await prepareMeshPayload();
+    const models = {};
+    for (const kind of ["part", "support", "base"]) {
+      if (state.models[kind] && state.models[kind].base64) {
+        models[kind] = { stl_base64: state.models[kind].base64 };
+      }
+    }
+    const response = await fetch("/api/setup/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, setup: currentSetup(), models })
+    });
+    const body = await response.json();
+    if (!response.ok || !body.ok) throw new Error(body.error || "保存方案失败");
+    await refreshSetups(name);
+    toast("方案「" + name + "」已保存");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    $("saveSetup").disabled = false;
+  }
+}
+
+async function loadSelectedSetup() {
+  const name = $("setupSelect").value;
+  if (!name) {
+    toast("先选择一个已保存的方案");
+    return;
+  }
+  $("loadSetup").disabled = true;
+  try {
+    const response = await fetch("/api/setup?name=" + encodeURIComponent(name));
+    const body = await response.json();
+    if (!response.ok || !body.ok) throw new Error(body.error || "读取方案失败");
+    const record = body.setup || {};
+    const saved = record.setup || {};
+    const models = record.models || {};
+
+    state.picked = [];
+    state.registration = null;
+    state.autoFace = false;
+    $("pickAxis").classList.remove("active");
+    for (const kind of ["part", "support", "base"]) {
+      const payload = models[kind];
+      if (!payload || !payload.stl_base64) continue;
+      const names = saved.model_names || {};
+      const fileName = names[kind] || (kind + ".stl");
+      const file = new File([base64ToBuffer(payload.stl_base64)], fileName,
+        { type: "model/stl" });
+      await loadModel(kind, file);
+    }
+    // Only now the picks: importing the part clears them and re-recommends the axis.
+    state.pointCount = Number(saved.point_count) === 4 ? 4 : 3;
+    document.querySelectorAll("[data-point-count]").forEach((button) => {
+      button.classList.toggle("active", Number(button.dataset.pointCount) === state.pointCount);
+    });
+    state.picked = (saved.cad_points_vehicle_mm || []).slice(0, state.pointCount);
+    const rows = saved.measured_points_mm || [];
+    state.measured = Array.from({ length: 4 }, (_, index) => {
+      const row = Array.isArray(rows[index]) ? rows[index] : [];
+      return [0, 1, 2].map((axis) => (row[axis] === undefined || row[axis] === null ? "" : String(row[axis])));
+    });
+
+    if (saved.scan_face_axis) $("scanAxis").value = saved.scan_face_axis;
+    if (saved.uframe !== undefined && saved.uframe !== null) {
+      $("measureFrame").value = String(Number(saved.uframe) === 0 ? 0 : 1);
+    }
+    if (saved.error_limit_mm) {
+      $("errorLimit").value = saved.error_limit_mm;
+      $("relocateLimit").value = saved.error_limit_mm;
+    }
+    if (saved.prog_name) $("progName").value = saved.prog_name;
+    if (saved.run_name) $("runName").value = saved.run_name;
+    if (saved.delivery_mode) $("scanMode").value = saved.delivery_mode;
+    $("fastMode").value = saved.fast === "fast" ? "fast" : "accurate";
+    $("fastNoOcclusion").disabled = $("fastMode").value !== "fast";
+    $("fastNoOcclusion").checked = $("fastMode").value === "fast" && Boolean(saved.fast_no_occlusion);
+    if ($("routeStyle") && saved.route_style) $("routeStyle").value = saved.route_style;
+    if ($("planMode") && saved.plan_mode) $("planMode").value = saved.plan_mode;
+    if (saved.coverage_target_pct !== undefined) {
+      showCoverageTarget(saved.coverage_target_pct);
+    }
+    if ($("strokeCornerCost") && saved.stroke_corner_cost !== undefined
+        && saved.stroke_corner_cost !== null) {
+      $("strokeCornerCost").value = String(saved.stroke_corner_cost);
+    }
+
+    updateAxisBadge("方案：" + (saved.scan_face_axis ? AXIS_LABELS[saved.scan_face_axis] : "未记录"));
+    renderDatumRows();
+    renderAdvancedReadout();
+    registrationRequest += 1;
+    window.clearTimeout(registrationTimer);
+    fitView();
+    updateSolveAvailability();
+    scheduleRegistrationCheck();
+    toast("已读取方案「" + name + "」");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    $("loadSetup").disabled = false;
+  }
+}
+
+async function deleteSelectedSetup() {
+  const name = $("setupSelect").value;
+  if (!name) {
+    toast("先选择一个已保存的方案");
+    return;
+  }
+  try {
+    const response = await fetch("/api/setup/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    const body = await response.json();
+    if (!response.ok || !body.ok) throw new Error(body.error || "删除方案失败");
+    await refreshSetups("");
+    toast(body.deleted ? "方案「" + name + "」已删除" : "方案「" + name + "」不存在");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+// Defaults come from the server, so the screen and the plan cannot disagree about which
+// deliverable is being asked for. The page keeps working if the endpoint is unavailable:
+// its own default stays in place.
+//
+// Two different things arrive here. `config.*` is the configuration the planner itself
+// will read (the identity presets the CLI and the regression baselines use); the page only
+// uses it for the grid labels on the speed choice. `config.defaults` is the site recipe this
+// panel starts on, which is what the operator sees and what every run posts back; keeping
+// them apart is what lets `banded`/`tidy`/99% be the on-screen start without turning
+// `--plan-mode standard` into a lie.
+function setChoice(id, value) {
+  const control = $(id);
+  if (!control || value === undefined || value === null) return;
+  const allowed = Array.from(control.options).map((option) => option.value);
+  if (allowed.includes(String(value))) control.value = String(value);
+}
+
+async function applyServerDefaults() {  try {
     const response = await fetch("/api/config");
     if (!response.ok) return;
     const config = await response.json();
-    const mode = $("scanMode");
-    if (mode && config.delivery_mode) mode.value = config.delivery_mode;
+    // The labels carry the grid each choice will actually run, so they cannot drift from
+    // the configuration the server holds.
+    const accurate = document.querySelector('#fastMode option[value="accurate"]');
+    if (accurate && config.sample_grid_mm) {
+      accurate.textContent = "精确 · " + Number(config.sample_grid_mm).toFixed(0) + " mm 采样";
+    }
+    const fast = document.querySelector('#fastMode option[value="fast"]');
+    if (fast && config.fast_grid_mm) {
+      fast.textContent = "快速 · " + Number(config.fast_grid_mm).toFixed(0) + " mm 采样（约 2 分钟）";
+    }
+    const defaults = config.defaults || {};
+    setChoice("scanMode", defaults.delivery_mode);
+    if (typeof defaults.fast === "boolean") {
+      $("fastMode").value = defaults.fast ? "fast" : "accurate";
+      $("fastNoOcclusion").disabled = !defaults.fast;
+      if (!defaults.fast) $("fastNoOcclusion").checked = false;
+    }
+    setChoice("planMode", defaults.plan_mode);
+    setChoice("routeStyle", defaults.route_style);
+    // `null` means the selection runs until nothing new is covered.
+    if (defaults.coverage_target_pct !== undefined) {
+      showCoverageTarget(defaults.coverage_target_pct);
+    }
+    if (defaults.stroke_corner_cost !== undefined && defaults.stroke_corner_cost !== null) {
+      $("strokeCornerCost").value = String(defaults.stroke_corner_cost);
+    }
   } catch (_error) {
     /* keep the built-in default */
   }
+  renderAdvancedReadout();
 }
 
 function init() {
   initRenderer();
   bindEvents();
   renderDatumRows();
+  renderAdvancedReadout();
   updateAxisBadge("尚未导入零件");
   updateSolveAvailability();
   showResultState("empty");
@@ -2098,3 +2447,4 @@ function init() {
 window.__scanplan = { state, glState, camera, projectPoint, pickScene };
 init();
 applyServerDefaults();
+refreshSetups();

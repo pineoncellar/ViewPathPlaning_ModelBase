@@ -20,7 +20,8 @@ from .writers import plain
 
 def stroke_block(strokes: StrokeCoverage | None, path: PathPlan | None,
                  swept_coverage_pct: float | None,
-                 pose_only_coverage_pct: float | None) -> dict:
+                 pose_only_coverage_pct: float | None,
+                 config: PlannerConfig | None = None) -> dict:
     """What the stroke stage produced, and which coverage figure is the promise."""
     if strokes is None:
         return {"enabled": False,
@@ -37,6 +38,16 @@ def stroke_block(strokes: StrokeCoverage | None, path: PathPlan | None,
         # stroke - so this is the number of real sweeps, not the number of distinct
         # `stroke_id`s in the path.
         "delivered_strokes": delivered,
+        # How much of the delivered set is swept and how much is stopped on. Bands and stops
+        # are not interchangeable: a band contributes two coverage points, a stop one, so
+        # this pair is what turns "the program has 31 points" into "26 stops and 5 bands".
+        "delivered_stops": (None if path is None
+                            else int(path.coverage_points) - 2 * int(path.coverage_strokes)),
+        # The price the selection charged a sweep. Reported because it decides the split
+        # above, and because it is a preference the site set rather than a measurement - two
+        # runs of the same part are not comparable unless this number matches.
+        "stroke_corner_cost": (float(getattr(config.stroke, "stroke_corner_cost", 2.0))
+                               if config is not None else None),
         "length_mm": ({"min": round(float(lengths.min()), 1),
                        "median": round(float(np.median(lengths)), 1),
                        "max": round(float(lengths.max()), 1)} if len(lengths) else None),

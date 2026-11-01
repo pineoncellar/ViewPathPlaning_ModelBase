@@ -25,6 +25,16 @@ SCOPE_NOTE = (
     "rejected poses back."
 )
 
+FAST_SCOPE_NOTE = (
+    "THIS RUN WAS A FAST RUN, and its numbers are for the shape of the path, not for "
+    "acceptance. What that meant: the target was sampled on {grid:g} mm instead of the "
+    "shipped grid, so the coverage figure is coarser and not comparable with an accurate "
+    "run{extra}. Use it to iterate on the joint model; re-run without --fast before any "
+    "figure is quoted."
+)
+FAST_SCOPE_EXTRA = (", and lines of sight were NOT tested, so a pose may 'cover' a "
+                    "sample through the part or the fixture")
+
 TRACKER_CAVEAT = (
     "The tracker test covers part, fixture and base only. Occlusion by the ROBOT ARM "
     "carrying the scanner is NOT modelled, because there is no robot model at this "
@@ -137,4 +147,83 @@ def provenance(config: PlannerConfig) -> dict:
         "note": ("the unmeasured block is the one to look at before believing a coverage "
                  "figure; max_incidence_deg is the most sensitive of them and "
                  "fov_anchor_distance_mm the one that moves the viewpoint count by ~20%"),
+    }
+
+
+def scope_note(config: PlannerConfig) -> str:
+    """What this run's coverage figure does and does not include.
+
+    A fast run gets its own note rather than a footnote on the accurate one: the whole
+    point of the mode is that its numbers must not be read as acceptance, so the sentence
+    a reader sees first has to say so in its own words.
+    """
+    if not config.fast.enabled:
+        return SCOPE_NOTE
+    extra = FAST_SCOPE_EXTRA if config.fast.no_occlusion else ""
+    return FAST_SCOPE_NOTE.format(grid=config.target.sample_grid_mm, extra=extra)
+
+
+def fast_block(config: PlannerConfig) -> dict:
+    """The machine-readable record that this run was fast, and what that changed.
+
+    Separate from `scope` because a program may read this one: a consumer that finds
+    `enabled: true` can refuse the run instead of parsing prose.
+    """
+    fast = config.fast
+    if not fast.enabled:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "layers": list(fast.layers),
+        "sample_grid_mm": config.target.sample_grid_mm,
+        "face": config.target.face,
+        "occlusion_modelled": not fast.no_occlusion,
+        "caveat": ("fast mode trades accuracy for iteration speed: the coverage figure "
+                   "describes a coarser sample set, and it is not an acceptance result"),
+    }
+
+
+def route_block(config: PlannerConfig) -> dict:
+    """The route style this run used, and the settings it stands for.
+
+    Written unconditionally, unlike `fast_block`: a style is not a degraded mode, so there is
+    no "off" to leave out - and two runs whose programs look different have to be comparable
+    two weeks later, which needs the numbers in the file rather than in someone's memory.
+    """
+    stroke = config.stroke
+    robot = config.robot
+    return {
+        "style": stroke.route_style,
+        "connector": stroke.connector,
+        "joint_connector": bool(stroke.joint_connector),
+        "connector_level": int(stroke.connector_level),
+        "config_change_cost_deg": float(robot.config_change_cost_deg),
+        "wrist_flip_cost_deg": float(robot.wrist_flip_cost_deg),
+        "j6_weight": float(robot.j6_weight),
+        "j6_travel_weight": float(getattr(robot, "j6_travel_weight", 0.0)),
+        "j6_max_step_deg": getattr(robot, "j6_max_step_deg", None),
+        "j6_report_deg": float(getattr(robot, "j6_report_deg", 90.0)),
+        "order_axis_weight_mm_per_deg": float(stroke.order_axis_weight_mm_per_deg),
+        "order_j6_weight_mm_per_deg": float(
+            getattr(stroke, "order_j6_weight_mm_per_deg", 0.0)),
+        # The plan mode is a SEPARATE axis from the route style: it decides which items the
+        # selection may choose from and what they cost, and it is the one that changes how
+        # much of the part is swept. Recorded with the three numbers it stands for, because
+        # "this run used banded" is not comparable with "this run used standard" and the
+        # reader has to be able to see why without opening the configuration.
+        "plan_mode": str(getattr(stroke, "plan_mode", "standard")),
+        "plan_mode_settings": {
+            "side_scan_azimuths": int(getattr(stroke, "side_scan_azimuths", 1)),
+            "side_scan_spacing_mm": float(getattr(stroke, "side_scan_spacing_mm", 0.0)),
+            "side_scan_wall_deg": float(getattr(stroke, "side_scan_wall_deg", 0.0)),
+            "side_scan_max_seeds": int(getattr(stroke, "side_scan_max_seeds", 0)),
+            "stroke_corner_cost": float(getattr(stroke, "stroke_corner_cost", 2.0)),
+            "joint_span_fraction": float(getattr(robot, "joint_span_fraction", 1.0)),
+            "joint_margin_deg": float(robot.joint_margin_deg),
+        },
+        "caveat": ("`direct` and `tidy` exchange point count and program shape, and "
+                   "`standard` and `banded` exchange point count for how much of the part "
+                   "is swept; their coverage figures describe the same target surface but "
+                   "different paths, so a figure from one is not a regression test for the "
+                   "other"),
     }

@@ -1,4 +1,4 @@
-"""Orchestrate the planning stage end to end.
+﻿"""Orchestrate the planning stage end to end.
 
 Order: load and align the station, split the sheet, sample the target, generate
 candidates, evaluate coverage, select, then export the viewpoint set and the
@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 
 from ..candidates import generate
 from ..config import PlannerConfig
+from ..policies import roll_policy
 from ..coverage import CoverageResult, evaluate
 from ..kinematics import KinematicGate
 from ..path import PathPlan
@@ -41,7 +42,7 @@ from ..report import (
     viewpoints_from_selection,
 )
 from ..scanner_model import ScannerModel
-from ..scene import Station
+from ..scene import Station, casters_for
 from ..selection import Selection, select
 from ..sheet_split import SheetSplit, split_sheet
 from ..strokes import StrokeCoverage, combine
@@ -181,7 +182,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
 
     gate = None
     if tracker is not None:
-        obstacles = station.obstacles()
+        obstacles = casters_for(station, cfg)
         gate = lambda positions: visible_mask(tracker, positions, obstacles)  # noqa: E731
 
     # The joint-limit gate. Off by default (`robot.enabled=false`), and when off every call
@@ -193,8 +194,15 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     cand_rep = base.band("candidates", 0.10, 0.22)
     say(f"generating candidates for the {face} face")
     cand_rep(0.0, "aiming the candidate ladder")
+    # Stage 2's two decisions, both here and neither later: the roll convention (slot A)
+    # and the joint gate, applied BEFORE the cap so the budget is not spent on poses the
+    # arm can never hold.  kin.check_pose reads the same memoised verdicts the selection
+    # and the branch assignment use, so the three stages cannot disagree.
+    roll_policy_ = roll_policy(cfg.scanner.roll_mode)
+    keep = kin.check_pose if kin.active else None
     poses = generate(target.samples.points, target.samples.normals, cfg.scanner,
-                     seed=cfg.seed, log=log, progress=cand_rep.tick("aims"))
+                     seed=cfg.seed, log=log, keep=keep, policy=roll_policy_,
+                     progress=cand_rep.tick("aims"))
     cand_rep(1.0, f"{len(poses)} candidates")
 
     occ_rep = base.band("occlusion", 0.22, 0.60)
@@ -296,3 +304,4 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
                       coverage=combined, selection=selection, viewpoints=viewpoints,
                       report=report, checks=checks, tracker=tracker, path=path,
                       strokes=stroke_cov, pose_only_coverage_pct=pose_selection.coverage_pct)
+

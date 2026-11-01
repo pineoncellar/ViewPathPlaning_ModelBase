@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "A FAST RUN. Wear it, do not live in it:",
+    "",
+    "  scanplan plan --station input/station.json --config configs/fast.json --out output/fast",
+    "",
+    "Why it exists: iterating on the joint model needs a path every couple of minutes, not",
+    "every half hour. Measured on the 1.05 m2 real part (2026-10-28, same command, one key",
+    "changed): 3 mm / face auto = 1724 s, 10 mm / face auto = 223 s. Dropping to one face",
+    "halves that again - both changes are in this file.",
+    "",
+    "  sample_grid_mm   3 -> 10   the target is sampled 11x more coarsely, and the coverage",
+    "                             cost is ~ (poses x samples) in both the pose and the stroke",
+    "                             stage. This is the whole speedup; nothing else here is.",
+    "  face             auto -> upper   `auto` plans BOTH faces and keeps the better one, so",
+    "                             it costs double. A fast run does not need that comparison.",
+    "",
+    "What is deliberately NOT here:",
+    "  stroke.check_step_mm / extend_step_mm   they look like an easy 1.5-2.5x, but",
+    "      check_step_mm is also the step the joint screen samples a straight move at,",
+    "      so coarsening it would make the check coarser than the motion it checks.",
+    "  stroke.enabled = false   the J5 over-travel this work is chasing happens ALONG the",
+    "      straight sweep, so a path without sweeps cannot reproduce it.",
+    "  fast.no_occlusion = true   do not turn on by default. It stops testing lines of",
+    "      sight, so a pose can 'cover' a sample through the part. Worth ~10-15% only.",
+    "",
+    "These numbers are for the SHAPE of the path. They are not an acceptance result: the",
+    "report says so in `fast_mode`, in `scope`, and on the console as a FAST MODE line."
+  ],
+  "target": {
+    "sample_grid_mm": 10.0,
+    "face": "upper"
+  },
+  "fast": {
+    "enabled": true,
+    "no_occlusion": false,
+    "layers": ["sample_grid", "single_face"]
+  }
+}
