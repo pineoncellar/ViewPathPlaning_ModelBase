@@ -12,6 +12,7 @@ in three groups:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -33,6 +34,8 @@ from scanplan.path import (
     ConnectorContext,
     PathPlan,
     PathPoint,
+    _arrival,
+    _cartesian_leg,
     _config_penalty,
     assign_branches,
 )
@@ -56,6 +59,14 @@ def test_every_style_has_a_preset_and_no_preset_is_orphaned():
 def test_every_preset_names_a_connector_that_exists():
     for style, table in ROUTE_PRESETS.items():
         assert table["stroke"]["connector"] in CONNECTOR_MODES, style
+
+
+def test_the_tidy_preset_prices_the_wrist_twist_and_direct_leaves_it_alone():
+    """`tidy` is the style that promises a straighter, calmer program, so it pays for the
+    wrist turn; `direct` must stay the identity, and the twist price is a site preference in
+    the same sense `robot.j6_weight` is."""
+    assert ROUTE_PRESETS["tidy"]["stroke"]["order_j6_weight_mm_per_deg"] > 0.0
+    assert "order_j6_weight_mm_per_deg" not in ROUTE_PRESETS["direct"]["stroke"]
 
 
 def test_direct_is_the_shipped_configuration_unchanged():
@@ -170,6 +181,10 @@ class _StubKin:
     def check(self, position, axis, roll_deg):
         return SimpleNamespace(ok=True, reason="", solution=_StubSolution(self.joints))
 
+    def follow(self, joints_start, position, axis, roll_deg, *, step_mm=10.0):
+        """The straight-line walk the connector now uses to earn `LEVEL_STRAIGHT`."""
+        return SimpleNamespace(ok=True, reason="", joints_deg=self.joints)
+
     def sweep_points(self, start, end, step_deg):
         return np.asarray([[60.0, 60.0, 0.0], [60.0, 60.0, 0.0]])
 
@@ -200,6 +215,69 @@ def test_the_tidy_chain_flies_straight_when_nothing_is_in_the_way():
     assert result is not None
     assert result.level == LEVEL_STRAIGHT
     assert result.corners == [] and result.joints == []
+
+
+# ------------------------------------------------------- straight means Cartesian, not joint
+
+
+def _leg(cfg, station, kin, entry=None):
+    previous, default_entry = _pair()
+    return _cartesian_leg(previous, entry if entry is not None else default_entry,
+                          _context(cfg, station, kin))
+
+
+def test_a_clear_line_that_keeps_the_branch_is_a_straight_leg():
+    cfg = route_preset(_config(), "tidy")
+    ok, margin, reason = _leg(cfg, _StubStation(blocked=False), _StubKin())
+    assert ok and reason == ""
+    assert margin == 120.0 - 45.0
+
+
+def test_a_blocked_line_is_not_a_straight_leg():
+    cfg = route_preset(_config(), "tidy")
+    ok, _margin, reason = _leg(cfg, _StubStation(blocked=True), _StubKin())
+    assert not ok and reason == "straight_blocked"
+
+
+def test_a_straight_leg_must_spread_its_rotation_over_the_distance():
+    """An `L` move turns the head as it goes, so the turn has to fit the flight."""
+    cfg = route_preset(_config(), "tidy")
+    previous, entry = _pair()
+    rolled = replace(entry, roll_deg=90.0)
+    ok, _margin, reason = _leg(cfg, _StubStation(blocked=False), _StubKin(), entry=rolled)
+    assert ok, "a 90 deg twist over 200 mm is inside the measured bound"
+    tight = replace(cfg, stroke=replace(cfg.stroke, max_rot_deg_per_mm=0.01))
+    ok, _margin, reason = _leg(tight, _StubStation(blocked=False), _StubKin(), entry=rolled)
+    assert not ok and reason == "straight_rate"
+
+
+def test_a_straight_leg_that_loses_the_branch_on_the_way_is_refused():
+    """Clearance is not reachability: the controller solves every point along the line."""
+
+    class _Lost(_StubKin):
+        def follow(self, joints_start, position, axis, roll_deg, *, step_mm=10.0):
+            return SimpleNamespace(ok=False, reason="branch_lost", joints_deg=self.joints)
+
+    cfg = route_preset(_config(), "tidy")
+    ok, _margin, reason = _leg(cfg, _StubStation(blocked=False), _Lost())
+    assert not ok and reason == "straight_branch_lost"
+
+
+def test_the_arrival_is_written_as_the_instruction_the_connector_proved():
+    """Both halves matter: an `L` where the line was proved, a `J` where it was not."""
+    corner = PathPoint(position=np.zeros(3), axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                       role=ROLE_COVERAGE, source="greedy", motion="J",
+                       representation="joint")
+    straight = _arrival(corner, LEVEL_STRAIGHT)
+    assert (straight.motion, straight.representation) == ("L", "cart")
+    lifted = _arrival(corner, LEVEL_ONE_CORNER)
+    assert (lifted.motion, lifted.representation) == ("J", "joint")
+    joint = _arrival(corner, LEVEL_JOINT)
+    assert joint.motion == "J"
+    # A gate-off run has no motion at all, and must keep the program default it always had.
+    blind = PathPoint(position=np.zeros(3), axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                      role=ROLE_COVERAGE, source="greedy")
+    assert _arrival(blind, LEVEL_STRAIGHT).motion is None
 
 
 def test_the_tidy_chain_sidesteps_perpendicular_to_the_axis_when_blocked():

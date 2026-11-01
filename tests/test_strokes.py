@@ -317,6 +317,36 @@ def test_the_ordering_prices_a_pose_change_and_sorts_like_poses_together(bench, 
     assert ids[0] == ids[1] and ids[2] == ids[3] and ids[0] != ids[2]
 
 
+def test_the_ordering_can_price_the_wrist_twist(cfg):
+    """A wrist turn is a separate cost from a pose change.
+
+    Three items in a row, with J6 readings 0 / 180 / 0: walking them in travel order commands
+    360 degrees of wrist, and the only way to do better is to visit the twisted one FIRST and
+    come back - 100 mm of extra travel for 180 degrees of J6. Nothing in the distance prices
+    that, and neither does the pose change, because the poses are nearly parallel.
+    """
+    items = [horizontal_stroke(-100.0, 100.0, y=float(offset)) for offset in (0.0, 100.0, 200.0)]
+    j6 = np.array([0.0, 180.0, 0.0])
+
+    def twist(order):
+        indices = [index for index, _flip in order]
+        return sum(abs((j6[right] - j6[left] + 180.0) % 360.0 - 180.0)
+                   for left, right in zip(indices, indices[1:], strict=False))
+
+    plain = order_strokes(items, np.zeros(3))
+    assert twist(plain) == 360.0, "travel alone walks straight through the twist"
+    priced = order_strokes(items, np.zeros(3), j6_weight=50.0, j6=j6)
+    assert twist(priced) == 180.0, "which is the least three alternating items allow"
+
+
+def test_a_negative_wrist_twist_price_is_refused(cfg):
+    from scanplan.config import route_preset
+
+    broken = replace(cfg, stroke=replace(cfg.stroke, order_j6_weight_mm_per_deg=-1.0))
+    with pytest.raises(ValueError, match="order_j6_weight_mm_per_deg"):
+        route_preset(broken, "direct")
+
+
 def test_the_group_score_prefers_one_sweep_over_the_poses_it_replaces():
     """`gain / cost` is the mechanism that makes a path out of loose poses."""
     n = 100

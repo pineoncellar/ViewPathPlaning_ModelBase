@@ -301,7 +301,8 @@ def _write_planning_report(path: Path, *, run_id: str, prog_name: str,
             f'{html.escape(str(route.get("style")))}</b>：连接器 '
             f'{html.escape(str(route.get("connector")))}，'
             f'换臂型计价 {float(route.get("config_change_cost_deg") or 0.0):g}°，'
-            f'腕翻转计价 {float(route.get("wrist_flip_cost_deg") or 0.0):g}°。'
+            f'腕翻转计价 {float(route.get("wrist_flip_cost_deg") or 0.0):g}°，'
+            f'排序的 J6 计价 {float(route.get("order_j6_weight_mm_per_deg") or 0.0):g} mm/度。'
             "程序的点数与形状与 <code>direct</code> 档不同，两档的覆盖率<b>不能互相作为"
             "回归基准</b>。</div></section>"
         )

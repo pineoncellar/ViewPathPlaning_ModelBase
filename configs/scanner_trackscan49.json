@@ -156,6 +156,15 @@
     "  order_axis_weight_mm_per_deg  60 deg of pose change costs the same as 120 mm of",
     "                            detour. Distance alone makes a large re-orientation look",
     "                            free, because it is only a short move.",
+    "  order_j6_weight_mm_per_deg    a price per degree of WRIST TWIST on top of that. It is",
+    "                            a separate term because it is a separate cost: two poses a",
+    "                            few degrees apart can still need 180 deg of J6, and J6 is",
+    "                            the axis that slides the scanner sideways - the one",
+    "                            direction the body sphere cannot see. It is also the only",
+    "                            lever that moves J6 when every pose has one solution, which",
+    "                            is what wrist_flip_policy 'T' gives this station.",
+    "                            0.0 = not priced (the pre-2026-11-01 behaviour); `tidy`",
+    "                            expands to 10.",
     "max_prune_rounds 32: the measured run reported '28 -> 28', i.e. pruning was stopped by",
     "the round limit and not by the target. Pruning is pure counting, no rays."
   ],
@@ -187,7 +196,8 @@
     "joint_connector": true,
     "joint_step_deg": 5.0,
     "connector": "direct-then-lift",
-    "route_style": "direct"
+    "route_style": "direct",
+    "order_j6_weight_mm_per_deg": 0.0
   },
 
   "_comment_route_style": [

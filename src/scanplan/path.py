@@ -236,6 +236,8 @@ def _rotation(axis, angle: float) -> np.ndarray:
 def order_strokes(strokes: Sequence[Stroke], start_near, *,
                   max_passes: int = 2,
                   axis_weight: float = 0.0,
+                  j6_weight: float = 0.0,
+                  j6=None,
                   two_opt_limit: int = 40) -> list[tuple[int, bool]]:
     """Order the strokes and choose an end for each: `(index, reversed)` in path order.
 
@@ -256,6 +258,13 @@ def order_strokes(strokes: Sequence[Stroke], start_near, *,
     Distance alone rates a 60 degree re-orientation at whatever the two endpoints happen
     to be apart, which is nothing - so the ordering happily pairs strokes whose poses have
     no relation and pays for it in wrist turns.
+
+    `j6_weight` (mm per degree) prices the WRIST TWIST on top of that, using `j6`: the J6
+    reading each item is entered with. It is a separate term because it is a separate cost -
+    two poses a few degrees apart can need a hundred and eighty degrees of J6, and it is the
+    axis that slides the scanner sideways where the body sphere cannot see. Measured on the
+    2026-11-01 station: travel-only ordering 1353 deg of J6, the shipped order 1056, and
+    `j6_weight = 10` 544 for 8 % more travel.
     """
     count = len(strokes)
     if count == 0:
@@ -266,6 +275,7 @@ def order_strokes(strokes: Sequence[Stroke], start_near, *,
     ends = np.array([np.asarray(stroke.end, dtype=float) for stroke in strokes])
     anchor = np.asarray(start_near, dtype=float).reshape(3)
     gaps = _pose_gaps(strokes) if axis_weight > 0.0 else None
+    twist = None if j6 is None or j6_weight <= 0.0 else np.asarray(j6, dtype=float)
 
     remaining = list(range(count))
     order: list[tuple[int, bool]] = []
@@ -276,7 +286,8 @@ def order_strokes(strokes: Sequence[Stroke], start_near, *,
         for index in remaining:
             for flip in (False, True):
                 entry = ends[index] if flip else starts[index]
-                cost = _edge(entry, cursor, gaps, previous, index, axis_weight)
+                cost = _edge(entry, cursor, gaps, previous, index, axis_weight,
+                             twist, j6_weight)
                 if best is None or cost < best[0]:
                     best = (cost, index, flip)
         _, index, flip = best
@@ -285,13 +296,46 @@ def order_strokes(strokes: Sequence[Stroke], start_near, *,
         previous = index
         remaining.remove(index)
 
-    order = _relocate(order, starts, ends, anchor, max_passes, gaps, axis_weight)
+    order = _relocate(order, starts, ends, anchor, max_passes, gaps, axis_weight,
+                      twist, j6_weight)
     return _two_opt(order, starts, ends, anchor, gaps, axis_weight,
-                    limit=int(two_opt_limit))
+                    limit=int(two_opt_limit), j6=twist, j6_weight=j6_weight)
+
+
+def _twist_deg(j6, first: int, second: int) -> float:
+    """|delta J6| between two items, circularly - the wrist turn the ordering pays for."""
+    if j6 is None:
+        return 0.0
+    delta = float(j6[second]) - float(j6[first])
+    return abs((delta + 180.0) % 360.0 - 180.0)
+
+
+def _item_j6_readings(strokes: Sequence[Stroke], kin, weight: float):
+    """The J6 reading every item would be entered with, and the weight to price it at.
+
+    Returns `(None, 0.0)` - i.e. "do not use the term" - when the weight is off, the gate is
+    off, or ANY item has no solution. A partial table would price half the program and order
+    the other half on travel alone, and the two halves would then disagree about what
+    "near" means; no term at all is the honest alternative.
+
+    One reading per item, taken at the stroke's start pose. The two ends of a sweep share an
+    axis and a roll, so they differ only in where the wrist ends up along it, which is small
+    next to the between-item twist this term exists to avoid.
+    """
+    if weight <= 0.0 or kin is None or not getattr(kin, "active", False):
+        return None, 0.0
+    readings: list[float] = []
+    for stroke in strokes:
+        found = kin.solutions(stroke.start, stroke.axis, float(stroke.roll_deg))
+        if not found:
+            return None, 0.0
+        readings.append(float(np.asarray(found[0].joints_deg, dtype=float)[5]))
+    return np.asarray(readings, dtype=float), float(weight)
 
 
 def _two_opt(order, starts, ends, anchor, gaps, axis_weight: float, *, limit: int = 40,
-             max_passes: int = 8) -> list[tuple[int, bool]]:
+             max_passes: int = 8, j6=None, j6_weight: float = 0.0
+             ) -> list[tuple[int, bool]]:
     """Undo crossings by reversing a run of strokes, flipping each one as it turns round.
 
     A reversed run is still the same physical plan: every stroke inside it is traversed the
@@ -314,6 +358,8 @@ def _two_opt(order, starts, ends, anchor, gaps, axis_weight: float, *, limit: in
                                         - np.asarray(from_point, dtype=float)))
             if gaps is not None and axis_weight > 0.0:
                 cost += axis_weight * float(gaps[from_index, to_index])
+            if j6 is not None and j6_weight > 0.0:
+                cost += j6_weight * _twist_deg(j6, from_index, to_index)
             return cost
 
         improved = False
@@ -357,12 +403,17 @@ def _pose_gaps(strokes: Sequence[Stroke]) -> np.ndarray:
     return gaps
 
 
-def _edge(entry, cursor, gaps, previous: int, index: int, axis_weight: float) -> float:
-    """Travel to reach `entry` plus what the pose change costs, in mm."""
+def _edge(entry, cursor, gaps, previous: int, index: int, axis_weight: float,
+          j6=None, j6_weight: float = 0.0) -> float:
+    """Travel to reach `entry` plus what the pose change and the wrist twist cost, in mm."""
     cost = float(np.linalg.norm(np.asarray(entry, dtype=float) - cursor))
-    if gaps is None or previous < 0:
+    if previous < 0:
         return cost
-    return cost + axis_weight * float(gaps[previous, index])
+    if gaps is not None and axis_weight > 0.0:
+        cost += axis_weight * float(gaps[previous, index])
+    if j6 is not None and j6_weight > 0.0:
+        cost += j6_weight * _twist_deg(j6, previous, index)
+    return cost
 
 
 def _path_endpoints(order, starts, ends, anchor):
@@ -372,9 +423,9 @@ def _path_endpoints(order, starts, ends, anchor):
     return entry, exit_
 
 
-def _connector_length(order, starts, ends, anchor, gaps=None, axis_weight: float = 0.0
-                      ) -> float:
-    """Travel plus pose change along a trial order, in mm - the ordering's objective."""
+def _connector_length(order, starts, ends, anchor, gaps=None, axis_weight: float = 0.0,
+                      j6=None, j6_weight: float = 0.0) -> float:
+    """Travel plus pose change plus wrist twist along a trial order, in mm."""
     entry, exit_ = _path_endpoints(order, starts, ends, anchor)
     if len(order) == 0:
         return 0.0
@@ -384,16 +435,21 @@ def _connector_length(order, starts, ends, anchor, gaps=None, axis_weight: float
         if gaps is not None and axis_weight > 0.0:
             for left, right in zip(order, order[1:], strict=False):
                 total += axis_weight * float(gaps[left[0], right[0]])
+        if j6 is not None and j6_weight > 0.0:
+            for left, right in zip(order, order[1:], strict=False):
+                total += j6_weight * _twist_deg(j6, left[0], right[0])
     return total
 
 
 def _relocate(order, starts, ends, anchor, max_passes: int, gaps=None,
-              axis_weight: float = 0.0) -> list[tuple[int, bool]]:
+              axis_weight: float = 0.0, j6=None, j6_weight: float = 0.0
+              ) -> list[tuple[int, bool]]:
     """Move one stroke at a time to a better slot, either way round, while it helps."""
     if len(order) < 3 or max_passes <= 0:
         return order
     best = list(order)
-    best_cost = _connector_length(best, starts, ends, anchor, gaps, axis_weight)
+    best_cost = _connector_length(best, starts, ends, anchor, gaps, axis_weight,
+                                  j6, j6_weight)
     for _ in range(max_passes):
         improved = False
         for source in range(len(best)):
@@ -403,7 +459,7 @@ def _relocate(order, starts, ends, anchor, max_passes: int, gaps=None,
                 for flip in (item[1], not item[1]):
                     candidate = without[:target] + [(item[0], flip)] + without[target:]
                     cost = _connector_length(candidate, starts, ends, anchor, gaps,
-                                             axis_weight)
+                                             axis_weight, j6, j6_weight)
                     if cost < best_cost - 1e-9:
                         best, best_cost, improved = candidate, cost, True
                         break
@@ -630,13 +686,17 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
     hard = bool(cfg.stroke.hard_gate) if strict is None else bool(strict)
     if start_near is None:
         start_near = np.asarray(strokes[0].start, dtype=float)
+    twist, twist_weight = _item_j6_readings(
+        strokes, kin, float(getattr(cfg.stroke, "order_j6_weight_mm_per_deg", 0.0)))
     order = order_strokes(strokes, start_near,
-                          axis_weight=float(cfg.stroke.order_axis_weight_mm_per_deg))
+                          axis_weight=float(cfg.stroke.order_axis_weight_mm_per_deg),
+                          j6_weight=twist_weight, j6=twist)
     points: list[PathPoint] = []
     solutions: list = []
     plan = PathPlan(points=points, ordering=(
         "nearest neighbour + single-stroke relocation over stroke endpoints, priced by "
-        "travel plus pose change"))
+        "travel plus pose change"
+        + (" plus wrist twist" if twist is not None else "")))
     plan.coverage_strokes = sum(1 for stroke in strokes if stroke.length_mm > _ZERO_MM)
 
     # 状态：定序位姿，不带任何连接几何
@@ -676,6 +736,13 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
                     f"({rotation_text(previous, entry)}, reasons "
                     f"{dict(plan.connector_failures)})")
                 continue
+            if state is not None and routed.level == LEVEL_STRAIGHT:
+                # The connector proved a straight Cartesian line from the previous corner to
+                # this one, so this is the instruction that flies it. Writing `J` here -
+                # which is what every gate-on program did before 2026-11-01 - threw that
+                # proof away: a `J` move interpolates joints, so the TCP arced between the
+                # two sweeps and the wrist unwound whatever J6 the IK happened to pick.
+                entry = _arrival(entry, routed.level)
             for corner, corner_solution in zip(routed.points,
                                                routed.solutions or [None] * len(
                                                    routed.points), strict=True):
@@ -740,6 +807,22 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
         f"{plan.interrupts_b} re-orientations"
         + (f", {len(plan.dropped)} dropped by the hard gate" if plan.dropped else ""))
     return plan
+
+
+def _arrival(point: PathPoint, level: str) -> PathPoint:
+    """The corner written as the instruction the connector actually proved.
+
+    `LEVEL_STRAIGHT` is the connector saying "a straight Cartesian line from here to there is
+    clear, within the turn rate, and keeps the branch" - so the program flies `L`. Every other
+    level inserts corners or falls back to the joint move, and the arrival stays `J`.
+
+    A point with no motion (`motion is None`) is a gate-off run, and it keeps whatever the
+    program default is: that is the byte-for-byte regression profile and this must not touch
+    it.
+    """
+    if point.motion is None or level != LEVEL_STRAIGHT:
+        return point
+    return replace(point, motion="L", representation="cart")
 
 
 def _exit_solution(state: _ItemJoints, robot):
@@ -976,6 +1059,45 @@ def _positions_margin(positions, station: Station, model: ScannerModel, *, visib
     margin = float(station.clearance_mm(stacked).min() - model.body_limit_mm)
     seen = True if visible is None else bool(np.all(visible(stacked)))
     return margin, seen
+
+
+def _cartesian_leg(previous: PathPoint, entry: PathPoint, ctx) -> tuple[bool, float, str]:
+    """Whether the move into `entry` can be flown as a STRAIGHT CARTESIAN line, and why not.
+
+    This is what makes `LEVEL_STRAIGHT` mean something. The connector used to test clearance
+    alone, and the exporter then wrote the arrival as a `J` anyway, so the verification was
+    thrown away and the arm interpolated joints through a path nobody had checked. Now the
+    level decides the instruction, so the level has to be earned:
+
+    `straight_blocked` - the head must fit everywhere along the line and the tracker must
+      keep seeing it.
+    `straight_rate` - an `L` move turns the head AS IT GOES, so the pose change has to be
+      spread over the distance; `stroke.max_rot_deg_per_mm` is a measured lower bound.
+    `straight_*` - a straight line can run out of branch: the controller solves the pose at
+      every intermediate point and alarms when the branch it is on disappears.
+      `KinematicGate.follow` is that test, and it is the same one the stroke walk uses.
+    """
+    cfg = ctx.cfg
+    margin, seen = _segment_margin(previous, entry, cfg, ctx.station, ctx.model,
+                                   visible=ctx.visible)
+    if not (margin > 0.0 and seen):
+        return False, margin, "straight_blocked"
+    length = float(np.linalg.norm(np.asarray(entry.position, dtype=float)
+                                  - np.asarray(previous.position, dtype=float)))
+    rotation = _rotation_deg(previous, entry)
+    if length <= 1e-6:
+        # A "straight line" of zero length is a wrist turn in place, and it has no rate to
+        # be within. Only an unchanged pose may be flown this way.
+        if rotation > _SAME_POSE_DEG:
+            return False, margin, "straight_stationary"
+    elif rotation / length > float(cfg.stroke.max_rot_deg_per_mm):
+        return False, margin, "straight_rate"
+    if ctx.kin is not None and getattr(ctx.kin, "active", False) and ctx.start_joints is not None:
+        verdict = ctx.kin.follow(ctx.start_joints, entry.position, entry.axis,
+                                 entry.roll_deg, step_mm=float(cfg.stroke.check_step_mm))
+        if not verdict.ok:
+            return False, margin, f"straight_{verdict.reason}"
+    return True, margin, ""
 
 
 @dataclass
@@ -1281,9 +1403,8 @@ class ConnectorChain:
         # A pair of identical poses still gets the old straight move when the level allows
         # it; changing that would move the gate-off program, which is the regression profile.
         if limit <= 0 and _same_pose(previous, entry):
-            margin, seen = _segment_margin(previous, entry, cfg, ctx.station, ctx.model,
-                                           visible=ctx.visible)
-            if margin > 0.0 and seen:
+            ok, margin, _reason = _cartesian_leg(previous, entry, ctx)
+            if ok:
                 return ConnectorResult(level=LEVEL_STRAIGHT, margin_mm=margin)
 
         # The lift ladder.  `connector_level` is how far down it may go.
@@ -1353,11 +1474,10 @@ class StraightThenLateral(ConnectorChain):
 
     def connect(self, previous: PathPoint, entry: PathPoint,
                 ctx: ConnectorContext) -> ConnectorResult | None:
-        margin, seen = _segment_margin(previous, entry, ctx.cfg, ctx.station, ctx.model,
-                                        visible=ctx.visible)
-        if margin > 0.0 and seen:
+        ok, margin, reason = _cartesian_leg(previous, entry, ctx)
+        if ok:
             return ConnectorResult(level=LEVEL_STRAIGHT, margin_mm=margin)
-        _note_failure(ctx.plan, "straight_blocked")
+        _note_failure(ctx.plan, reason)
 
         if int(ctx.cfg.stroke.connector_level) >= 1:
             found = _lateral_corner(previous, entry, ctx)

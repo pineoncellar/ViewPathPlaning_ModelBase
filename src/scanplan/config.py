@@ -152,6 +152,10 @@ class StrokeParams:
     * `order_axis_weight_mm_per_deg` prices a pose change in the ordering. Distance alone
       ignores the axis, so two adjacent strokes 60 degrees apart in pose look free to
       travel between and cost a large re-orientation instead.
+    * `order_j6_weight_mm_per_deg` prices the WRIST TWIST in the same cost. It is the only
+      lever that moves J6 on a station where every pose has one solution, because J6 is
+      decided by which pair of strokes the ordering puts next to each other, not by the
+      branch search - see `docs/validation.md` for how to measure it.
 
     The last three belong to the merged coverage/continuity design (2026-10-22):
 
@@ -236,6 +240,23 @@ class StrokeParams:
     # the two sequence prices that make the arm hold one CONFIG family. Written into the
     # report so "why is this program shaped differently" is answerable two weeks later.
     route_style: str = "direct"
+    # What one degree of J6 costs the ordering, in millimetres of travel, on top of the pose
+    # change `order_axis_weight_mm_per_deg` prices. A separate term because it is a separate
+    # cost: two poses a few degrees apart can still need 180 deg of J6, and J6 is the axis
+    # that slides the scanner sideways along the surface - the one direction the 45 mm body
+    # sphere cannot see. Charging only the pose change leaves that out, and the ordering then
+    # zig-zags across the part and spends the wrist on it.
+    #
+    # Measured on the 2026-11-01 station (30 delivered poses, uniform 180-flip parity): the
+    # run's own order cost 1056 deg of J6 with a worst step of 175; travel only 1353; this
+    # term at 10 gives 544 with a worst step of 63 for 8 % more travel, and at 20 gives 409
+    # for 16 % more. The knee is 10-20 because below it the wrist still pays for ordering
+    # errors and above it the search is choosing J6 over the part it has to reach.
+    #
+    # It is the ONLY lever that moves J6 on a station where every pose has one joint
+    # solution: the branch search then has nothing to choose, and `robot.j6_weight` is inert.
+    # 0.0 is "not priced", i.e. the behaviour before 2026-11-01.
+    order_j6_weight_mm_per_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -660,7 +681,7 @@ ROUTE_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
     },
     "tidy": {
         "stroke": {"route_style": "tidy", "connector": "straight-then-lateral",
-                   "joint_connector": True},
+                   "joint_connector": True, "order_j6_weight_mm_per_deg": 10.0},
         "robot": {"config_change_cost_deg": 240.0, "wrist_flip_cost_deg": 1000.0,
                   "j6_weight": 0.5},
     },
@@ -1000,6 +1021,9 @@ def _validate_strokes(stroke: StrokeParams) -> None:
                          "straight move between two identical poses")
     if stroke.order_axis_weight_mm_per_deg < 0.0:
         raise ValueError("'order_axis_weight_mm_per_deg' cannot be negative")
+    if stroke.order_j6_weight_mm_per_deg < 0.0:
+        raise ValueError("'order_j6_weight_mm_per_deg' cannot be negative: it is a price per "
+                         "degree of wrist twist, and 0.0 is 'not priced'")
     if stroke.parallel_weight <= 0.0:
         raise ValueError("'parallel_weight' must be positive: it multiplies the gain of "
                          "the parallel bands, so zero would delete the skeleton")

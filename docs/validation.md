@@ -157,6 +157,9 @@
 | `j6.worst` / `literal_max_at` | 报告 | 最坏单段在哪。和 `over_cap` / `over_report` 对得上才算读对 |
 | `j6.over_cap` | 报告 | 超 `j6_max_step_deg` 的段；出厂配置里这个阈值是 `60.0` |
 | `j6.over_report` | 报告 | 超 `j6_report_deg`（90°）的段，只是点名 |
+| **`j6.physical_total_deg` / `physical_max_deg`** | 报告 | **唯一可比的口径**：它按姿态算，不看指令类型。`literal_*` 只数 `J` 段，一旦大量连接器改成 `L`，它就掉到很小，那不是改进，是没被计数 |
+| 程序里 `J` / `L` 的条数 | 数 `.LS` | 2026-11-01 之后直线连接器写成 `L`，所以 `L` 的占比就是"路线有多直" |
+| `path_length_mm` | 报告 | 排序给 J6 计价会拿它换：实测 J6 减半，绕行 +23% |
 | 兜底日志 | 运行日志 | `point N: roll re-tried to hold the J6 step under 60 deg` = 真的换了滚转 |
 | `branch_histogram` | 报告 | 只有一个键、且计数等于点数 → **每个位姿只有一个解**，权重与加法收费都不会有任何效果 |
 
