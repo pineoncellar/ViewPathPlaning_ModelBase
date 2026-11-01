@@ -245,6 +245,27 @@ def test_the_report_block_records_the_mode_and_the_numbers_it_stands_for():
     assert "banded" in block["caveat"]
 
 
+def test_a_run_report_rebuilds_the_envelope_the_program_was_audited_in():
+    """`relocate_job` has no configuration object, so it reads the envelope off the report."""
+    from scanweb import _robot_params_from_report
+
+    report = {"kinematics": {"envelope": {
+        "usable_limits_deg": [[-180.0, 180.0], [-60.0, 76.0], [-120.0, 180.0],
+                              [-360.0, 360.0], [-125.0, 125.0], [-360.0, 360.0]],
+        "margin_deg": 0.0,
+        "wrist_policy": "T",
+    }}}
+    params = _robot_params_from_report(report)
+    assert params is not None
+    assert params.enabled is True
+    assert params.joint_margin_deg == 0.0
+    assert params.joint_span_fraction == 1.0
+    # limits == usable at span 1.0, so Robot.usable reproduces the recorded band
+    assert tuple(params.soft_limits_deg) == tuple(params.mechanical_limits_deg)
+    assert params.soft_limits_deg[4] == (-125.0, 125.0)
+    assert _robot_params_from_report({}) is None
+
+
 def test_the_shipped_configuration_ships_the_standard_mode():
     """The default has to be the identity, or every stored baseline moves at once."""
     config = _config()

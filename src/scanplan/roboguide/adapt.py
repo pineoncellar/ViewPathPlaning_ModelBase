@@ -441,6 +441,7 @@ def export(
     joint_blocks: bool = False,
     order=True,
     allow_unverified: bool = False,
+    robot_params=None,
 ) -> dict:
     """Write `<NAME>.LS`, `<NAME>_points.csv`, `<NAME>_frame.json` and return the contract.
 
@@ -458,6 +459,13 @@ def export(
     for - the kind of error that survives every visual check. Passing `stroke_id`
     through therefore forces the delivered order, and asking for a re-sort is an error
     rather than a silent re-sort.
+
+    `robot_params` is the `RobotParams` the plan was made with, and the joint audit walks the
+    program with it. Without one the audit falls back to `RobotParams.disabled()`, i.e. the
+    dataclass DEFAULTS - which happen to agree with the shipped file, so the omission was
+    invisible until a plan was made in a different envelope: a `banded` run (full span, zero
+    margin) then came back as "25 point(s) would not run (joint_limit)" because the audit was
+    demanding the default 5 degrees of margin inside the default 90% span.
     """
     name = wpr.normalise_prog_name(prog_name)
     points = viewpoints_to_points(viewpoints, per_point_config=per_point_config)
@@ -530,7 +538,7 @@ def export(
     # delivery has no joints to contradict: reachability there is decided in ROBOGUIDE by
     # design (see README's scope note), so refusing it would silently retire a documented
     # workflow.  The CONFIG column is always checked, because it is written either way.
-    audit = validate.check_points(points, default_motion=motion)
+    audit = validate.check_points(points, default_motion=motion, params=robot_params)
     hints = validate.check_config_hints(points)
     claims_joints = any(point.get("joints_deg") is not None for point in points)
     refusals = list(hints["failures"]) + (list(audit["failures"]) if claims_joints else [])

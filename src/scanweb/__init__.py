@@ -756,6 +756,9 @@ def solve_job(data: dict, progress=None) -> dict:
             prog_name=prog_name,
             uframe=output_uframe,
             utool=int(data.get("utool", 1)),
+            # The plan's own envelope: the audit re-walks the file and must judge it against
+            # the limits the plan was made in, not against the dataclass defaults.
+            robot_params=config.robot,
             **options,
         )
         announce("export", 0.98, "program exported")
@@ -1040,6 +1043,36 @@ def _run_program_name(run_dir: Path) -> str:
     return ""
 
 
+def _robot_params_from_report(report: dict):
+    """The arm parameters a finished run was judged against, rebuilt from its own report.
+
+    A relocation does not re-plan, so there is no configuration object to hand - and the
+    export audit would otherwise walk the file against the dataclass DEFAULTS, i.e. a 5 degree
+    margin inside a 90 % span, which is not the envelope a `banded` run was made in.
+
+    Only the envelope is reconstructed, because that is the only part the audit uses to decide
+    `joint_limit`: the measured geometry, signs and tool all come from the shipped defaults,
+    which are the same numbers the configuration file carries. Set as `limits = usable` with
+    span 1.0 so that `Robot.usable` reproduces the recorded band exactly.
+    """
+    from scanplan.config import RobotParams
+
+    envelope = ((report or {}).get("kinematics") or {}).get("envelope") or {}
+    usable = envelope.get("usable_limits_deg")
+    if not usable:
+        return None
+    band = tuple(tuple(float(value) for value in pair) for pair in usable)
+    return replace(
+        RobotParams.disabled(),
+        enabled=True,
+        mechanical_limits_deg=band,
+        soft_limits_deg=band,
+        joint_span_fraction=1.0,
+        joint_margin_deg=float(envelope.get("margin_deg") or 0.0),
+        wrist_flip_policy=str(envelope.get("wrist_policy") or "T"),
+    )
+
+
 def relocate_job(data: dict, progress=None) -> dict:
     """Move a completed run's path into a corrected field frame - without re-planning.
 
@@ -1206,6 +1239,12 @@ def relocate_job(data: dict, progress=None) -> dict:
         contract = export_ls(moved, output, prog_name=prog_name, uframe=uframe,
                              utool=utool,
                              order=not any(vp.stroke_id is not None for vp in moved),
+                             # The audit re-walks the file, so it has to judge it in the same
+                             # envelope the run was planned in. A relocation does not re-plan,
+                             # so the run's own report is the only record of that envelope -
+                             # without it the audit falls back to the dataclass defaults and
+                             # refuses every pose a wider plan deliberately allowed.
+                             robot_params=_robot_params_from_report(old_report),
                              **options)
         contract["frame"]["axes"] = (
             f"Robot UFRAME {uframe} axes; the delivered path was rigidly moved from the "

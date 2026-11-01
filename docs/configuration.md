@@ -260,6 +260,21 @@ J6 以外的任何轴不得比它替换掉的那一次走得更远、而且**进
 报告里 `route.plan_mode` 与 `route.plan_mode_settings` 记录实际生效值，摘要的 `strokes` 行写
 「几条带 + 几个停点」。
 
+**导出审计必须用同一个包络（2026-11-01 修的第二个缺陷）。** `roboguide.validate.check_points`
+会用自己建的 `Robot` 把整份程序重走一遍才允许落盘，这个检查是对的；但它原来**拿不到运行时的
+`RobotParams`**，只能退回 `RobotParams.disabled()`，也就是数据类默认值（90% 量程 + 5° 余量）——
+那正好是出厂配置，所以这个漏洞一直没暴露。一旦用 `banded`（满量程 + 0° 余量）规划，导出的第一道闸
+就会以 `joint_limit` 拒掉绝大多数点：
+
+```
+refusing to write X11018.LS: 25 point(s) would not run (P[1] joint_limit; ...)
+```
+
+现在 `export(..., robot_params=...)` 把运行时的 `RobotParams` 一路传下去：网页端传的是本次作业的
+`config.robot`（已含模式展开），`scanplan ls` 传的是配置文件里的 `robot` 段。重新导出一次历史跑批时，
+如果那次跑批用的不是 `standard`，要么给它**同一份含 `plan_mode` 的配置**，要么显式加
+`--plan-mode banded`——否则审计仍会按标准包络判，拒得没错，但拒的不是你要的东西。
+
 ### 路线风格：`direct` 与 `tidy`
 
 两条扫描带之间怎么飞，有两种主张，差别就在**第一个动作**上：

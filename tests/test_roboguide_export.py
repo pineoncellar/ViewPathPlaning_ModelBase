@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -38,6 +39,38 @@ def viewpoints() -> list[dict]:
             "roll_deg": 210.0,
         },
     ]
+
+
+def test_the_export_audit_judges_the_file_in_the_plans_own_envelope(tmp_path, monkeypatch):
+    """The joint walk must be given the run's `RobotParams`, not the dataclass defaults.
+
+    Without it the audit falls back to `RobotParams.disabled()`, whose 5 degree margin inside a
+    90 % span is the SHIPPED file - so the omission was invisible until a plan was made in a
+    wider envelope. A `banded` run (full span, zero margin) then came back as
+    "25 point(s) would not run (joint_limit)" on a program the planner had just verified.
+    """
+    from scanplan.config import RobotParams
+    from scanplan.roboguide import validate
+
+    seen = {}
+    real = validate.check_points
+
+    def spy(points, **kwargs):
+        seen.update(kwargs)
+        return real(points, **kwargs)
+
+    monkeypatch.setattr(validate, "check_points", spy)
+    params = replace(RobotParams.disabled(), enabled=True, joint_span_fraction=1.0,
+                     joint_margin_deg=0.0)
+    adapt.export(viewpoints(), tmp_path, prog_name=PROG, robot_params=params)
+    assert seen.get("params") is params, (
+        "the audit was not told which envelope the program was planned in")
+
+
+def test_the_export_audit_still_works_without_robot_parameters(tmp_path):
+    """An exporter used on its own (no configuration) keeps the old behaviour."""
+    contract = adapt.export(viewpoints(), tmp_path, prog_name=PROG)
+    assert contract["files"]["program"] == f"{PROG}.LS"
 
 
 def test_the_three_files_appear(tmp_path):

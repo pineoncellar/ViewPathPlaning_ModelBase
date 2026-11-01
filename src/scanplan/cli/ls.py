@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import load_config, read_json
+from ..config import PLAN_MODES, load_config, plan_preset, read_json
 from ..registration import load_registration
 from ..roboguide.adapt import export as export_ls
 from ..roboguide.registration_report import write_registration_report
@@ -56,6 +56,11 @@ def configure(subparsers) -> None:
     exporter.add_argument("--config", help="configuration override (JSON); it is authoritative "
                                           "for motion, termination and speed when the "
                                           "viewpoint file is a stroke plan")
+    exporter.add_argument("--plan-mode", dest="plan_mode", choices=PLAN_MODES,
+                          help="the plan mode the viewpoints were made in. The export audit "
+                               "re-walks the file and must judge it in that envelope, so "
+                               "re-exporting a 'banded' run with a 'standard' configuration "
+                               "refuses every pose the wider plan deliberately allowed")
     exporter.add_argument("--per-point-config", action="store_true",
                           help="write each point's own CONFIG letters instead of the "
                                "program-wide constant. OFF by default: a program carrying a "
@@ -150,6 +155,27 @@ def run(args, parser: argparse.ArgumentParser) -> int:
         except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
             parser.error(f"cannot read the configuration: {error}")
             return 2
+    if cfg is None:
+        # The export audit walks the program with a Robot built from these parameters, so an
+        # export that never loaded the configuration would audit the arm against the dataclass
+        # DEFAULTS instead of the envelope the plan was made in - which is how a run planned
+        # with a wider envelope came back "25 points would not run, joint_limit".
+        try:
+            cfg = load_config(args.config)
+        except (ValueError, FileNotFoundError, json.JSONDecodeError):
+            cfg = None
+    mode = getattr(args, "plan_mode", None)
+    if mode:
+        if cfg is None:
+            parser.error("--plan-mode needs a configuration")
+            return 2
+        try:
+            # The audit judges the file against the envelope the plan ran in, so asking for a
+            # mode here is what makes a re-export of a wider run pass.
+            cfg = plan_preset(cfg, mode)
+        except ValueError as error:
+            parser.error(str(error))
+            return 2
     if stroke_plan:
         # The configuration is authoritative here: a stroke plan's motion, termination and
         # speed are one decision, and two sources for it is how a program ends up flown at
@@ -191,6 +217,7 @@ def run(args, parser: argparse.ArgumentParser) -> int:
                              per_point_config=bool(args.per_point_config),
                              joint_blocks=bool(args.joint_blocks),
                              order=order,
+                             robot_params=(cfg.robot if cfg is not None else None),
                              allow_unverified=bool(args.allow_unverified))
     except ValueError as error:
         parser.error(str(error))
