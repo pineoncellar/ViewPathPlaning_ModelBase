@@ -87,12 +87,15 @@ def summary_lines(report: dict) -> list[str]:
         j6 = kinematics.get("j6") or {}
         if j6.get("available"):
             over = j6.get("over_cap") or []
+            named = j6.get("over_report") or []
             lines.append(
                 f"J6                     literal total {j6['literal_total_deg']} deg, "
                 f"worst {j6['literal_max_deg']} deg, "
                 f"dominant on {j6['dominant_segments']} of {j6['segments']} segments "
                 f"({j6['lever_arm_mm']:g} mm lever = {j6['mm_per_deg']:g} mm/deg)"
                 + (f", {len(over)} over the {j6['cap_deg']:g} deg cap" if over else "")
+                + (f", {len(named)} over {j6['report_deg']:g} deg at {named[:6]}"
+                   if named else "")
                 + " - reported, not refused")
         program = report.get("program", {})
         levels = program.get("connector_levels") or {}

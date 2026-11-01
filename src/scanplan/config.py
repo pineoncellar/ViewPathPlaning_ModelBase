@@ -379,6 +379,13 @@ class RobotParams:
     # A J6 step above this costs an extra penalty in the sequencing (`path._J6_OVER_CAP_COST`),
     # which is still a cost rather than a refusal. None turns the cap off.
     j6_max_step_deg: float | None = None
+    # A SECOND charge on J6, added on top of the all-axis step. `j6_weight` above only bites
+    # when J6 is the largest axis of the move, so a 20 deg twist next to a 100 deg arm swing
+    # is free under it; this one pays per degree of J6 whatever the rest of the move does,
+    # which is what "keep the total J6 travel small" needs. The two charge different things
+    # - one the worst step, one the running sum - and a site may want either, both or
+    # neither. 0.0 is the behaviour before 2026-11-01, so the default changes nothing.
+    j6_travel_weight: float = 0.0
     # What it costs the sequencing to change the arm's CONFIG family between two points.
     # Zero is the behaviour every program before 2026-11-01 was written with, and it is the
     # default on purpose: the letters say which posture the arm is in, and two postures for
@@ -1018,9 +1025,10 @@ def _validate_surface(target: TargetParams) -> None:
 
 
 def _validate_robot(robot: RobotParams) -> None:
-    # The two sequence prices are meaningful whether or not the gate is on: a pose-only
-    # delivery still chooses a branch for every point.
-    for name in ("config_change_cost_deg", "wrist_flip_cost_deg"):
+    # The two sequence prices and the J6 travel charge are meaningful whether or not the
+    # gate is on: a pose-only delivery still chooses a branch for every point, and a negative
+    # price would reward the change it exists to avoid.
+    for name in ("config_change_cost_deg", "wrist_flip_cost_deg", "j6_travel_weight"):
         if getattr(robot, name) < 0.0:
             raise ValueError(f"'robot.{name}' cannot be negative: it is a cost added to the "
                              "alternative that carries the change, so a negative value "

@@ -510,6 +510,7 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
     states = [_ItemJoints() for _ in items]
     weight = float(cfg.robot.j6_weight)
     cap = getattr(cfg.robot, "j6_max_step_deg", None)
+    travel = float(getattr(cfg.robot, "j6_travel_weight", 0.0))
     flip_cost = float(getattr(cfg.robot, "wrist_flip_cost_deg", 0.0))
     family_cost = float(getattr(cfg.robot, "config_change_cost_deg", 0.0))
     options: list[list[tuple]] = []
@@ -534,7 +535,7 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
             for source, (_prev_solution, prev_exit, _prev_margin) in enumerate(previous):
                 cost = total[depth - 1][source] + _step_cost(prev_exit,
                                                             solution.joints_deg,
-                                                            weight, cap)
+                                                            weight, cap, travel)
                 if float(np.asarray(prev_exit)[4]) * float(solution.joints_deg[4]) < 0.0:
                     cost += flip_cost
                 cost += _config_penalty(_prev_solution, solution, family_cost,
@@ -706,8 +707,10 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
         # point's roll (a spin about the same axis keeps the sight line), and when even that
         # cannot help, leave the move and name it - the speed ladder already flies anything
         # over 60 deg at the slowest bucket, so "slow down" is not a promise, it is the default.
-        eased = ease_over_cap_j6(points, solutions, kin,
-                                 getattr(cfg.robot, "j6_max_step_deg", None))
+        eased = ease_over_cap_j6(
+            points, solutions, kin, getattr(cfg.robot, "j6_max_step_deg", None),
+            verify=lambda a, b: _joint_move(a, b, cfg, station, model,
+                                            visible=visible, kin=kin)[0])
         plan.violations.extend(eased)
         plan.branches = _branch_record(points, solutions, float(cfg.robot.max_step_deg))
         plan.max_step_deg = plan.branches.max_step_deg
@@ -840,7 +843,8 @@ def _unwrap_readings(solutions: list, robot) -> None:
 
 
 def ease_over_cap_j6(points: Sequence[PathPoint], solutions: Sequence, kin,
-                     cap: float | None) -> list[str]:
+                     cap: float | None, *,
+                     verify: Callable[[np.ndarray, np.ndarray], bool] | None = None) -> list[str]:
     """Re-try the roll of a point whose J6 step still exceeds `robot.j6_max_step_deg`.
 
     This is the fallback the merge agreed on, and it is deliberately narrow.  A roll about
@@ -849,6 +853,16 @@ def ease_over_cap_j6(points: Sequence[PathPoint], solutions: Sequence, kin,
     retry list already does for the pool.  A COVERAGE point is left alone: its roll decides
     which samples its rectangular footprint reaches, so re-rolling it would move the very
     coverage figure the plan was accepted on.
+
+    A candidate roll is only accepted when it does not cost the arm anything: no J5 sign
+    flip, and no axis outside J6 travelling further than the move it replaces. Without that
+    guard the pass would happily trade a 200 deg wrist twist for a 250 deg J1 swing and call
+    it an improvement, because J6 is the one axis a roll touches directly.
+
+    `verify(a, b)` is the caller's joint-move check, run on BOTH sides of the point that gets
+    re-rolled. It has to be both: the corner is an endpoint of the move arriving and of the
+    move leaving, so verifying one leaves the other checked against joints that no longer
+    exist. Without it the pass would be choosing a pose and asserting the arm can reach it.
 
     Returns the violations to record.  An over-cap move that survives is not an error: the
     speed ladder already flies anything over 60 deg at the slowest bucket, so the move is
@@ -870,6 +884,8 @@ def ease_over_cap_j6(points: Sequence[PathPoint], solutions: Sequence, kin,
             continue
         point = points[index]
         if point.role != ROLE_COVERAGE:
+            arm_budget = _other_axes_deg(first, second)
+            after = solutions[index + 1] if index + 1 < len(solutions) else None
             best = None
             for turn in ROLL_RETRY_DEG:
                 roll = (float(point.roll_deg) + turn) % 360.0
@@ -877,7 +893,16 @@ def ease_over_cap_j6(points: Sequence[PathPoint], solutions: Sequence, kin,
                     if not option.ok:
                         continue
                     step = _j6_step_deg(first, option)
-                    if step <= limit and (best is None or step < best[0]):
+                    if step > limit or _j5_crossover(first, option):
+                        continue
+                    if _other_axes_deg(first, option) > arm_budget + 1e-9:
+                        continue
+                    if verify is not None and not verify(first.joints_deg, option.joints_deg):
+                        continue
+                    if (after is not None and verify is not None
+                            and not verify(option.joints_deg, after.joints_deg)):
+                        continue
+                    if best is None or step < best[0]:
                         best = (step, option)
             if best is not None:
                 solutions[index] = best[1]
@@ -1045,15 +1070,41 @@ def _j6_step_deg(first, second) -> float:
     return abs((delta + 180.0) % 360.0 - 180.0)
 
 
+def _other_axes_deg(first, second) -> float:
+    """Largest change outside J6 between two joint sets: what the ARM has to do.
+
+    The counterpart of `_j6_step_deg`. A re-roll can always be made to look good on J6 alone,
+    because J6 turns the flange about the optical axis and a roll IS a turn about that axis -
+    so "hold J6 still" is only worth anything if the rest of the move does not grow to pay
+    for it.
+    """
+    first = getattr(first, "joints_deg", first)
+    second = getattr(second, "joints_deg", second)
+    delta = np.asarray(second, dtype=float) - np.asarray(first, dtype=float)
+    return float(np.max(np.abs((delta + 180.0) % 360.0 - 180.0)[:5]))
+
+
+def _j5_crossover(first, second) -> bool:
+    """Whether a joint move between the two passes through the wrist singularity."""
+    first = np.asarray(getattr(first, "joints_deg", first), dtype=float).reshape(6)
+    second = np.asarray(getattr(second, "joints_deg", second), dtype=float).reshape(6)
+    return float(first[4]) * float(second[4]) < 0.0
+
+
 def _step_cost(first, second, j6_weight: float = 1.0,
-               j6_cap: float | None = None) -> float:
-    """What one segment costs the sequencing: the weighted step, plus a cap penalty.
+               j6_cap: float | None = None, j6_travel: float = 0.0) -> float:
+    """What one segment costs the sequencing: the weighted step, plus its two J6 charges.
 
     The cap is a price, not a limit.  Refusing an over-cap move means dropping the sweep
     behind it and the coverage that sweep carried, so the delivery stage has cheaper answers:
     re-try the point at another roll about the same axis, or slow the move down.  A penalty
     an order of magnitude above any real alternative makes the search use one only when
     nothing else works - which is exactly the case the report then names.
+
+    `j6_travel` is the second J6 charge and it is ADDITIVE. `j6_weight` only changes the
+    answer when J6 is the worst axis of the move, so a small twist alongside a big arm swing
+    costs nothing under it; `j6_travel` pays per degree regardless, which is the only way the
+    search sees a sequence of small twists as the budget it is.
     """
     if first is None or second is None:
         return 0.0
@@ -1061,7 +1112,10 @@ def _step_cost(first, second, j6_weight: float = 1.0,
         cost = _step_between(first, second, j6_weight)
     else:
         cost = _joint_step_deg(first, second, j6_weight)
-    if j6_cap is not None and _j6_step_deg(first, second) > float(j6_cap):
+    j6 = _j6_step_deg(first, second)
+    if j6_travel:
+        cost += float(j6_travel) * j6
+    if j6_cap is not None and j6 > float(j6_cap):
         cost += _J6_OVER_CAP_COST
     return cost
 
@@ -1086,7 +1140,7 @@ def _joint_move(first, second, cfg: PlannerConfig, station: Station, model: Scan
     """
     from_deg = np.asarray(first, dtype=float).reshape(6)
     to_deg = np.asarray(second, dtype=float).reshape(6)
-    if float(from_deg[4]) * float(to_deg[4]) < 0.0:
+    if _j5_crossover(from_deg, to_deg):
         return False, float("inf"), "j5_crossover"
     positions = kin.sweep_points(from_deg, to_deg,
                                  step_deg=float(cfg.stroke.joint_step_deg))
@@ -1536,7 +1590,8 @@ class BranchAssignment:
 def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
                     j6_weight: float = 1.0,
                     j6_cap: float | None = None,
-                    config_change_cost_deg: float = 0.0) -> BranchAssignment:
+                    config_change_cost_deg: float = 0.0,
+                    j6_travel: float = 0.0) -> BranchAssignment:
     """Pick a joint branch for every delivered point so the sequence jumps as little as it can.
 
     Picking the locally best branch at every point is the mistake this exists to prevent:
@@ -1551,6 +1606,10 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
 
     `config_change_cost_deg` prices a CONFIG family change the same way, and defaults to zero
     so a caller that does not ask for it keeps the behaviour it had.
+
+    `j6_travel` adds a charge per degree of J6 on top of the all-axis step, which is what
+    makes a run of moderate twists visible to the search; it defaults to zero for the same
+    reason.
 
     Points without any feasible solution are reported, never silently filled in with
     something plausible.
@@ -1571,7 +1630,7 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
             best = (float("inf"), 0)
             for k, previous in enumerate(candidates[index - 1]):
                 cost = total[index - 1][k] + _step_cost(previous, option,
-                                                        j6_weight, j6_cap)
+                                                        j6_weight, j6_cap, j6_travel)
                 cost += _config_penalty(previous, option, config_change_cost_deg)
                 if cost < best[0]:
                     best = (cost, k)

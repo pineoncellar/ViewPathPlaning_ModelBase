@@ -160,20 +160,26 @@ def _j6_block(config: PlannerConfig, literal: np.ndarray, circular: np.ndarray,
     re-try the point at another roll about the same axis, or slow the move down.
     """
     cap = getattr(config.robot, "j6_max_step_deg", None)
+    report_deg = float(getattr(config.robot, "j6_report_deg", 90.0))
     tool = np.asarray(config.robot.tool_xyz_mm, dtype=float).reshape(3)
     lever = float(np.hypot(tool[0], tool[1]))
     block = {
         "lever_arm_mm": round(lever, 2),
         "mm_per_deg": round(lever * np.pi / 180.0, 3),
         "weight": float(getattr(config.robot, "j6_weight", 1.0)),
+        "travel_weight": float(getattr(config.robot, "j6_travel_weight", 0.0)),
         "cap_deg": cap,
+        "report_deg": report_deg,
         "note": (
             "lever_arm_mm is the tool offset projected onto the flange plane - the radius J6 "
             "swings the scanner origin along. `literal_*` are the numbers the program writes "
             "on J moves; `physical_*` are the pose changes and are diagnostic only. "
             "`over_cap` lists segments above robot.j6_max_step_deg, which cost extra in the "
-            "sequencing and are reported, not refused: the delivery stage re-tries the roll "
-            "or slows the move instead of dropping the sweep"),
+            "sequencing, and `over_report` lists the segments above robot.j6_report_deg, "
+            "which are named without being priced. Neither is a refusal: the delivery stage "
+            "re-tries the roll or slows the move instead of dropping the sweep. `weight` "
+            "scales J6 inside the all-axis step, `travel_weight` charges every degree of it "
+            "on top - the first stops one big twist, the second stops a run of small ones"),
     }
     if len(literal) < 1:
         block["available"] = False
@@ -181,25 +187,32 @@ def _j6_block(config: PlannerConfig, literal: np.ndarray, circular: np.ndarray,
         return block
     j6_literal = literal[:, 5]
     j6_physical = circular[:, 5]
-    joint_j6 = [value for value, motion in zip(j6_literal, motions, strict=True)
-                if motion == "J"]
+    joint_segments = [index for index, motion in enumerate(motions) if motion == "J"]
+    joint_j6 = [float(j6_literal[index]) for index in joint_segments]
     edges = (0.0, 20.0, 45.0, 90.0, 180.0, 360.0)
     histogram = {}
     for low, high in zip(edges[:-1], edges[1:], strict=True):
         count = int(((j6_physical >= low) & (j6_physical < high)).sum())
         if count:
             histogram[f"{low:.0f}-{high:.0f}"] = count
-    over_cap = ([int(index) + 1 for index, value in enumerate(j6_literal)
-                 if cap is not None and value > float(cap)] if cap is not None else [])
+    # Both lists name segments the program reaches with a `J`, for the reason the top block
+    # gives: a segment flown as a line does not perform its end-to-end joint difference, so
+    # counting it here would point at a move nobody makes.
+    over_cap = ([index + 1 for index in joint_segments
+                 if j6_literal[index] > float(cap)] if cap is not None else [])
+    over_report = [index + 1 for index in joint_segments
+                   if j6_literal[index] > report_deg]
     block.update({
         "available": True,
         "segments": int(len(j6_literal)),
         "literal_total_deg": round(float(np.sum(joint_j6)), 1),
         "literal_max_deg": round(float(np.max(joint_j6)), 1) if joint_j6 else None,
-        "literal_max_at": (int(np.argmax(j6_literal)) + 1 if len(j6_literal) else None),
+        "literal_max_at": (joint_segments[int(np.argmax(joint_j6))] + 1
+                           if joint_j6 else None),
         "physical_total_deg": round(float(j6_physical.sum()), 1),
         "physical_max_deg": round(float(j6_physical.max()), 1),
         "over_cap": over_cap,
+        "over_report": over_report,
         "dominant_segments": int((circular.argmax(axis=1) == 5).sum()),
         "histogram": histogram,
     })

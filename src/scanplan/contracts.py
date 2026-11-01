@@ -83,6 +83,7 @@ class RobotEnvelope:
     wrist_policy: str
     j6_weight: float
     j6_max_step_deg: float | None
+    j6_travel_weight: float
 
     @classmethod
     def from_gate(cls, gate) -> RobotEnvelope:
@@ -107,6 +108,7 @@ class RobotEnvelope:
                 wrist_policy=str(getattr(params, "wrist_flip_policy", "any")),
                 j6_weight=float(getattr(params, "j6_weight", 1.0)),
                 j6_max_step_deg=getattr(params, "j6_max_step_deg", None),
+                j6_travel_weight=float(getattr(params, "j6_travel_weight", 0.0)),
             )
         return cls(
             enabled=True, model=params.model, limits_source=str(robot.limits_source),
@@ -119,6 +121,7 @@ class RobotEnvelope:
             wrist_policy=str(getattr(params, "wrist_flip_policy", "any")),
             j6_weight=float(getattr(params, "j6_weight", 1.0)),
             j6_max_step_deg=getattr(params, "j6_max_step_deg", None),
+            j6_travel_weight=float(getattr(params, "j6_travel_weight", 0.0)),
         )
 
     def band(self, axis: int) -> tuple[float, float]:
@@ -140,6 +143,7 @@ class RobotEnvelope:
             "wrist_policy": self.wrist_policy,
             "j6_weight": self.j6_weight,
             "j6_max_step_deg": self.j6_max_step_deg,
+            "j6_travel_weight": self.j6_travel_weight,
             "note": (
                 "one envelope per run: stage 2 filters candidates with it, stage 4 picks "
                 "branches inside it, stage 5 audits the file against it"

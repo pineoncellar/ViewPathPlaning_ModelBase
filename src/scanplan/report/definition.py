@@ -200,6 +200,9 @@ def route_block(config: PlannerConfig) -> dict:
         "config_change_cost_deg": float(robot.config_change_cost_deg),
         "wrist_flip_cost_deg": float(robot.wrist_flip_cost_deg),
         "j6_weight": float(robot.j6_weight),
+        "j6_travel_weight": float(getattr(robot, "j6_travel_weight", 0.0)),
+        "j6_max_step_deg": getattr(robot, "j6_max_step_deg", None),
+        "j6_report_deg": float(getattr(robot, "j6_report_deg", 90.0)),
         "caveat": ("`direct` and `tidy` exchange point count and program shape; their "
                    "coverage figures describe the same target surface but different paths, "
                    "so a figure from one is not a regression test for the other"),

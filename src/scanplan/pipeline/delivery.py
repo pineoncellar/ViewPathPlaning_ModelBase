@@ -281,6 +281,8 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
         assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg),
                                      j6_weight=float(cfg.robot.j6_weight),
                                      j6_cap=getattr(cfg.robot, "j6_max_step_deg", None),
+                                     j6_travel=float(getattr(cfg.robot,
+                                                             "j6_travel_weight", 0.0)),
                                      config_change_cost_deg=float(
                                          cfg.robot.config_change_cost_deg))
         path.branches = assignment
