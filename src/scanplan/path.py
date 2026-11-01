@@ -35,7 +35,7 @@ import numpy as np
 
 from .config import PlannerConfig
 from .contracts import ConnectorResult
-from .geometry import unit
+from .geometry import tangents, unit
 from .policies import connector_policy
 from .scanner_model import ScannerModel, ScannerPose
 from .scene import Station
@@ -66,8 +66,13 @@ LEVEL_TWO_CORNERS = "L2-retract-through"
 
 # A joint move crosses the wrist singularity when it takes J5 through zero, and the arm
 # whips round there. The DP will do it rather than lose a sweep, but it should lose ties
-# long before it does that.
-_J5_FLIP_PENALTY_DEG = 180.0
+# long before it does that. The price is `robot.wrist_flip_cost_deg`, defaulted there to the
+# 180 this constant used to hold.
+#
+# How many sideways directions the `straight-then-lateral` chain tries before it gives up on
+# a waiting point: evenly spread in the plane PERPENDICULAR to the optical axis, because a
+# retract along the axis walks into whatever is behind the head.
+_LATERAL_DIRECTIONS = 8
 
 # What it costs the branch search to exceed `robot.j6_max_step_deg` on one move.  Two orders
 # of magnitude above any real alternative, so the search only accepts an over-cap J6 move
@@ -492,14 +497,21 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
     sweep's exit joints are derived from its start solution instead of being chosen
     separately and then found to be inconsistent.
 
-    A wrist flip (J5 changing sign) is allowed but priced at `_J5_FLIP_PENALTY_DEG`, because
-    the alternative may be losing the sweep and the controller does perform the move. J6
-    changes are priced at `robot.j6_weight` times their size, for the reason
+    A wrist flip (J5 changing sign) is allowed but priced at `robot.wrist_flip_cost_deg`,
+    because the alternative may be losing the sweep and the controller does perform the move.
+    J6 changes are priced at `robot.j6_weight` times their size, for the reason
     `_joint_step_deg` gives.
+
+    Changing the CONFIG family is priced at `robot.config_change_cost_deg`, and DOUBLE that
+    between the two ends of one sweep: those two corners are the same pose, so a family change
+    there is not a preference but a jump the scan would ride through. Zero - the default -
+    prices the swing as free, which is what every program before this key was written with.
     """
     states = [_ItemJoints() for _ in items]
     weight = float(cfg.robot.j6_weight)
     cap = getattr(cfg.robot, "j6_max_step_deg", None)
+    flip_cost = float(getattr(cfg.robot, "wrist_flip_cost_deg", 0.0))
+    family_cost = float(getattr(cfg.robot, "config_change_cost_deg", 0.0))
     options: list[list[tuple]] = []
     for position, (_index, entry, leave) in enumerate(items):
         found, reason = _item_options(entry, leave, kin, cfg)
@@ -513,6 +525,8 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
     parent: list[list[int]] = [[0] * len(options[keep[0]])]
     for depth in range(1, len(keep)):
         previous = options[keep[depth - 1]]
+        same_sweep = (items[keep[depth]][1].stroke_id is not None
+                      and items[keep[depth]][1].stroke_id == items[keep[depth - 1]][1].stroke_id)
         row_total: list[float] = []
         row_parent: list[int] = []
         for solution, _exit, _margin in options[keep[depth]]:
@@ -522,7 +536,9 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
                                                             solution.joints_deg,
                                                             weight, cap)
                 if float(np.asarray(prev_exit)[4]) * float(solution.joints_deg[4]) < 0.0:
-                    cost += _J5_FLIP_PENALTY_DEG
+                    cost += flip_cost
+                cost += _config_penalty(_prev_solution, solution, family_cost,
+                                        doubled=same_sweep)
                 if cost < best_cost:
                     best_cost, best_source = cost, source
             row_total.append(best_cost)
@@ -970,6 +986,30 @@ def _note_drop(plan: PathPlan, reason: str) -> None:
     plan.drop_reasons[key] = plan.drop_reasons.get(key, 0) + 1
 
 
+def _config_family(item) -> str:
+    """The posture letter of a joint solution: `N`/`F` for the shoulder, `U`/`D`, `T`/`B`.
+
+    Only the first letter: it is the one the sequence changes by swinging the whole arm round,
+    and the one the eight-pose bank could actually name.
+    """
+    return str(getattr(item, "config", "") or "").split(",")[0].strip()
+
+
+def _config_penalty(first, second, cost_deg: float, *, doubled: bool = False) -> float:
+    """What changing the CONFIG family between two points costs the sequencing.
+
+    A charge, not a prohibition: a point whose only solution sits in another family keeps it.
+    Zero `cost_deg` means the change is priced as free, which is the behaviour before this
+    became configurable - the swing it hides is real either way, so the value is a site
+    decision rather than a correction nobody can turn off.
+    """
+    if not cost_deg or first is None or second is None:
+        return 0.0
+    if _config_family(first) == _config_family(second):
+        return 0.0
+    return float(cost_deg) * (2.0 if doubled else 1.0)
+
+
 def _joint_step_deg(first, second, j6_weight: float = 1.0) -> float:
     """Largest single-axis change between two joint sets, circularly.
 
@@ -1153,31 +1193,46 @@ class ConnectorChain:
 
     def connect(self, previous: PathPoint, entry: PathPoint,
                 ctx: ConnectorContext) -> ConnectorResult | None:
-        plan = ctx.plan
+        found = self.joint_leg(previous, entry, ctx)
+        if found is not None:
+            return found
+        return self.fallback_legs(previous, entry, ctx)
+
+    def joint_leg(self, previous: PathPoint, entry: PathPoint,
+                  ctx: ConnectorContext) -> ConnectorResult | None:
+        """One joint move between the two items' joint states, when both are known.
+
+        A joint move cannot fail in the middle - that is the point of it - so this is the
+        cheapest primitive and the one a chain should try before inserting anything.
+        """
         cfg = ctx.cfg
-        same = _same_pose(previous, entry)
+        if not (bool(cfg.stroke.joint_connector) and ctx.kin is not None and ctx.kin.active
+                and ctx.start_joints is not None and ctx.end_joints is not None):
+            return None
+        ok, margin, reason = _joint_move(ctx.start_joints, ctx.end_joints, cfg,
+                                         ctx.station, ctx.model,
+                                         visible=ctx.visible, kin=ctx.kin)
+        if ok:
+            return ConnectorResult(level=LEVEL_JOINT, margin_mm=margin)
+        _note_failure(ctx.plan, reason)
+        return None
+
+    def fallback_legs(self, previous: PathPoint, entry: PathPoint,
+                      ctx: ConnectorContext) -> ConnectorResult | None:
+        """The retract routes: a straight move for identical poses, then the lift ladder."""
+        cfg = ctx.cfg
         rotation = _rotation_deg(previous, entry)
         limit = int(cfg.stroke.connector_level)
 
-        # Level 1: one joint move.  It cannot fail in the middle - that is the point of it.
-        if (bool(cfg.stroke.joint_connector) and ctx.kin is not None and ctx.kin.active
-                and ctx.start_joints is not None and ctx.end_joints is not None):
-            ok, margin, reason = _joint_move(ctx.start_joints, ctx.end_joints, cfg,
-                                             ctx.station, ctx.model,
-                                             visible=ctx.visible, kin=ctx.kin)
-            if ok:
-                return ConnectorResult(level=LEVEL_JOINT, margin_mm=margin)
-            _note_failure(plan, reason)
-
         # A pair of identical poses still gets the old straight move when the level allows
         # it; changing that would move the gate-off program, which is the regression profile.
-        if limit <= 0 and same:
+        if limit <= 0 and _same_pose(previous, entry):
             margin, seen = _segment_margin(previous, entry, cfg, ctx.station, ctx.model,
                                            visible=ctx.visible)
             if margin > 0.0 and seen:
                 return ConnectorResult(level=LEVEL_STRAIGHT, margin_mm=margin)
 
-        # Level 2: the lift ladder.  `connector_level` is how far down it may go.
+        # The lift ladder.  `connector_level` is how far down it may go.
         if limit <= 0:
             return None
         if limit <= 1:
@@ -1191,9 +1246,10 @@ class ConnectorChain:
                 if ok:
                     return ConnectorResult(level=LEVEL_ONE_CORNER, corners=list(corners),
                                            joints=list(solutions), margin_mm=margin)
-            _note_failure(plan, "retract")
+            _note_failure(ctx.plan, "retract")
             return None
 
+        same = _same_pose(previous, entry)
         corners, margin, rate = _two_corners(previous, entry, cfg, ctx.station, ctx.model,
                                              rotation, same, visible=ctx.visible,
                                              kin=ctx.kin)
@@ -1208,10 +1264,52 @@ class ConnectorChain:
         # and counted in the report, so they stay visible rather than accepted.
         legal = margin > 0.0 and _route_allowed(corners, ctx.kin) and chain_ok
         if ctx.strict and not legal:
-            _note_failure(plan, "retract_through" if margin > 0.0 else "collision")
+            _note_failure(ctx.plan, "retract_through" if margin > 0.0 else "collision")
             return None
         return ConnectorResult(level=LEVEL_TWO_CORNERS, corners=list(corners),
                                joints=list(solutions), margin_mm=margin, rate=rate)
+
+
+class StraightThenLateral(ConnectorChain):
+    """Slot B's second implementation: fly straight, sidestep only when the line is blocked.
+
+    The order is the whole difference from `direct-then-lift`, and the reason it is a
+    separate class rather than a flag is that the two disagree about what the FIRST move
+    should be - a joint move interpolates in joint space, so the TCP arcs between two sweeps
+    even when nothing is in the way, while a straight Cartesian line is what the program
+    looks like it does.
+
+    * **straight** - no corner at all, whatever `connector_level` says, as long as the line
+      keeps clearance and the tracker. One instruction instead of three, and the wrist turn
+      rides along on it rather than needing a corner to start turning at.
+    * **lateral** - one waiting point SIDEWAYS of the part, over a ring of directions
+      perpendicular to the optical axis and the lift ladder's distances. Sideways rather
+      than backwards: retracting along the axis walks into whatever is behind the head,
+      which on this cell is the base behind the upper face and the fixture behind the lower.
+    * **the parent's chain** - joint move, then the lift ladder. This is the part that keeps
+      the style from LOSING coverage: a straight line through the part is worse than a
+      detour, and losing the sweep is worse than both.
+
+    A straight line is only honest while it is clear, so it is sampled like any other move.
+    What this deliberately does not do is fly a blocked line and note it (that is what the
+    upstream lateral route does): an item is worth more than a transit through the part.
+    """
+
+    name = "straight-then-lateral"
+
+    def connect(self, previous: PathPoint, entry: PathPoint,
+                ctx: ConnectorContext) -> ConnectorResult | None:
+        margin, seen = _segment_margin(previous, entry, ctx.cfg, ctx.station, ctx.model,
+                                        visible=ctx.visible)
+        if margin > 0.0 and seen:
+            return ConnectorResult(level=LEVEL_STRAIGHT, margin_mm=margin)
+        _note_failure(ctx.plan, "straight_blocked")
+
+        if int(ctx.cfg.stroke.connector_level) >= 1:
+            found = _lateral_corner(previous, entry, ctx)
+            if found is not None:
+                return found
+        return super().connect(previous, entry, ctx)
 
 
 def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: PathPlan,
@@ -1283,21 +1381,30 @@ def _record(plan: PathPlan, same: bool, margin: float, rotation: float, rate: fl
             f"{_LIFT_FACTORS[-1] * cfg.stroke.retract_clearance_mm:g} mm of lift")
 
 
-def _retract_point(previous: PathPoint, lift: float) -> PathPoint:
-    """A point `lift` millimetres behind the head, keeping its pose."""
+def _retract_point(previous: PathPoint, lift: float, direction=None) -> PathPoint:
+    """A point `lift` millimetres from the head along `direction`, keeping its pose.
+
+    `direction` defaults to straight back along the optical axis, which is what every route
+    before 2026-11-01 used and what the lift ladder still means. The lateral route passes a
+    direction in the plane perpendicular to the axis instead, so the waiting point leaves
+    the part's volume without walking towards the base behind the head.
+    """
+    step = (-np.asarray(previous.axis, dtype=float) if direction is None
+            else np.asarray(direction, dtype=float).reshape(3))
     return PathPoint(
-        position=np.asarray(previous.position, dtype=float)
-        - np.asarray(previous.axis, dtype=float) * lift,
+        position=np.asarray(previous.position, dtype=float) + step * lift,
         axis=np.asarray(previous.axis, dtype=float), roll_deg=float(previous.roll_deg),
         role=ROLE_RETRACT, source=str(previous.source), stroke_id=previous.stroke_id)
 
 
 def _one_corner(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
                 station: Station, model: ScannerModel, rotation: float, *,
-                visible=None, kin=None) -> tuple[list[PathPoint], float] | None:
+                visible=None, kin=None, direction=None
+                ) -> tuple[list[PathPoint], float] | None:
     """L1: retract, then fly straight to the next entry. None when no lift works."""
     for factor in _LIFT_FACTORS:
-        retract = _retract_point(previous, float(cfg.stroke.retract_clearance_mm) * factor)
+        retract = _retract_point(previous, float(cfg.stroke.retract_clearance_mm) * factor,
+                                 direction)
         reach = float(np.linalg.norm(np.asarray(entry.position, dtype=float)
                                      - np.asarray(retract.position, dtype=float)))
         if reach <= 0.0 or rotation / reach > cfg.stroke.max_rot_deg_per_mm:
@@ -1317,6 +1424,50 @@ def _one_corner(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig,
             seen = seen and tracker_ok
         if margin > 0.0 and seen:
             return [retract], float(margin)
+    return None
+
+
+def _lateral_directions(previous: PathPoint,
+                        count: int = _LATERAL_DIRECTIONS) -> list[np.ndarray]:
+    """Unit directions in the plane PERPENDICULAR to the head's optical axis, evenly spread.
+
+    Perpendicular on purpose: the retract this backs up along the axis walks into whatever
+    is behind the head, which on this cell is the base behind the upper face and the fixture
+    behind the lower one. A sidestep leaves the part's own volume immediately, whatever the
+    head happens to be pointing at.
+    """
+    axis = unit(np.asarray(previous.axis, dtype=float))
+    first, second = tangents(axis)
+    angles = np.linspace(0.0, 2.0 * np.pi * (1.0 - 1.0 / count), count)
+    return [unit(np.cos(angle) * first + np.sin(angle) * second) for angle in angles]
+
+
+def _lateral_corner(previous: PathPoint, entry: PathPoint,
+                    ctx: ConnectorContext) -> ConnectorResult | None:
+    """One sideways waiting point, over the ring of directions and the lift ladder.
+
+    The corner is verified like any other: `_one_corner` already refuses a direction whose
+    waiting point keeps no clearance, and `_chain_route` is what turns the point into joint
+    states the exporter can write. That second check is not optional - inserted points are
+    exactly what the 99 % run could not solve, so a lateral corner that no branch can hold
+    has to be refused here rather than delivered and found out at import.
+    """
+    rotation = _rotation_deg(previous, entry)
+    for direction in _lateral_directions(previous):
+        found = _one_corner(previous, entry, ctx.cfg, ctx.station, ctx.model, rotation,
+                            visible=ctx.visible, kin=ctx.kin, direction=direction)
+        if found is None:
+            continue
+        corners, margin = found
+        solutions, ok = _chain_route(ctx.start_joints, corners, ctx.end_joints, ctx.cfg,
+                                     ctx.station, ctx.model, visible=ctx.visible,
+                                     kin=ctx.kin)
+        if not ok:
+            _note_failure(ctx.plan, "lateral_joint")
+            continue
+        return ConnectorResult(level=LEVEL_ONE_CORNER, corners=list(corners),
+                               joints=list(solutions), margin_mm=margin)
+    _note_failure(ctx.plan, "lateral")
     return None
 
 
@@ -1384,7 +1535,8 @@ class BranchAssignment:
 
 def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
                     j6_weight: float = 1.0,
-                    j6_cap: float | None = None) -> BranchAssignment:
+                    j6_cap: float | None = None,
+                    config_change_cost_deg: float = 0.0) -> BranchAssignment:
     """Pick a joint branch for every delivered point so the sequence jumps as little as it can.
 
     Picking the locally best branch at every point is the mistake this exists to prevent:
@@ -1396,6 +1548,9 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
     `j6_weight` prices a J6 change as if it were that many times bigger, for the reason
     `_joint_step_deg` gives; it decides between candidates, never whether a point is feasible.
     The steps it REPORTS are always the real degrees, because that is what the program does.
+
+    `config_change_cost_deg` prices a CONFIG family change the same way, and defaults to zero
+    so a caller that does not ask for it keeps the behaviour it had.
 
     Points without any feasible solution are reported, never silently filled in with
     something plausible.
@@ -1417,6 +1572,7 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
             for k, previous in enumerate(candidates[index - 1]):
                 cost = total[index - 1][k] + _step_cost(previous, option,
                                                         j6_weight, j6_cap)
+                cost += _config_penalty(previous, option, config_change_cost_deg)
                 if cost < best[0]:
                     best = (cost, k)
             total[index][j] = best[0]

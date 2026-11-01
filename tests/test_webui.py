@@ -270,6 +270,29 @@ def test_the_joint_gate_is_always_on_and_cannot_be_switched_off_from_the_page():
     assert on.robot.mechanical_limits_deg == _delivery_config({}).robot.mechanical_limits_deg
 
 
+def test_the_page_can_choose_the_route_style_and_omitting_it_keeps_the_file():
+    from scanweb import _delivery_config
+
+    default = _delivery_config({})
+    assert default.stroke.route_style == "direct"
+    assert default.stroke.connector == "direct-then-lift"
+
+    tidy = _delivery_config({"route_style": "tidy"})
+    assert tidy.stroke.connector == "straight-then-lateral"
+    assert tidy.robot.config_change_cost_deg == 240.0
+
+    # The key is absent from a saved setup written before the control existed, and from any
+    # payload that does not include it: that must plan exactly what it planned before.
+    assert _delivery_config({}).stroke == default.stroke
+
+
+def test_an_unknown_route_style_from_the_page_is_refused():
+    from scanweb import _delivery_config
+
+    with pytest.raises(ValueError, match="route_style"):
+        _delivery_config({"route_style": "neat"})
+
+
 def test_no_occlusion_is_only_honoured_inside_a_fast_run():
     from scanweb import _delivery_config
 
@@ -752,6 +775,7 @@ def a_setup(point: float = 1.0, *, name: str = "PART01") -> dict:
             "fast": "fast",
             "fast_no_occlusion": True,
             "coverage_target_pct": 97.5,
+            "route_style": "tidy",
         },
     }
 
@@ -777,6 +801,9 @@ def test_a_saved_setup_returns_the_meshes_and_the_picks(tmp_path, monkeypatch):
     assert restored["setup"]["fast"] == "fast"
     assert restored["setup"]["fast_no_occlusion"] is True
     assert restored["setup"]["coverage_target_pct"] == pytest.approx(97.5)
+    # The route style survives a save/restore, or an operator who picked it has to remember
+    # to pick it again every time the program restarts.
+    assert restored["setup"]["route_style"] == "tidy"
     assert "robot_gate" not in restored["setup"], "the switch is gone, not just defaulted"
     # The names the operator picked, so a restore shows the same files, not `part.stl`.
     assert restored["setup"]["model_names"] == {"part": "零件v2.stl", "support": "夹具.stl"}

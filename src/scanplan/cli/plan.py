@@ -14,9 +14,11 @@ from ..config import (
     FACES,
     FAST_MIN_SAMPLE_GRID_MM,
     FAST_SAMPLE_GRID_MM,
+    ROUTE_STYLES,
     fast_preset,
     load_config,
     override,
+    route_preset,
 )
 from ..raycast import backend_name
 from ..report import summary_lines
@@ -59,6 +61,11 @@ def configure(subparsers) -> None:
                          help="acceptance coverage in percent, or 'none' to run until the "
                               "coverage stops growing; overrides the configuration for "
                               "this run")
+    planner.add_argument("--route-style", dest="route_style", choices=ROUTE_STYLES,
+                         help="which set of connector and sequence settings to plan with: "
+                              "'direct' is the shipped chain (a joint move between sweeps), "
+                              "'tidy' flies straight and sidesteps only when blocked, so the "
+                              "program reads as fewer, straighter transitions")
     planner.add_argument("--face", choices=FACES, help="which face of the blank to scan")
     planner.add_argument("--tracker", help="tracker pose 'x,y,z' if the station has none")
     planner.add_argument("--tracker-aim", help="tracker aim point 'x,y,z'")
@@ -82,6 +89,13 @@ def run(args, parser: argparse.ArgumentParser) -> int:
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
         parser.error(f"cannot read the configuration: {error}")
         return 2
+
+    if cfg.stroke.route_style != "direct":
+        say(f"route style '{cfg.stroke.route_style}': connector "
+            f"{cfg.stroke.connector}, CONFIG-family change "
+            f"{cfg.robot.config_change_cost_deg:g} deg, wrist flip "
+            f"{cfg.robot.wrist_flip_cost_deg:g} deg - the point count and the program "
+            "shape will differ from a 'direct' run on the same part")
 
     if cfg.fast.enabled:
         say(f"FAST run: {', '.join(cfg.fast.layers) or 'preset'}; "
@@ -124,14 +138,16 @@ def _apply_overrides(cfg, args, parser: argparse.ArgumentParser):
     """Apply the flags that are not part of the configuration file merge.
 
     Order matters and is documented in the log: the JSON file goes on first (in
-    `load_config`), the fast preset next, and an explicit `--coverage-target` last, so the
-    most specific thing said on the command line always wins.
+    `load_config`), the route style next, the fast preset after it, and an explicit
+    `--coverage-target` last, so the most specific thing said on the command line always wins.
     """
     if args.fast_grid is not None and not args.fast:
         parser.error("--fast-grid only means something with --fast")
     if args.no_occlusion and not args.fast:
         parser.error("--no-occlusion only means something with --fast: switching sight "
                      "lines off is only honest inside a run that says it is fast")
+    if getattr(args, "route_style", None):
+        cfg = route_preset(cfg, args.route_style)
     if args.fast:
         grid = FAST_SAMPLE_GRID_MM if args.fast_grid is None else float(args.fast_grid)
         if grid < FAST_MIN_SAMPLE_GRID_MM:

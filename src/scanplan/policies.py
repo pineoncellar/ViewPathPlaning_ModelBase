@@ -178,16 +178,21 @@ def connector_policy(mode: str | None) -> ConnectorPolicy:
     the kinematic walk and the path record together; this factory is the slot's name, so a
     second connector is added by registering it here rather than by editing `path`.
 
-    Two levels only, deliberately: a joint move, then the lift ladder.  Every extra
-    fallback is a route nobody has flown - the measurement that removed the old three-level
-    chain was that its retract corners, not the wrist, held all seven unsolvable points of
-    the 99 % run.
+    Two implementations, and they differ in what the FIRST move is:
+
+    * `direct-then-lift` - one joint move, then the lift ladder. Every extra fallback is a
+      route nobody has flown: the measurement that removed the old three-level chain was that
+      its retract corners, not the wrist, held all seven unsolvable points of the 99 % run.
+    * `straight-then-lateral` - a straight Cartesian line, a sideways waiting point when the
+      line is blocked, and this chain as the fallback. The line is what the program looks like
+      it does, so the delivered path reads as one continuous sweep instead of an arc between
+      sweeps; the fallback is what keeps the style from losing the coverage it was chosen for.
     """
     chosen = str(mode or "direct-then-lift").strip().lower()
     if chosen not in CONNECTOR_MODES:
         raise ValueError(f"stroke.connector must be one of {CONNECTOR_MODES}, "
                          f"not {mode!r}")
-    from .path import ConnectorChain  # local import: path imports this module's protocol
+    from .path import ConnectorChain, StraightThenLateral  # local import: path imports us
 
-    return ConnectorChain()
+    return StraightThenLateral() if chosen == "straight-then-lateral" else ConnectorChain()
 

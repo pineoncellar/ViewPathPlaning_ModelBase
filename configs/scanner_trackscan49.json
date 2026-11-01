@@ -185,8 +185,30 @@
     "pool_mode": "full",
     "side_scan_tilt_deg": 45.0,
     "joint_connector": true,
-    "joint_step_deg": 5.0
+    "joint_step_deg": 5.0,
+    "connector": "direct-then-lift",
+    "route_style": "direct"
   },
+
+  "_comment_route_style": [
+    "route_style names a SET of settings rather than changing one: `direct` is what this",
+    "file describes (an explicit `direct-then-lift`, joint move first), `tidy` swaps in",
+    "`straight-then-lateral` and prices the CONFIG-family change at 240 deg (480 inside one",
+    "sweep) and the wrist flip at 1000 deg. `route_preset` is the single expansion, used by",
+    "`scanplan plan --route-style` and by the web page's dropdown, so the two cannot drift.",
+    "",
+    "Why `tidy` exists: a joint move interpolates in joint space, so the TCP ARC between two",
+    "sweeps even when nothing is in the way. The program is correct and the path reads as",
+    "winding. `tidy` flies a straight Cartesian line instead and inserts one waiting point",
+    "only when the line is blocked, sideways of the part rather than backwards along the",
+    "optical axis (behind the head is the base on the upper face and the fixture on the",
+    "lower one). The joint move is still the fallback, so the style never trades coverage for",
+    "appearance.",
+    "",
+    "What it costs: the two styles exchange point count against program shape, so a coverage",
+    "figure from one is not a regression test for the other. Point counts and transition",
+    "counts are expected to differ."
+  ],
 
   "_comment_joint_connector": [
     "max_rot_deg_per_mm is 0.669 and that is a MEASURED LOWER BOUND, not a limit: segment",

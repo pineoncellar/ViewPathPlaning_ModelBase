@@ -28,7 +28,12 @@ FACES = ("upper", "lower", "auto")
 ROLL_MODES = ("locked", "discrete")
 # Slot B (stage 3): how the head travels between two sweeps. Two levels only - a single
 # joint move, then the lift ladder.
-CONNECTOR_MODES = ("direct-then-lift",)
+CONNECTOR_MODES = ("direct-then-lift", "straight-then-lateral")
+# The route style is a NAME for a set of settings, not a setting of its own: it exists so a
+# page control can switch the whole chain at once, and `route_preset` is the only thing that
+# reads it. `direct` is the identity - it leaves every other key alone, which is what keeps
+# the shipped behaviour exactly what it was before the style existed.
+ROUTE_STYLES = ("direct", "tidy")
 # How the delivered program is assembled. `path` checks the motion between every pair of
 # delivered points; `lean` delivers the poses alone, exactly like v1, and promises nothing
 # about what the head does between them.
@@ -226,6 +231,11 @@ class StrokeParams:
     # is the shipped implementation - one joint move, then the lift ladder. The level of
     # that ladder is still `connector_level`; this key names the policy, not its depth.
     connector: str = "direct-then-lift"
+    # Which named set of connector and cost settings is in force. A LABEL, expanded by
+    # `route_preset`: `direct` changes nothing, `tidy` swaps in `straight-then-lateral` and
+    # the two sequence prices that make the arm hold one CONFIG family. Written into the
+    # report so "why is this program shaped differently" is answerable two weeks later.
+    route_style: str = "direct"
 
 
 @dataclass(frozen=True)
@@ -369,6 +379,19 @@ class RobotParams:
     # A J6 step above this costs an extra penalty in the sequencing (`path._J6_OVER_CAP_COST`),
     # which is still a cost rather than a refusal. None turns the cap off.
     j6_max_step_deg: float | None = None
+    # What it costs the sequencing to change the arm's CONFIG family between two points.
+    # Zero is the behaviour every program before 2026-11-01 was written with, and it is the
+    # default on purpose: the letters say which posture the arm is in, and two postures for
+    # one tool pose are not two nearby joint vectors - the controller swings the whole arm
+    # round to get from one to the other (measured 2026-10-28: J1 167.6 deg out and J3
+    # 158.8 deg back in, mid-scan). Nothing in the delivery geometry models that swing, so a
+    # zero here prices it as free. Charged, never refused: a point whose only solution sits
+    # in another family keeps it.
+    config_change_cost_deg: float = 0.0
+    # What a wrist flip (J5 changing sign) costs the sequencing. A joint move interpolates
+    # J5 linearly, so a sign change sends the wrist through the singularity where the arm
+    # whips round. 180 is what every item-level sequence used before it was configurable.
+    wrist_flip_cost_deg: float = 180.0
 
     @classmethod
     def disabled(cls) -> RobotParams:
@@ -614,6 +637,65 @@ def _read_json(path: Path) -> dict[str, Any]:
     return read_json(path)
 
 
+#: What each route style expands to. `direct` is spelled out rather than left empty so that
+#: asking for it explicitly restores the shipped chain even if the file it is applied to
+#: carries a `tidy` value; it deliberately does NOT name `robot.j6_weight`, which is the
+#: site's own cost preference rather than part of the route's shape.
+#:
+#: `tidy` keeps `joint_connector` ON even though the chain it belongs to is the fallback:
+#: the joint move is what stops "make it straight" from meaning "lose the sweep", and a style
+#: whose fallback could not fly would trade coverage for appearance.
+ROUTE_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
+    "direct": {
+        "stroke": {"route_style": "direct", "connector": "direct-then-lift",
+                   "joint_connector": True},
+        "robot": {"config_change_cost_deg": 0.0, "wrist_flip_cost_deg": 180.0},
+    },
+    "tidy": {
+        "stroke": {"route_style": "tidy", "connector": "straight-then-lateral",
+                   "joint_connector": True},
+        "robot": {"config_change_cost_deg": 240.0, "wrist_flip_cost_deg": 1000.0,
+                  "j6_weight": 0.5},
+    },
+}
+
+
+def _route_values(config: PlannerConfig, style: str) -> PlannerConfig:
+    """`config` with one style's settings applied, unvalidated."""
+    replacement = config
+    for name, changes in ROUTE_PRESETS[style].items():
+        section = getattr(replacement, name)
+        replacement = replace(replacement, **{name: replace(section, **changes)})
+    return replacement
+
+
+def route_preset(config: PlannerConfig, style: str | None = None) -> PlannerConfig:
+    """Expand `stroke.route_style` into the settings it names.
+
+    One expansion for the page and the command line, so the two cannot drift apart - the
+    same reason `fast_preset` exists. `style=None` means "the style this configuration
+    already carries", which is what a caller that only wants the file's own label applied
+    passes.
+
+    `direct` restores the shipped connector and the two sequence prices to the values every
+    program before this key existed was written with, and leaves everything else -
+    `j6_weight` above all - exactly as the file set it. On the shipped configuration it is
+    therefore the identity, which is what makes "no style chosen" reproduce the old runs
+    byte for byte.
+
+    The style owns the keys it names. A file that writes `route_style: tidy` AND
+    `j6_weight: 1.0` gets 0.5 at the top level, because the preset is the single writer of
+    that set; the report then shows the value that actually ran.
+    """
+    chosen = str(config.stroke.route_style if style is None else style)
+    chosen = chosen.strip().lower()
+    if chosen not in ROUTE_STYLES:
+        raise ValueError(f"'route_style' must be one of {ROUTE_STYLES}, not {style!r}")
+    replacement = _route_values(config, chosen)
+    _validate(replacement)
+    return replacement
+
+
 def read_json(path: str | Path) -> Any:
     """Read a JSON file, tolerating the UTF-8 BOM that Windows tools write.
 
@@ -662,6 +744,13 @@ def _build(data: dict[str, Any], source: str, override: str | None,
         override=override,
         parameter_sources=dict(parameter_sources or {}),
     )
+    # A file may carry `route_style: tidy` and nothing else; the label is expanded here, so
+    # no consumer can read a style that the rest of the configuration does not implement.
+    if config.stroke.route_style not in ROUTE_STYLES:
+        raise ValueError(f"'stroke.route_style' must be one of {ROUTE_STYLES}, not "
+                         f"{config.stroke.route_style!r}")
+    if config.stroke.route_style != "direct":
+        config = _route_values(config, config.stroke.route_style)
     _validate(config)
     return config
 
@@ -871,6 +960,9 @@ def _validate_strokes(stroke: StrokeParams) -> None:
     if stroke.connector not in CONNECTOR_MODES:
         raise ValueError(f"'stroke.connector' must be one of {CONNECTOR_MODES}, not "
                          f"{stroke.connector!r}")
+    if stroke.route_style not in ROUTE_STYLES:
+        raise ValueError(f"'stroke.route_style' must be one of {ROUTE_STYLES}, not "
+                         f"{stroke.route_style!r}")
     if stroke.max_stroke_mm < 0.0:
         raise ValueError("'max_stroke_mm' cannot be negative")
     if stroke.min_stroke_mm < 0.0:
@@ -926,6 +1018,13 @@ def _validate_surface(target: TargetParams) -> None:
 
 
 def _validate_robot(robot: RobotParams) -> None:
+    # The two sequence prices are meaningful whether or not the gate is on: a pose-only
+    # delivery still chooses a branch for every point.
+    for name in ("config_change_cost_deg", "wrist_flip_cost_deg"):
+        if getattr(robot, name) < 0.0:
+            raise ValueError(f"'robot.{name}' cannot be negative: it is a cost added to the "
+                             "alternative that carries the change, so a negative value "
+                             "would reward the change it exists to avoid")
     if not robot.enabled:
         return
     for name in ("upper_arm_mm", "forearm_mm", "forearm_offset_mm"):

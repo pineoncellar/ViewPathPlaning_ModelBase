@@ -163,6 +163,32 @@ uv run scanplan plan --station input/<工位>.json \
 | `stroke.joint_connector` | `true` | 连接器主原语用单个 `J` 移动；关掉回到退刀路径 |
 | `stroke.joint_step_deg` | `5.0` | 关节移动扫掠 TCP 路径做间隙检查的采样步长（度） |
 | `stroke.max_rot_deg_per_mm` | `0.669` | 只约束退刀兜底路径。实测下界：`X10290` 有一段 173.8°/259.8 mm = 0.669 且实机跑过去了 |
+| `stroke.connector` | `direct-then-lift` | 第三阶段的连接器实现，见下节 |
+| `stroke.route_style` | `direct` | 一套连接器 + 计价设置的**名字**，由 `route_preset` 展开 |
+
+### 路线风格：`direct` 与 `tidy`
+
+两条扫描带之间怎么飞，有两种主张，差别就在**第一个动作**上：
+
+| | `direct`（默认） | `tidy` |
+|---|---|---|
+| 主原语 | 一次关节移动（`J`） | 直线直飞（`L`），通了就不插点 |
+| 直线被挡 | — | 绕光轴**垂直方向**侧移一个等待点（8 个方向 × 抬升档） |
+| 侧移也不成 | — | 回落 `direct` 的链路（关节移动 → 抬升阶梯） |
+| `connector` | `direct-then-lift` | `straight-then-lateral` |
+| `robot.config_change_cost_deg` | `0`（等于免费） | `240`，同一条带内加倍成 `480` |
+| `robot.wrist_flip_cost_deg` | `180` | `1000` |
+| `robot.j6_weight` | 沿用文件的 `1.0` | `0.5` |
+
+关节移动在关节空间里插值，所以 TCP **走的是弧线**——没错，但程序读起来是绕的，这就是 `tidy` 存在的理由。
+`tidy` 的侧移方向是垂直于光轴的，不是沿轴后退：上表面背后是底座、下表面背后是工装，沿轴退刀只会撞过去。
+
+两个必须知道的口径：
+
+* **`direct` 对出厂配置是恒等映射**，所以不选风格 = 跟以前逐字节相同（`route_preset` 里 `direct` 不写 `j6_weight`，那是站点的成本偏好，不属于路线形状）。
+* **两档的覆盖率不能互相作为回归基准**：同样的目标面，路径不同，点数与过渡点数本来就该不同。报告里有 `route` 块记录实际生效值。
+
+命令行等价：`--route-style {direct,tidy}`；网页端是「路线风格」下拉；保存的现场方案会一起存这个键。
 
 ### 交付程序的形态（关节门打开时）
 

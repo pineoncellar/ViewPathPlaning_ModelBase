@@ -65,6 +65,7 @@ from .definition import (
     fast_block,
     placeholders_block,
     provenance,
+    route_block,
     scope_note,
 )
 from .kinematics import (
@@ -155,6 +156,7 @@ def build_report(*, config: PlannerConfig, model: ScannerModel, station: Station
         },
         "scope": scope_note(config),
         "fast_mode": fast_block(config),
+        "route": route_block(config),
         "tracker_caveat": TRACKER_CAVEAT,
         "placeholders_note": PLACEHOLDERS_NOTE,
         "placeholders": placeholders_block(config, tracker),

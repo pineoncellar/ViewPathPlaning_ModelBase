@@ -35,9 +35,11 @@ import trimesh
 from scanplan.config import (
     FAST_MIN_SAMPLE_GRID_MM,
     FAST_SAMPLE_GRID_MM,
+    ROUTE_STYLES,
     fast_preset,
     load_config,
     override,
+    route_preset,
 )
 from scanplan.pipeline import plan, write_outputs
 from scanplan.registration import RigidRegistration, fit_points
@@ -288,6 +290,21 @@ def _write_planning_report(path: Path, *, run_id: str, prog_name: str,
             "覆盖率数字只描述路径的形状，<b>不能作为验收依据</b>；引用任何数字前请去掉快速"
             "模式重跑一次。</div></section>"
         )
+    route = report.get("route", {}) or {}
+    route_banner = ""
+    if route.get("style") and route.get("style") != "direct":
+        # Same reasoning as the fast banner: two styles exchange point count against program
+        # shape, so a figure from one is not a regression test for the other. The reader has
+        # to be told which one produced this page before they compare it with another run.
+        route_banner = (
+            '<section><div class="warn"><b>本次运行使用路线风格 '
+            f'{html.escape(str(route.get("style")))}</b>：连接器 '
+            f'{html.escape(str(route.get("connector")))}，'
+            f'换臂型计价 {float(route.get("config_change_cost_deg") or 0.0):g}°，'
+            f'腕翻转计价 {float(route.get("wrist_flip_cost_deg") or 0.0):g}°。'
+            "程序的点数与形状与 <code>direct</code> 档不同，两档的覆盖率<b>不能互相作为"
+            "回归基准</b>。</div></section>"
+        )
     body = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>扫描规划报告 · {html.escape(prog_name)}</title>
@@ -324,6 +341,7 @@ code{{color:#315c82}}
 <header><h1>扫描路径规划报告</h1>
 <p>运行编号 {html.escape(run_id)} · 程序 {html.escape(prog_name)}</p></header>
 {fast_banner}
+{route_banner}
 <section><h2>主要结果</h2><div class="metrics">
 <div class="metric"><span>目标面覆盖率</span><b>{coverage:.2f}%</b></div>
 <div class="metric"><span>扫描视点</span><b>{int(report.get('viewpoints', 0))}</b></div>
@@ -413,6 +431,12 @@ def _public_config() -> dict:
         "sample_grid_mm": float(config.target.sample_grid_mm),
         "fast_grid_mm": FAST_SAMPLE_GRID_MM,
         "fast_min_grid_mm": FAST_MIN_SAMPLE_GRID_MM,
+        # The route style and what it stands for. The page labels the choice from these
+        # rather than hard-coding "tidy means fewer corners", so renaming a preset cannot
+        # leave the page promising something the planner no longer does.
+        "route_style": config.stroke.route_style,
+        "route_styles": list(ROUTE_STYLES),
+        "route_connector": config.stroke.connector,
     }
 
 
@@ -457,6 +481,11 @@ def _delivery_config(data: dict):
     selection stops AND the refinement rounds aimed at what is still uncovered are skipped,
     which is exactly what leaves the sloped areas behind.
 
+    The route style is a page setting for the same kind of reason - it trades point count
+    against how the program reads - and it goes through the same `route_preset` the command
+    line's `--route-style` uses. Omitting the key keeps whatever the configuration file
+    says, so a page that never touches the control plans exactly what it always did.
+
     Fast mode is applied LAST and by the same `fast_preset` the command line uses, so the
     page and `scanplan plan --fast` cannot drift apart. `single_face=False` because this
     job asks for one face already: claiming the preset's face saving here would be a
@@ -469,6 +498,9 @@ def _delivery_config(data: dict):
     if mode == "pose":
         config = override(config, stroke={"enabled": False})
     config = override(config, robot={"enabled": True})
+    style = data.get("route_style", _KEEP)
+    if style is not _KEEP and style is not None:
+        config = route_preset(config, str(style))
     target = _coverage_target(data.get("coverage_target_pct", _KEEP))
     if target is not _KEEP:
         config = override(config, target={"coverage_target_pct": target})
@@ -1657,6 +1689,9 @@ def _clean_setup(body: dict) -> dict:
     speed = str(body.get("fast") or "accurate")
     if speed not in ("accurate", "fast"):
         raise ValueError("fast must be 'accurate' or 'fast'")
+    style = str(body.get("route_style") or "direct")
+    if style not in ROUTE_STYLES:
+        raise ValueError(f"route_style must be one of {ROUTE_STYLES}")
 
     raw_names = body.get("model_names")
     model_names = {}
@@ -1679,6 +1714,7 @@ def _clean_setup(body: dict) -> dict:
         "delivery_mode": mode,
         "fast": speed,
         "fast_no_occlusion": bool(body.get("fast_no_occlusion")),
+        "route_style": style,
         "coverage_target_pct": _coverage_target(body.get("coverage_target_pct")),
         "model_names": model_names,
     }

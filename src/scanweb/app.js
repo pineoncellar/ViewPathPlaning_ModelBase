@@ -911,6 +911,7 @@ function payload(includeMeshes) {
     delivery_mode: $("scanMode").value,
     fast: $("fastMode").value === "fast",
     fast_no_occlusion: $("fastMode").value === "fast" && $("fastNoOcclusion").checked,
+    route_style: $("routeStyle").value,
     coverage_target_pct: coverageTargetInput(),
     run_name: runName || undefined,
     run_id: /^[A-Za-z0-9_-]{1,64}$/.test(runName) ? runName : undefined
@@ -2158,6 +2159,7 @@ function currentSetup() {
     delivery_mode: $("scanMode").value,
     fast: $("fastMode").value,
     fast_no_occlusion: $("fastNoOcclusion").checked,
+    route_style: $("routeStyle").value,
     coverage_target_pct: coverageTargetInput(),
     model_names: {
       part: state.models.part ? state.models.part.sourceName : "",
@@ -2286,6 +2288,7 @@ async function loadSelectedSetup() {
     $("fastMode").value = saved.fast === "fast" ? "fast" : "accurate";
     $("fastNoOcclusion").disabled = $("fastMode").value !== "fast";
     $("fastNoOcclusion").checked = $("fastMode").value === "fast" && Boolean(saved.fast_no_occlusion);
+    if ($("routeStyle") && saved.route_style) $("routeStyle").value = saved.route_style;
     if (saved.coverage_target_pct !== undefined) {
       showCoverageTarget(saved.coverage_target_pct);
     }
@@ -2349,6 +2352,12 @@ async function applyServerDefaults() {  try {
     // value; `null` means the selection runs until nothing new is covered.
     if (config.coverage_target_pct !== undefined) {
       showCoverageTarget(config.coverage_target_pct);
+    }
+    // The route style is a configuration value, so the screen starts on it: a file that
+    // asks for `tidy` must not be silently planned as `direct` because the page defaulted.
+    const style = $("routeStyle");
+    if (style && config.route_style && config.route_styles && config.route_styles.includes(config.route_style)) {
+      style.value = config.route_style;
     }
   } catch (_error) {
     /* keep the built-in default */

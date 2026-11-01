@@ -181,3 +181,26 @@ def fast_block(config: PlannerConfig) -> dict:
         "caveat": ("fast mode trades accuracy for iteration speed: the coverage figure "
                    "describes a coarser sample set, and it is not an acceptance result"),
     }
+
+
+def route_block(config: PlannerConfig) -> dict:
+    """The route style this run used, and the settings it stands for.
+
+    Written unconditionally, unlike `fast_block`: a style is not a degraded mode, so there is
+    no "off" to leave out - and two runs whose programs look different have to be comparable
+    two weeks later, which needs the numbers in the file rather than in someone's memory.
+    """
+    stroke = config.stroke
+    robot = config.robot
+    return {
+        "style": stroke.route_style,
+        "connector": stroke.connector,
+        "joint_connector": bool(stroke.joint_connector),
+        "connector_level": int(stroke.connector_level),
+        "config_change_cost_deg": float(robot.config_change_cost_deg),
+        "wrist_flip_cost_deg": float(robot.wrist_flip_cost_deg),
+        "j6_weight": float(robot.j6_weight),
+        "caveat": ("`direct` and `tidy` exchange point count and program shape; their "
+                   "coverage figures describe the same target surface but different paths, "
+                   "so a figure from one is not a regression test for the other"),
+    }

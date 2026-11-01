@@ -56,6 +56,28 @@ uv run scanplan plan --station input/<工位>.json --fast --out output/<零件>-
 扫描带的直线扫掠段上，而 `check_step_mm` 同时是关节筛选对直线移动的采样步长——
 改粗它会让"检查"比"被检查的运动"还粗。
 
+### 路线风格：`--route-style`
+
+两条扫描带之间怎么飞，有两个可选档：
+
+```bash
+uv run scanplan plan --station input/<工位>.json --route-style direct --out output/<零件>-direct/
+uv run scanplan plan --station input/<工位>.json --route-style tidy   --out output/<零件>-tidy/
+```
+
+* `direct`（默认）：一次关节移动。两端合法就不会在中段出界，点最少，代价是 TCP 走弧线。
+* `tidy`：直线直飞，通了**不插任何点**；直线被挡时绕光轴垂直方向侧移一个等待点；侧移也不成才回落
+  `direct` 的链路。同时给"换臂型（CONFIG 族）"计 240°（同一条带内加倍）、腕翻转计 1000°、
+  `j6_weight` 降到 0.5。
+
+`direct` 对出厂配置是**恒等映射**，所以不写这个参数 = 跟以前完全一致。两档的点数与覆盖率**不能互相
+作为回归基准**；报告里的 `route` 块记录实际生效的连接器与三个代价，网页端是「路线风格」下拉，
+保存的现场方案会一起存这个键。
+
+对应配置键：`stroke.route_style`（名字）、`stroke.connector`、`robot.config_change_cost_deg`、
+`robot.wrist_flip_cost_deg`、`robot.j6_weight`。详见
+[`docs/configuration.md`](configuration.md#路线风格direct-与-tidy)。
+
 ### 快速模式配哪种交付模式
 
 同一零件、同一 seed、同一条 `--fast` 命令，只改交付模式（实测 2026-10-28）：

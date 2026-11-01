@@ -84,6 +84,15 @@ def test_the_headline_numbers_are_at_the_top_level(planned):
             == len(planned["viewpoints"]))
 
 
+def test_the_report_always_names_the_route_style(planned):
+    """Two styles give the same part different programs, so the file has to say which ran -
+    otherwise a figure from one is later compared with the other as if it were a regression."""
+    route = planned["report"]["route"]
+    assert route["style"] == planned["config"].stroke.route_style
+    assert route["connector"] == planned["config"].stroke.connector
+    assert "caveat" in route
+
+
 def test_report_states_what_it_does_not_model(planned):
     scope = planned["report"]["scope"].lower()
     assert "geometric" in scope
