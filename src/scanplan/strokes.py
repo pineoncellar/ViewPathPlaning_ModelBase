@@ -46,7 +46,7 @@ from .coverage import CoverageResult
 from .geometry import tangents, unit
 from .rolls import roll_for_axis
 from .scanner_model import ScannerModel, ScannerPose, measure_mask
-from .scene import Station
+from .scene import Station, casters_for
 from .target_surface import SampleSet
 
 _EPS = 1e-9
@@ -295,9 +295,14 @@ class StrokeBuilder:
 
     @property
     def obstacles(self) -> dict:
-        """The ray casters, built by the station once and reused."""
+        """The ray casters, built by the station once and reused.
+
+        Through :func:`casters_for` so a fast run skips sight lines here too - the
+        builder is where every stroke's coverage is measured, so a switch that missed it
+        would be a switch that did nothing.
+        """
         if self._obstacles is None:
-            self._obstacles = self.station.obstacles()
+            self._obstacles = casters_for(self.station, self.cfg)
         return self._obstacles
 
     # -- coverage primitives -------------------------------------------------

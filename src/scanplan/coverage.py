@@ -35,7 +35,7 @@ from scipy.sparse import csr_matrix
 from .config import PlannerConfig
 from .raycast import nearest_across
 from .scanner_model import ScannerModel, ScannerPose, measure_mask
-from .scene import Station
+from .scene import Station, casters_for
 from .target_surface import SampleSet
 
 REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by_base",
@@ -121,7 +121,7 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
     n_targets = len(points)
     if len(areas) != n_targets:
         raise ValueError("every sample needs an area")
-    casters = station.obstacles() if obstacles is None else obstacles
+    casters = casters_for(station, cfg) if obstacles is None else obstacles
 
     positions = (np.array([pose.position for pose in poses], dtype=float)
                  if poses else np.zeros((0, 3)))
@@ -220,7 +220,7 @@ def attribute_uncovered(leak_points, leak_normals, poses: Sequence[ScannerPose],
     if count == 0:
         return reasons
 
-    casters = station.obstacles() if obstacles is None else obstacles
+    casters = casters_for(station, cfg) if obstacles is None else obstacles
     resolved = np.zeros(count, dtype=bool)
     only_colliding = np.zeros(count, dtype=bool)
     only_limited = np.zeros(count, dtype=bool)

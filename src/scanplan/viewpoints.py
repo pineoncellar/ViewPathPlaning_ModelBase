@@ -57,6 +57,10 @@ class Viewpoint:
     branch: str | None = None
     joints_deg: tuple[float, ...] | None = None
     j5_margin_deg: float | None = None
+    # How the program reaches this point, and how its P[n] block is written. None means
+    # "the program default", which is what keeps a gate-off export unchanged.
+    motion: str | None = None
+    representation: str | None = None
 
     def as_dict(self) -> dict:
         """A plain JSON-ready mapping under the documented field names."""
@@ -80,6 +84,9 @@ class Viewpoint:
                            else [round(float(v), 3) for v in self.joints_deg]),
             "j5_margin_deg": (None if self.j5_margin_deg is None
                               else round(float(self.j5_margin_deg), 3)),
+            "motion": None if self.motion is None else str(self.motion),
+            "representation": (None if self.representation is None
+                               else str(self.representation)),
         }
 
 
@@ -138,6 +145,8 @@ def viewpoints_from_path(plan, coverage: CoverageResult,
                            if solution is not None else None),
             "j5_margin_deg": (float(solution.j5_margin_deg)
                               if solution is not None else None),
+            "motion": getattr(point, "motion", None),
+            "representation": getattr(point, "representation", None),
         }
         row = point.coverage_index
         if row is None or len(coverage.sets[row]) == 0:

@@ -241,8 +241,14 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
         path.violations.append(
             f"the hard gate removed {len(rejected)} item(s) with no legal connector; "
             "the selection was re-run without them")
-    if kin is not None and kin.active and path.points:
-        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg))
+    if kin is not None and kin.active and path.points and not path.joint_planned:
+        # Only when `build_path` did not do it. It does, whenever the gate is on: the joint
+        # state has to be known BEFORE the connector can be checked, so it is decided there.
+        # Re-running the assignment here would override per-point motion and representation
+        # with a second choice made after the corners were already committed.
+        assignment = assign_branches(path.points, kin, float(cfg.robot.max_step_deg),
+                                     j6_weight=float(cfg.robot.j6_weight),
+                                     j6_cap=getattr(cfg.robot, "j6_max_step_deg", None))
         path.branches = assignment
         path.max_step_deg = assignment.max_step_deg
         if assignment.failed:
@@ -462,3 +468,4 @@ def _rebuild_selection(combined: CoverageResult, rows, sources: dict[int, str],
         coverage_area_mm2=float(area[covered].sum()),
         target_area_mm2=combined.target_area_mm2,
         sources=np.array(labels, dtype=object))
+

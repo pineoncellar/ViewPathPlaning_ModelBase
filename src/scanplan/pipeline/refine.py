@@ -14,6 +14,7 @@ import numpy as np
 from ..candidates import refine
 from ..config import PlannerConfig
 from ..coverage import CoverageResult, evaluate, merge
+from ..policies import roll_policy
 from ..scanner_model import ScannerModel
 from ..scene import Station
 from ..selection import Selection, select
@@ -71,6 +72,8 @@ def refine_rounds(state: RefineState, builder: StrokeBuilder | None, target: Tar
             round_rep(0.05, f"refinement round {round_index + 1}: aiming at the leaks")
         extra = refine(target.samples.points[leftover], target.samples.normals[leftover],
                        cfg.scanner, seed=cfg.seed + round_index, log=log,
+                       keep=kin.check_pose if kin is not None and kin.active else None,
+                       policy=roll_policy(cfg.scanner.roll_mode),
                        progress=round_rep.band("strokes", 0.0, 0.25).tick("aims")
                        if round_rep is not None else None)
         if not extra:
@@ -160,3 +163,4 @@ def _shift_rows(selection: Selection, old_poses: int, new_poses: int) -> Selecti
                      coverage_area_mm2=selection.coverage_area_mm2,
                      target_area_mm2=selection.target_area_mm2,
                      sources=selection.sources, corners=selection.corners)
+
