@@ -154,6 +154,29 @@ class RayCaster:
         return distance, triangle
 
 
+    def hit_count(self, origins, directions) -> np.ndarray:
+        """How many surfaces of the mesh each ray meets, over the whole ray.
+
+        Parity is the point: an odd count means the origin sits INSIDE a closed shell. A
+        ray that misses counts zero, and the intersector stops after `max_hits` - an even
+        number - so a truncated count still reads as "outside", which is the safe direction
+        for a veto that exists to reject poses rather than accept them.
+        """
+        origins, directions = _as_rays(origins, directions)
+        count = np.zeros(len(origins), dtype=np.int64)
+        for start in range(0, len(origins), self.chunk):
+            stop = min(start + self.chunk, len(origins))
+            _index_tri, index_ray = self._intersector.intersects_id(
+                origins[start:stop], directions[start:stop],
+                multiple_hits=True, return_locations=False,
+            )
+            if len(index_ray) == 0:
+                continue
+            count[start:stop] += np.bincount(np.asarray(index_ray, dtype=np.int64),
+                                             minlength=stop - start)
+        return count
+
+
 def nearest_across(casters: Mapping[str, RayCaster], origins, directions,
                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The nearest hit over several meshes: `(distance, mesh_name, triangle_index)`.

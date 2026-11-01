@@ -262,10 +262,15 @@ def test_geometry_outranks_the_tracker_when_both_apply(clamped_plate, model_plac
 def test_the_counters_record_what_was_rejected(clamped_plate, model_placeholder, cfg):
     result = evaluate(ladder_poses(), head_on_samples(60.0), clamped_plate.station,
                       model_placeholder, cfg)
-    assert set(result.counters) == {"rejected_clearance", "rejected_tracker",
+    assert set(result.counters) == {"rejected_inside_part", "inside_part_unchecked",
+                                    "rejected_clearance", "rejected_tracker",
                                     "rejected_kinematics", "rejected_no_points", "rays"}
     assert result.counters["rays"] > 0
     assert result.counters["rejected_clearance"] == 0
+    # None of these poses sits in the sheet, and the counter has to say so rather than be
+    # absent: a zero is the evidence that the veto ran and found nothing.
+    assert result.counters["rejected_inside_part"] == 0
+    assert result.counters["inside_part_unchecked"] == 0
 
 
 def test_an_empty_pose_list_gives_an_empty_result(clamped_plate, model_placeholder, cfg):

@@ -96,6 +96,8 @@ class Station:
     winding: dict = field(default_factory=dict)
     _obstacles: dict[str, Any] | None = field(default=None, init=False, repr=False,
                                               compare=False)
+    # Cached answer to "may the parity test be trusted on this part?"; see `parity_trusted`.
+    _closed: bool | None = field(default=None, init=False, repr=False, compare=False)
 
     def obstacles(self) -> dict[str, RayCaster]:
         """Ray casters for the three meshes, built on first use and kept.
@@ -122,6 +124,76 @@ class Station:
         to_fixture = self.fixture_tree.query(points, k=1)[0]
         to_base = self.base_tree.query(points, k=1)[0]
         return np.minimum(to_fixture, to_base)
+
+    def _parity(self, points) -> np.ndarray:
+        """The raw three-axis parity vote, with no trust check."""
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if len(points) == 0:
+            return np.zeros(0, dtype=bool)
+        caster = self.obstacles()["part"]
+        votes = np.zeros(len(points), dtype=np.int64)
+        for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+            directions = np.broadcast_to(np.asarray(axis, dtype=float), points.shape).copy()
+            votes += caster.hit_count(points, directions) % 2
+        return votes >= 2
+
+    def inside_part(self, points) -> np.ndarray:
+        """Whether each point lies inside the part's own material.
+
+        Every delivered point - a scan position as much as a retract or transition corner -
+        has to sit OUTSIDE the part: the head approaches from outside, and a reference point
+        buried in the sheet is a point no controller can fly. Worse, such a pose still
+        "sees" samples through the very material it is inside, so without this veto it earns
+        coverage it could never measure.
+
+        Measured by parity: a ray leaving the point crosses a closed shell an odd number of
+        times exactly when the point started inside it. Three axis-aligned rays vote,
+        because one ray that grazes an edge, runs along a face or leaves through a hole
+        answers wrongly for the whole point, and a single answer would then be believed.
+
+        Refused unless :attr:`parity_trusted`: on a mesh the vote cannot be relied on, this
+        is not "approximately right", it is a coin toss, and a coin toss that vetoes poses
+        costs coverage with nothing to show for it.
+
+        Measurements on the 2026-10-30 part (110k faces, NOT edge-manifold: T-junctions are
+        normal on a tessellated sheet) say what to expect - recall is partial, precision is
+        not. Probes pushed 0.15 mm under a face were called inside 30 % of the time, i.e.
+        the test misses most buried poses; poses pulled 100-300 mm off a face along its own
+        normal were called inside 0 times out of 600, so it does not invent them. A veto can
+        live with the first number and not with the second.
+        """
+        if not self.parity_trusted:
+            raise ValueError(
+                "ray parity cannot be trusted on this part, so 'inside the part' has no "
+                "answer - callers must check `Station.parity_trusted` first"
+            )
+        return self._parity(points)
+
+    @property
+    def parity_trusted(self) -> bool:
+        """Whether `inside_part` may be believed on THIS mesh.
+
+        Parity needs a closed surface, and a tessellated part usually is not edge-manifold:
+        T-junctions where a finely divided face meets a single-quad rim are normal, and they
+        break `is_watertight` while leaving the surface geometrically closed. So the mesh is
+        judged on the only question that matters - eight points on a box well OUTSIDE the
+        part must all come back outside. A mesh that fails that is never asked anything else,
+        and `inside_part_unchecked` in the report says so.
+
+        Cached: the answer cannot change for a mesh this object holds.
+        """
+        if self._closed is None:
+            bounds = np.asarray(self.part.bounds, dtype=float)
+            middle = bounds.mean(axis=0)
+            # One reach for all three axes: on a 0.7 mm sheet the axis-wise span would put a
+            # probe closer to the surface than the tessellation can resolve.
+            reach = 1.5 * float(np.max(bounds[1] - bounds[0]))
+            corners = np.array([middle + reach * np.array(sign)
+                                for sign in ((-1, -1, -1), (-1, -1, 1), (-1, 1, -1),
+                                             (-1, 1, 1), (1, -1, -1), (1, -1, 1),
+                                             (1, 1, -1), (1, 1, 1))])
+            self._closed = not bool(self._parity(corners).any())
+        return self._closed
 
     def nearest_obstacle_point(self, points) -> np.ndarray:
         """The obstacle sample that `clearance_mm` measured the distance to."""

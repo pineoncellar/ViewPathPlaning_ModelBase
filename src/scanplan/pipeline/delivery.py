@@ -26,6 +26,13 @@ from .ranking import _rank_plan
 # never remove anything, which would make the stage pointless by construction.
 PRUNE_TARGET_PCT = 99.0
 
+# How far ABOVE the requirement a selection may sit before pruning is allowed to touch it.
+# The greedy pass stops the moment it crosses the target, so its overshoot is under one item
+# and removal from there can only undershoot. Shaving a set that already sits at the target
+# cost 3.9 points of coverage on the 2026-10-28 station (99.04% selected -> 92.06% delivered)
+# without a single drop being reported, so the guard is not cosmetic.
+PRUNE_SLACK_PCT = 0.5
+
 
 def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
                     model: ScannerModel, gate, kin=None) -> StrokeBuilder | None:
@@ -39,6 +46,33 @@ def _stroke_builder(cfg: PlannerConfig, target: TargetSet, station: Station,
     if cfg.stroke.max_stroke_mm <= 0.0:
         return None
     return StrokeBuilder(target.samples, station, model, cfg, visible=gate, gate=kin)
+
+
+def _prune_to_target(items: list[Stroke], item_sets: list[np.ndarray],
+                     item_rows: list[int], combined: CoverageResult,
+                     cfg: PlannerConfig, limit_pct: float,
+                     say) -> list[int]:
+    """Which items survive pruning, or all of them when the selection is already at target.
+
+    The guard exists because pruning is only meaningful on an OVERSHOOT. When the selected
+    set already sits within `PRUNE_SLACK_PCT` of the requirement, removing anything takes
+    coverage away from an answer that was already acceptable - and it does so silently,
+    because nothing was "dropped" by the hard gate and the report has no field for it.
+    """
+    if not items or float(combined.target_area_mm2) <= 0.0:
+        return list(range(len(items)))
+    area = np.asarray(combined.area_mm2, dtype=float)
+    seen = np.zeros(int(combined.n_targets), dtype=bool)
+    for row in item_rows:
+        seen[combined.sets[int(row)]] = True
+    selected_pct = 100.0 * float(area[seen].sum()) / float(combined.target_area_mm2)
+    if selected_pct <= limit_pct + PRUNE_SLACK_PCT:
+        say(f"  pruning skipped: the selection sits at {selected_pct:.2f}%, within "
+            f"{PRUNE_SLACK_PCT:g} of the {limit_pct:g}% requirement")
+        return list(range(len(items)))
+    return prune(items, item_sets, list(range(len(items))), combined.area_mm2,
+                 combined.target_area_mm2, target_pct=limit_pct,
+                 max_rounds=cfg.stroke.max_prune_rounds)
 
 
 def _group_selection(combined: CoverageResult, coverage: CoverageResult,
@@ -169,13 +203,11 @@ def _one_delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[i
             items.append(stroke_cov.strokes[int(row) - n_poses])
 
     target_pct = cfg.target.coverage_target_pct
-    kept = prune(items, item_sets, list(range(len(items))), combined.area_mm2,
-                 combined.target_area_mm2,
-                 target_pct=PRUNE_TARGET_PCT if target_pct is None else target_pct,
-                 max_rounds=cfg.stroke.max_prune_rounds)
+    limit_pct = PRUNE_TARGET_PCT if target_pct is None else target_pct
+    kept = _prune_to_target(items, item_sets, item_rows, combined, cfg, limit_pct, say)
     if len(kept) < len(items):
         say(f"  pruning: {len(items)} selected items -> {len(kept)} while staying at "
-            f"{(PRUNE_TARGET_PCT if target_pct is None else target_pct):g}%")
+            f"{limit_pct:g}%")
     kept_rows = [item_rows[index] for index in kept]
     path = build_path([items[index] for index in kept], cfg=cfg, station=station,
                       model=model, coverage_index=lambda index: kept_rows[index],
