@@ -15,6 +15,7 @@ dependencies = [
     "ortools==9.4.1874",
     "protobuf==4.21.5",
     "pyglet==1.5.26",
+    "rtree==1.0.0",
     "scikit-learn==1.1.2",
     "scipy==1.8.1",
     "trimesh==3.12.7",
@@ -23,10 +24,12 @@ dependencies = [
 [project.optional-dependencies]
 # Fast ray casting.  Without it trimesh falls back to a pure-Python intersector
 # that is roughly three orders of magnitude slower, which makes a real part
-# impractical to plan.  The planner works without it, just slowly, so this is an
-# extra rather than a hard dependency.
+# impractical to plan.  The planner works without it, just slowly.
+#
+# `rtree` is NOT in this extra: trimesh 3.12.7's own intersector builds a
+# triangle bounds tree too, so it is needed by both backends and lives in the
+# main dependency list above.
 embree = [
-    "rtree==1.0.0",
     "embreex==4.4.0",
     # trimesh's pyembree bridge imports pkg_resources, which setuptools stopped
     # shipping in version 70.
