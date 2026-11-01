@@ -189,10 +189,13 @@ def test_the_page_offers_a_fast_run_next_to_the_delivery_mode():
     page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
 
     assert 'id="fastMode"' in page
-    assert 'value="accurate" selected' in page
-    assert 'value="fast"' in page
+    assert 'value="accurate"' in page
+    assert 'value="fast" selected' in page, "the 10 mm grid is what the panel starts on"
     assert 'id="fastNoOcclusion"' in page
     assert "不能当验收依据" in page
+    # Fast starts selected, so the sub-option cannot start disabled or it would look
+    # unavailable until the operator switched away and back.
+    assert '<input id="fastNoOcclusion" type="checkbox">' in page
 
 
 def test_fast_reaches_the_planner_through_the_same_preset_the_cli_uses():
@@ -239,6 +242,42 @@ def test_the_page_offers_a_coverage_target_with_an_unlimited_option():
     # the hint has to say that the target also stops the refinement, which is the whole
     # reason the leftover areas look the way they do
     assert "二次瞄准" in page
+
+
+def test_the_advanced_panel_holds_the_recipe_and_starts_collapsed():
+    page = (Path(scanweb.__file__).parent / "index.html").read_text(encoding="utf-8")
+
+    # One fold for everything an operator sets once per part, so the panel keeps showing the
+    # few things they touch on every run.
+    assert '<details class="advanced-config" id="advancedConfig">' in page
+    assert '<details class="advanced-config" id="advancedConfig" open' not in page
+    for control in ("scanMode", "fastMode", "fastNoOcclusion", "planMode", "routeStyle",
+                    "coverageTarget", "coverageTargetNone", "strokeCornerCost"):
+        assert f'id="{control}"' in page
+    # Folded away or not, the header has to say which recipe is armed; the readout is filled
+    # from the controls themselves so the two cannot drift apart.
+    assert 'id="advancedReadout"' in page
+    # The panel starts on the measured recipe, not on the configuration's identity presets.
+    assert 'value="banded" selected' in page
+    assert 'value="tidy" selected' in page
+    assert 'id="coverageTarget" type="number" value="99"' in page
+
+
+def test_the_recipe_the_panel_starts_on_is_a_plan_the_server_accepts():
+    from scanweb import SITE_DEFAULTS, _delivery_config
+
+    recipe = _delivery_config(dict(SITE_DEFAULTS))
+    assert recipe.stroke.plan_mode == "banded"
+    assert recipe.stroke.route_style == "tidy"
+    assert recipe.stroke.connector == "straight-then-lateral"
+    assert recipe.stroke.stroke_corner_cost == pytest.approx(2.0)
+    assert recipe.target.coverage_target_pct == pytest.approx(99.0)
+    assert recipe.fast.enabled is True
+    assert recipe.stroke.enabled is True
+    # The page is told to start there instead of on the configuration's own defaults, and
+    # the two stay separate: the CLI still plans `standard` unless asked otherwise.
+    assert scanweb._public_config()["defaults"] == SITE_DEFAULTS
+    assert _delivery_config({}).stroke.plan_mode == "standard"
 
 
 def test_the_coverage_target_reaches_the_planner_and_can_be_switched_off():
@@ -776,6 +815,8 @@ def a_setup(point: float = 1.0, *, name: str = "PART01") -> dict:
             "fast_no_occlusion": True,
             "coverage_target_pct": 97.5,
             "route_style": "tidy",
+            "plan_mode": "banded",
+            "stroke_corner_cost": 1.5,
         },
     }
 
@@ -804,6 +845,10 @@ def test_a_saved_setup_returns_the_meshes_and_the_picks(tmp_path, monkeypatch):
     # The route style survives a save/restore, or an operator who picked it has to remember
     # to pick it again every time the program restarts.
     assert restored["setup"]["route_style"] == "tidy"
+    # Same for the rest of the advanced panel: it is where the sweeps-vs-stops recipe lives,
+    # so losing it on restart would silently plan the part a different way.
+    assert restored["setup"]["plan_mode"] == "banded"
+    assert restored["setup"]["stroke_corner_cost"] == pytest.approx(1.5)
     assert "robot_gate" not in restored["setup"], "the switch is gone, not just defaulted"
     # The names the operator picked, so a restore shows the same files, not `part.stl`.
     assert restored["setup"]["model_names"] == {"part": "零件v2.stl", "support": "夹具.stl"}

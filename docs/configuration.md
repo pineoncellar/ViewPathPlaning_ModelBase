@@ -471,8 +471,12 @@ uv run scanplan plan --station input/<工位>.json --config configs/fast.json --
   `FAST MODE`；
 - 一条守着的不变量：`coverage_pct` **等于**路径里所有覆盖点的并集；`swept_coverage_pct`
   另算过渡段顺手扫到的面积，只作参考、不参与验收；
-- 网页端显示的默认值来自 `GET /api/config`，也就是服务端**实际会用的**那份配置——页面说
-  扫掠，跑的就是扫掠。
+- 「高级配置」面板**打开时**的起点值来自 `GET /api/config` 的 `defaults`（即
+  `scanweb.SITE_DEFAULTS`：扫掠 / 快速 / 扫掠优先 / 整齐 / 99% / 2.0），而 `GET /api/config`
+  顶层的 `plan_mode`、`route_style`、`coverage_target_pct` 等描述的是**配置文件**（出厂值仍是
+  `standard` / `direct`）。两者分开是有意的：配置文件那套是命令行与回归基准的参照，改它会让
+  `--plan-mode standard` 名不副实；页面这套是现场实测合用的配方。页面每次规划都会把面板里的
+  六项原样发给服务端，所以屏幕上显示什么，跑的就是什么。
 
 ### 三块新读的地方（2026-10-29）
 

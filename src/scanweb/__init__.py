@@ -426,6 +426,25 @@ def _download_entries(prog_name: str) -> list[dict[str, str]]:
     ]
 
 
+# 高级配置面板的起点值。这不是配置文件的出厂值，两者故意分开：
+#
+# * 出厂值（`PLAN_PRESETS` / `ROUTE_PRESETS` 的默认项，即 standard + direct + 不设覆盖率
+#   上限）是命令行和回归基准的参照，改它等于让 `--plan-mode standard` 变成一句空话；
+# * 这里是 2026-11-01 在同一工位、同一 10 mm 网格、同一 99% 目标下实测出的现场配方，
+#   页面每次规划都会把它看见的这六项原样发回来，所以“屏幕显示什么”就是“这一跑按什么跑”。
+#
+# 放在服务端而不是写死在 `index.html`，是因为 `app.js` 本来就在 `/api/config` 拿起点值：
+# 页面不再自己藏一套默认值，改配方只改这一处。
+SITE_DEFAULTS = {
+    "delivery_mode": "stroke",
+    "fast": True,
+    "plan_mode": "banded",
+    "route_style": "tidy",
+    "coverage_target_pct": 99.0,
+    "stroke_corner_cost": 2.0,
+}
+
+
 def _public_config() -> dict:
     """What the page is allowed to know about the shipped configuration, as defaults.
 
@@ -467,6 +486,9 @@ def _public_config() -> dict:
         # numbers it will actually use.
         "plan_mode": config.stroke.plan_mode,
         "plan_modes": list(PLAN_MODES),
+        # 页面起点值（见 `SITE_DEFAULTS`）：上面那些键描述的是配置文件，这里描述的是
+        # 折叠面板一打开时的样子。两者可以不同，页面用的是这一份。
+        "defaults": dict(SITE_DEFAULTS),
     }
 
 

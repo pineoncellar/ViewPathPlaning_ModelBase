@@ -908,6 +908,21 @@ function requireStrokeCornerCost() {
   return value;
 }
 
+// 高级配置默认收起，收起时能读到的只有这一行，所以它必须从控件本身推出来，
+// 不能另写一份文案——两份文案迟早会有一份说谎。
+function renderAdvancedReadout() {
+  const readout = $("advancedReadout");
+  if (!readout) return;
+  const target = coverageTargetInput();
+  readout.textContent = [
+    $("scanMode").value === "pose" ? "纯位姿" : "扫掠带",
+    $("fastMode").value === "fast" ? "快速网格" : "精确网格",
+    $("planMode").value === "banded" ? "扫掠优先" : "标准",
+    $("routeStyle").value === "tidy" ? "整齐" : "直连",
+    target === null ? "覆盖率不限" : "覆盖率 " + target + "%"
+  ].join(" · ");
+}
+
 function payload(includeMeshes) {
   if (state.picked.length !== state.pointCount) {
     throw new Error("请在 3D 模型上依次选取 " + state.pointCount + " 个定位点");
@@ -1494,6 +1509,7 @@ function syncSetupFromResult(result) {
   if (result.coverage_target_pct !== undefined) {
     showCoverageTarget(result.coverage_target_pct);
   }
+  renderAdvancedReadout();
   if (Number.isFinite(Number(result.uframe))) {
     $("measureFrame").value = String(Number(result.uframe));
   }
@@ -1755,6 +1771,12 @@ function bindEvents() {
     $("fastNoOcclusion").disabled = !fast;
     if (!fast) $("fastNoOcclusion").checked = false;
   });
+  // 收起状态下那行摘要跟着面板里任何一个控件走，不用逐个控件挂监听。
+  const advanced = $("advancedConfig");
+  if (advanced) {
+    advanced.addEventListener("change", renderAdvancedReadout);
+    advanced.addEventListener("input", renderAdvancedReadout);
+  }
   $("coverageTargetNone").addEventListener("change", () => {
     $("coverageTarget").disabled = $("coverageTargetNone").checked;
   });
@@ -2323,6 +2345,7 @@ async function loadSelectedSetup() {
 
     updateAxisBadge("方案：" + (saved.scan_face_axis ? AXIS_LABELS[saved.scan_face_axis] : "未记录"));
     renderDatumRows();
+    renderAdvancedReadout();
     registrationRequest += 1;
     window.clearTimeout(registrationTimer);
     fitView();
@@ -2357,15 +2380,27 @@ async function deleteSelectedSetup() {
   }
 }
 
-// Defaults come from the configuration the server will actually run, so the screen and
-// the plan cannot disagree about which deliverable is being asked for. The page keeps
-// working if the endpoint is unavailable: its own default stays in place.
+// Defaults come from the server, so the screen and the plan cannot disagree about which
+// deliverable is being asked for. The page keeps working if the endpoint is unavailable:
+// its own default stays in place.
+//
+// Two different things arrive here. `config.*` is the configuration the planner itself
+// will read (the identity presets the CLI and the regression baselines use); the page only
+// uses it for the grid labels on the speed choice. `config.defaults` is the site recipe this
+// panel starts on, which is what the operator sees and what every run posts back; keeping
+// them apart is what lets `banded`/`tidy`/99% be the on-screen start without turning
+// `--plan-mode standard` into a lie.
+function setChoice(id, value) {
+  const control = $(id);
+  if (!control || value === undefined || value === null) return;
+  const allowed = Array.from(control.options).map((option) => option.value);
+  if (allowed.includes(String(value))) control.value = String(value);
+}
+
 async function applyServerDefaults() {  try {
     const response = await fetch("/api/config");
     if (!response.ok) return;
     const config = await response.json();
-    const mode = $("scanMode");
-    if (mode && config.delivery_mode) mode.value = config.delivery_mode;
     // The labels carry the grid each choice will actually run, so they cannot drift from
     // the configuration the server holds.
     const accurate = document.querySelector('#fastMode option[value="accurate"]');
@@ -2376,38 +2411,33 @@ async function applyServerDefaults() {  try {
     if (fast && config.fast_grid_mm) {
       fast.textContent = "快速 · " + Number(config.fast_grid_mm).toFixed(0) + " mm 采样（约 2 分钟）";
     }
-    // The acceptance target is a site knob, so the control starts on the configuration's
-    // value; `null` means the selection runs until nothing new is covered.
-    if (config.coverage_target_pct !== undefined) {
-      showCoverageTarget(config.coverage_target_pct);
+    const defaults = config.defaults || {};
+    setChoice("scanMode", defaults.delivery_mode);
+    if (typeof defaults.fast === "boolean") {
+      $("fastMode").value = defaults.fast ? "fast" : "accurate";
+      $("fastNoOcclusion").disabled = !defaults.fast;
+      if (!defaults.fast) $("fastNoOcclusion").checked = false;
     }
-    // The route style is a configuration value, so the screen starts on it: a file that
-    // asks for `tidy` must not be silently planned as `direct` because the page defaulted.
-    const style = $("routeStyle");
-    if (style && config.route_style && config.route_styles && config.route_styles.includes(config.route_style)) {
-      style.value = config.route_style;
+    setChoice("planMode", defaults.plan_mode);
+    setChoice("routeStyle", defaults.route_style);
+    // `null` means the selection runs until nothing new is covered.
+    if (defaults.coverage_target_pct !== undefined) {
+      showCoverageTarget(defaults.coverage_target_pct);
     }
-    // Same reasoning for the band price: it is a configuration value, and silently planning
-    // with a different one would make two runs of the same part incomparable.
-    if ($("strokeCornerCost") && config.stroke_corner_cost !== undefined
-        && config.stroke_corner_cost !== null) {
-      $("strokeCornerCost").value = String(config.stroke_corner_cost);
-    }
-    // And for the plan mode, which decides what the selection may even consider.
-    const planMode = $("planMode");
-    if (planMode && config.plan_mode && config.plan_modes
-        && config.plan_modes.includes(config.plan_mode)) {
-      planMode.value = config.plan_mode;
+    if (defaults.stroke_corner_cost !== undefined && defaults.stroke_corner_cost !== null) {
+      $("strokeCornerCost").value = String(defaults.stroke_corner_cost);
     }
   } catch (_error) {
     /* keep the built-in default */
   }
+  renderAdvancedReadout();
 }
 
 function init() {
   initRenderer();
   bindEvents();
   renderDatumRows();
+  renderAdvancedReadout();
   updateAxisBadge("尚未导入零件");
   updateSolveAvailability();
   showResultState("empty");
