@@ -1,4 +1,4 @@
-"""Load the station models and put them into ONE frame.
+﻿"""Load the station models and put them into ONE frame.
 
 The station is part + fixture + base + tracker. All of them must live in a
 single CAD frame before anything else runs, because every later number
@@ -25,6 +25,7 @@ from scipy.spatial import cKDTree
 from .config import read_json
 from .geometry import sample_surface_seeded
 from .raycast import RayCaster
+from .winding import repair_winding
 
 IDENTITY_4X4 = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
                 (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
@@ -89,6 +90,10 @@ class Station:
     base_cloud_mm: np.ndarray
     fixture_tree: cKDTree
     base_tree: cKDTree
+    # What `winding.repair_winding` did to the part, empty when nothing had to be fixed.
+    # Stage 1 owns this: the split, the sampling and the feature mask all read `face_normals`,
+    # so a mis-wound patch poisons every one of them at once.
+    winding: dict = field(default_factory=dict)
     _obstacles: dict[str, Any] | None = field(default=None, init=False, repr=False,
                                               compare=False)
 
@@ -97,6 +102,9 @@ class Station:
 
         All three block sight lines, so the coverage stage needs them together, and
         building an intersector per call would dominate a real part's runtime.
+
+        Go through :func:`casters_for` rather than calling this directly: that is where a
+        fast run decides not to model sight lines at all.
         """
         if self._obstacles is None:
             self._obstacles = {
@@ -136,6 +144,21 @@ class Station:
         if kwargs.get("base_plane_mm") is None and self.description.mounting_plane_z_mm:
             kwargs["base_plane_mm"] = self.description.mounting_plane_z_mm
         return check_alignment(self, **kwargs)
+
+
+def casters_for(station: Station, config) -> dict[str, RayCaster]:
+    """The sight-line blockers for this run: the three meshes, or none at all.
+
+    One function because this is the only place the decision is allowed to be made. A
+    fast run (`fast.no_occlusion`) gets an empty mapping, and `measure_mask` already
+    treats that as "nothing blocks": `nearest_across({})` returns infinity for every ray,
+    so `blocked` is all-false and the mask is exactly `geometry_mask`. Nothing else has to
+    know; nothing else may special-case it.
+
+    Not used by `split_sheet`'s mirror pass, which needs real rays to find the two faces
+    of the blank - without that pass there is no target surface to be fast about.
+    """
+    return {} if config.fast.no_occlusion else station.obstacles()
 
 
 def read_transform(values) -> np.ndarray:
@@ -190,8 +213,14 @@ def load_station_description(path: str | Path) -> StationDescription:
     )
 
 
-def load_models(description: StationDescription) -> tuple[trimesh.Trimesh, ...]:
+def load_models(description: StationDescription, *, repair: bool = True
+                ) -> tuple[trimesh.Trimesh, ...]:
     """The three models in the station frame, without the clearance clouds.
+
+    The part comes back with its winding repaired (stage 1) unless `repair=False`, and the
+    repair record is the fourth element - the caller publishes it in the report, because a
+    run that had to flip 39 % of the "upper" face is a run whose coverage number needs that
+    context next to it.
 
     Kept separate from :func:`load_station` because the 3D view needs the meshes only:
     sampling 400k obstacle points to draw a picture would waste the bulk of its runtime.
@@ -201,14 +230,17 @@ def load_models(description: StationDescription) -> tuple[trimesh.Trimesh, ...]:
     fixture = apply_transform(_load_mesh(description.fixture, "fixture"),
                               read_transform(description.transform_fixture))
     base = _load_mesh(description.base, "base")
-    return part, fixture, base
+    winding: dict = {}
+    if repair:
+        part, winding = repair_winding(part)
+    return part, fixture, base, winding
 
 
 def load_station(description: StationDescription, *, cloud_seed: int,
                  fixture_cloud_points: int = 200_000,
                  base_cloud_points: int = 200_000) -> Station:
-    """Load the three models, realign part and fixture, and sample the obstacles."""
-    part, fixture, base = load_models(description)
+    """Load the three models, repair the part's winding, and sample the obstacles."""
+    part, fixture, base, winding = load_models(description)
 
     fixture_cloud = sample_surface_seeded(
         fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)[0]
@@ -218,6 +250,7 @@ def load_station(description: StationDescription, *, cloud_seed: int,
         part=part, fixture=fixture, base=base, description=description,
         fixture_cloud_mm=fixture_cloud, base_cloud_mm=base_cloud,
         fixture_tree=cKDTree(fixture_cloud), base_tree=cKDTree(base_cloud),
+        winding=winding,
     )
 
 
@@ -558,3 +591,4 @@ def _orientation_shares(mesh) -> dict[str, float]:
         shares[f"+{axis.upper()}"] = positive
         shares[f"-{axis.upper()}"] = negative
     return shares
+
