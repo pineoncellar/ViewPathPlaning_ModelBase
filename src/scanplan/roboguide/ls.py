@@ -76,7 +76,29 @@ def check_joint_speed(speed: str) -> str:
     return text
 
 
-def _pos_block(index: int, kind: str, uframe: int, utool: int, config: str, payload) -> str:
+def _pos_block(index: int, kind: str, uframe: int, utool: int, config: str, payload,
+               track_mm: float | None = None, joint_label: str = "J7") -> str:
+    """One `P[n]` block.
+
+    `track_mm` is the seventh axis, and it is spelled TWO ways because the controller spells
+    it two ways:
+
+    * a JOINT block counts axes by number inside the group, so the extended axis is `J7`;
+      a joint block with six `J` values and a stray `E1` is `ASBN-009 Mismatch number of
+      joint` at load - which is what a real ROBOGUIDE import reported on the first point of
+      a rail plan;
+    * a CARTESIAN block names it `E1`, in millimetres, on its own line after `R` - and that
+      is the form a working program exported from the same cell carries.
+
+    `joint_label` is the escape hatch: set it to `E1` if a controller insists on the
+    Cartesian spelling in joint blocks too.
+    """
+    rail = ""
+    if track_mm is not None:
+        if kind == "joint" and str(joint_label).upper() == "J7":
+            rail = f",\n\tJ7={fanuc_num(track_mm)} mm"
+        else:
+            rail = f",\n\tE1={fanuc_num(track_mm)}  mm"
     if kind == "joint":
         joints = payload
         return (
@@ -86,7 +108,7 @@ def _pos_block(index: int, kind: str, uframe: int, utool: int, config: str, payl
             f"\tJ1= {fanuc_num(joints[0])} deg,\tJ2= {fanuc_num(joints[1])} deg,"
             f"\tJ3= {fanuc_num(joints[2])} deg,\n"
             f"\tJ4= {fanuc_num(joints[3])} deg,\tJ5= {fanuc_num(joints[4])} deg,"
-            f"\tJ6= {fanuc_num(joints[5])} deg\n"
+            f"\tJ6= {fanuc_num(joints[5])} deg{rail}\n"
             f"}};"
         )
     x, y, z, w, p, r = payload
@@ -95,7 +117,7 @@ def _pos_block(index: int, kind: str, uframe: int, utool: int, config: str, payl
         f"   GP1:\n"
         f"\tUF : {uframe}, UT : {utool},\t\tCONFIG : '{config}',\n"
         f"\tX = {fanuc_num(x)}  mm,\tY = {fanuc_num(y)}  mm,\tZ = {fanuc_num(z)}  mm,\n"
-        f"\tW = {fanuc_num(w)} deg,\tP = {fanuc_num(p)} deg,\tR = {fanuc_num(r)} deg\n"
+        f"\tW = {fanuc_num(w)} deg,\tP = {fanuc_num(p)} deg,\tR = {fanuc_num(r)} deg{rail}\n"
         f"}};"
     )
 
@@ -115,6 +137,9 @@ def build_ls(
     constant: str = "",
     home_joints=None,
     joint_blocks: bool = False,
+    emit_e1: bool = True,
+    joint_rail_label: str = "J7",
+    cartesian_only: bool = False,
     stamp: datetime | str | None = None,
 ) -> str:
     """Render the whole `.LS` program.
@@ -187,10 +212,22 @@ def build_ls(
             point_speed = check_speed(str(pt.get("speed") or speed), point_motion)
         joints = pt.get("joints_deg")
         wanted = str(pt.get("representation") or ("joint" if joint_blocks else "cart"))
+        if cartesian_only:
+            # `cartesian_only` exists for one measurement: a controller that refuses ANY
+            # seventh value in a joint-representation block (`ASBN-009 Mismatch number of
+            # joint`, whether the axis is called `J7` or `E1`) while accepting the same
+            # value in a Cartesian block. Writing every point as Cartesian is then the only
+            # shape that loads, and it is exactly the shape that cell's own exports have.
+            # What is lost is the pinned branch on the joint points: the controller resolves
+            # those poses itself, so the CONFIG letters above are a hint again.
+            wanted = "cart"
         as_joint = bool(wanted == "joint" and joints is not None)
+        rail = pt.get("track_mm") if emit_e1 else None
+        rail = None if rail is None else float(rail)
         if as_joint:
             pos_blocks.append(
-                _pos_block(next_index, "joint", uframe, utool, point_config, joints))
+                _pos_block(next_index, "joint", uframe, utool, point_config, joints, rail,
+                           joint_label=joint_rail_label))
         else:
             pos_blocks.append(
                 _pos_block(
@@ -200,6 +237,8 @@ def build_ls(
                     utool,
                     point_config,
                     (*pt["xyz_mm"].tolist(), *pt["wpr_deg"]),
+                    rail,
+                    joint_label=joint_rail_label,
                 )
             )
         point_specs.append((point_motion, point_termination, point_speed, as_joint))

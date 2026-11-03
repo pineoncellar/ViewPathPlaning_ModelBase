@@ -17,16 +17,18 @@ import pytest
 
 from scanplan.config import RobotParams
 from scanplan.coverage import attribute_uncovered, evaluate
-from scanplan.kinematics import KinematicGate
+from scanplan.kinematics import KinematicGate, turn_digits
 from scanplan.path import (
     LEVEL_JOINT,
     ROLE_COVERAGE,
+    ROLE_RETRACT,
     PathPoint,
     _BranchOnly,
     _joint_move,
     _unwrap_readings,
     assign_branches,
     build_path,
+    ease_over_cap_j6,
 )
 from scanplan.scanner_model import ScannerModel, ScannerPose
 from scanplan.strokes import Stroke
@@ -255,9 +257,74 @@ def test_no_segment_of_the_unwrapped_chain_jumps_more_than_the_bottleneck():
         assert robot.feasible(item.joints_deg)
 
 
+def test_the_unwrap_only_chooses_readings_the_config_column_can_say():
+    """A Cartesian block names the revolution with a turn digit, and it may not be negative.
+
+    `-200` is a legal J6 reading and an illegal CONFIG (`..., -1`). Its equivalent `+160` is
+    the same wrist pose and needs turn 0, so the chain uses that - otherwise the chain-wide
+    objective would win with a number the exporter can only refuse.
+    """
+    robot = gate().robot
+    chain = [_BranchOnly(joints_deg=(0.0, 0.0, 0.0, 0.0, -60.0, j6),
+                         shoulder="N", elbow="U", config="N U T, 0, 0, 0",
+                         j5_margin_deg=30.0, min_margin_deg=30.0)
+             for j6 in (150.0, 200.0, 250.0, -200.0)]
+    _unwrap_readings(chain, robot)
+    readings = [float(item.joints_deg[5]) for item in chain]
+    assert readings == pytest.approx([150.0, 200.0, 250.0, 160.0])
+    assert all(turn_digits(reading) >= 0 for reading in readings)
+
+
+def test_the_unwrap_judges_the_rail_at_the_point_s_own_reading():
+    """On a rail, `feasible(joints)` at the default 0 mm is FALSE for every candidate.
+
+    0 mm is the carriage's end stop, so a chain of perfectly good readings came back with no
+    options at all and the pass silently did nothing - which is why the 2026-11-02 delivery
+    still commanded 307.9 degrees between two J6 readings that are 52 apart.
+    """
+    tracked = KinematicGate(RobotParams(**{**RobotParams.disabled().__dict__,
+                                          "enabled": True, "track_enabled": True}))
+    robot = tracked.robot
+    chain = [_BranchOnly(joints_deg=(0.0, 0.0, 0.0, 0.0, -60.0, j6),
+                         shoulder="N", elbow="U", config="N U T, 0, 0, 0",
+                         j5_margin_deg=30.0, min_margin_deg=30.0, track_mm=600.0)
+             for j6 in (144.6, -163.3)]
+    _unwrap_readings(chain, robot)
+    assert float(chain[1].joints_deg[5]) == pytest.approx(196.7, abs=1e-6)
+    assert str(chain[1].config).endswith(", 0, 0, 1")
+
+
+def test_the_j6_easing_pass_cannot_send_the_next_move_through_the_seam():
+    """A point is the end of TWO moves; judging only the arrival fixes one and breaks the other.
+
+    This is the 2026-11-02 rail run: P[14] sat between J6 = -164.0 and +130.1 with the
+    continuous reading +191.5, the move out was 61.4 deg against a 60 deg cap, and the easing
+    pass "fixed" it by taking a freshly solved -168.5 - the same 61.4 deg of wrist turn, but
+    written a full revolution away, so `J P[15]` commanded 298.6 degrees. Nothing to gain and
+    a great deal to lose: the reading must be left alone.
+    """
+    positions = [np.array([0.0, 0.0, 1000.0]), np.array([100.0, 0.0, 1000.0]),
+                 np.array([0.0, 100.0, 1000.0])]
+    points = [PathPoint(position=positions[0], axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                        role=ROLE_COVERAGE, source="greedy"),
+              PathPoint(position=positions[1], axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                        role=ROLE_RETRACT, source="connector"),
+              PathPoint(position=positions[2], axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                        role=ROLE_COVERAGE, source="greedy")]
+    # a fresh solve always lands on the roomiest reading - the far side of the seam
+    fresh = [_stub_solution((0.0, 0.0, 0.0, 0.0, -60.0, -168.5))]
+    gate = _StubGate({tuple(np.round(position, 6)): fresh for position in positions})
+    solutions = [_stub_solution((0.0, 0.0, 0.0, 0.0, -60.0, -164.0)),
+                 _stub_solution((0.0, 0.0, 0.0, 0.0, -60.0, 191.5)),
+                 _stub_solution((0.0, 0.0, 0.0, 0.0, -60.0, 130.1))]
+    notes = ease_over_cap_j6(points, solutions, gate, 60.0)
+    assert float(solutions[1].joints_deg[5]) == pytest.approx(191.5)
+    assert any("still turn J6" in note for note in notes)
+
+
 def _stub_solution(joints, config="N U T, 0, 0, 0"):
     return SimpleNamespace(joints_deg=tuple(float(v) for v in joints), config=config,
-                           min_margin_deg=30.0, j5_margin_deg=30.0)
+                           min_margin_deg=30.0, j5_margin_deg=30.0, ok=True)
 
 
 class _StubGate:

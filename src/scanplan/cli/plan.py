@@ -82,6 +82,16 @@ def configure(subparsers) -> None:
                               "count of corners a band needs and 1.0 prices it like a pose, "
                               "which sweeps more of the part at the same coverage. Range "
                               "[1.0, 2.0] is the useful part")
+    planner.add_argument("--joint-margin", dest="joint_margin", type=float, metavar="DEG",
+                         help="degrees to keep every joint away from its usable band. The "
+                              "envelope is a CEILING of 98%% span with 5 deg inside it, so "
+                              "this can only make it stricter: a run at 0 deg delivered a "
+                              "point 1.2 deg under the J2 ceiling and ROBOGUIDE answered "
+                              "MOTN-018. 5 is the minimum, 8-10 is a comfortable site "
+                              "value")
+    planner.add_argument("--joint-span", dest="joint_span", type=float, metavar="FRACTION",
+                         help="fraction of each axis span the planner may use (0 < f <= 0.98). "
+                              "Also a ceiling: 0.98 is fixed and wider values are refused")
     planner.add_argument("--face", choices=FACES, help="which face of the blank to scan")
     planner.add_argument("--tracker", help="tracker pose 'x,y,z' if the station has none")
     planner.add_argument("--tracker-aim", help="tracker aim point 'x,y,z'")
@@ -184,6 +194,16 @@ def _apply_overrides(cfg, args, parser: argparse.ArgumentParser):
         # part of a route's shape. `override` validates, and the ValueError it raises is
         # reported by the same handler that reads the configuration file.
         cfg = override(cfg, stroke={"stroke_corner_cost": float(args.stroke_corner_cost)})
+    if getattr(args, "joint_margin", None) is not None or getattr(args, "joint_span",
+                                                                 None) is not None:
+        # After `plan_preset`: the mode's envelope is a starting point, not the last word.
+        # This is how "keep the tilted seed family, but stop riding the limits" is spelled.
+        changes = {}
+        if getattr(args, "joint_margin", None) is not None:
+            changes["joint_margin_deg"] = float(args.joint_margin)
+        if getattr(args, "joint_span", None) is not None:
+            changes["joint_span_fraction"] = float(args.joint_span)
+        cfg = override(cfg, robot=changes)
     if args.fast:
         grid = FAST_SAMPLE_GRID_MM if args.fast_grid is None else float(args.fast_grid)
         if grid < FAST_MIN_SAMPLE_GRID_MM:

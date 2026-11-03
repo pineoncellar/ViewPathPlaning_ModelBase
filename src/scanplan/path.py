@@ -36,6 +36,7 @@ import numpy as np
 from .config import PlannerConfig
 from .contracts import ConnectorResult
 from .geometry import tangents, unit
+from .kinematics import turn_digits
 from .policies import connector_policy
 from .scanner_model import ScannerModel, ScannerPose
 from .scene import Station
@@ -111,6 +112,10 @@ class PathPoint:
     # is the only way a planned branch survives to the machine.
     motion: str | None = None
     representation: str | None = None
+    # The seventh axis: where the carriage sits when the TCP is here, in millimetres of
+    # rail. Zero on a floor-mounted arm, and the reason the programme can carry an `E1`
+    # column without every stored run changing.
+    track_mm: float = 0.0
 
 
 @dataclass
@@ -146,6 +151,9 @@ class PathPlan:
     # difference matters: a point list already containing retract corners cannot be re-branched
     # without invalidating the reason those corners were inserted.
     joint_planned: bool = False
+    # True when the seventh axis was part of this run. Zero rails and no rail are the same
+    # number, so the flag is what keeps `E1` out of a floor-mounted program.
+    track_enabled: bool = False
     # Transitions the joint move could not take, by reason, so "the connector got worse" has
     # a cause instead of a sentence that covers four of them.
     connector_failures: dict[str, int] = field(default_factory=dict)
@@ -507,6 +515,7 @@ class _ItemJoints:
     start: object | None = None
     exit_deg: np.ndarray | None = None
     exit_margin_deg: float | None = None
+    exit_track_mm: float = 0.0
     reason: str = ""
 
 
@@ -529,15 +538,21 @@ def _item_options(entry: PathPoint, leave: PathPoint | None, kin, cfg: PlannerCo
         return [], "no_ik_solution"
     if leave is None:
         return [(item, np.asarray(item.joints_deg, dtype=float),
-                 float(item.min_margin_deg)) for item in found], ""
+                 float(item.min_margin_deg), float(item.track_mm)) for item in found], ""
     options = []
     reason = ""
     for item in found:
+        # The carriage HOLDS through a sweep. A tilted band is one straight line at a fixed
+        # attitude; sliding the rail while the head scans adds nothing the arm cannot do and
+        # spends travel the programme has to pay for. So the walk is asked to end where it
+        # started and the exit rail reading is the entry one.
         verdict = kin.follow(item.joints_deg, leave.position, leave.axis, leave.roll_deg,
-                             step_mm=float(cfg.stroke.check_step_mm))
+                             step_mm=float(cfg.stroke.check_step_mm),
+                             track_start=float(item.track_mm),
+                             track_end=float(item.track_mm))
         if verdict.ok:
             options.append((item, np.asarray(verdict.joints_deg, dtype=float),
-                            float(verdict.min_margin_deg)))
+                            float(verdict.min_margin_deg), float(item.track_mm)))
         elif not reason:
             reason = f"stroke_{verdict.reason}"
     return options, ("" if options else reason or "stroke_unknown")
@@ -558,10 +573,16 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
     J6 changes are priced at `robot.j6_weight` times their size, for the reason
     `_joint_step_deg` gives.
 
-    Changing the CONFIG family is priced at `robot.config_change_cost_deg`, and DOUBLE that
-    between the two ends of one sweep: those two corners are the same pose, so a family change
-    there is not a preference but a jump the scan would ride through. Zero - the default -
-    prices the swing as free, which is what every program before this key was written with.
+    A CONFIG family change is NOT allowed here, and that is not a preference: a straight
+    Cartesian move cannot change family mid-line (the controller answers `MOTN-063`), the
+    connector proves those lines wherever it can, and the delivery audit refuses to write a
+    program whose recorded joints are on another family than the line arrives at. Pricing the
+    change - which is what `robot.config_change_cost_deg` used to do - only made it expensive,
+    so the sequencing could still buy it, and the whole run died at export on
+    `branch_mismatch`.
+    `robot.config_change_cost_deg` is now the price of the FALLBACK: when no single family can
+    carry the chain, this pass relaxes to pricing (a joint move may legally change family) and
+    records a violation saying so.
     """
     states = [_ItemJoints() for _ in items]
     weight = float(cfg.robot.j6_weight)
@@ -569,6 +590,7 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
     travel = float(getattr(cfg.robot, "j6_travel_weight", 0.0))
     flip_cost = float(getattr(cfg.robot, "wrist_flip_cost_deg", 0.0))
     family_cost = float(getattr(cfg.robot, "config_change_cost_deg", 0.0))
+    track_price = float(getattr(cfg.robot, "track_cost_deg_per_mm", 0.0))
     options: list[list[tuple]] = []
     for position, (_index, entry, leave) in enumerate(items):
         found, reason = _item_options(entry, leave, kin, cfg)
@@ -578,40 +600,73 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
     keep = [position for position, found in enumerate(options) if found]
     if not keep:
         return states
-    total: list[list[float]] = [[0.0] * len(options[keep[0]])]
-    parent: list[list[int]] = [[0] * len(options[keep[0]])]
-    for depth in range(1, len(keep)):
-        previous = options[keep[depth - 1]]
-        same_sweep = (items[keep[depth]][1].stroke_id is not None
-                      and items[keep[depth]][1].stroke_id == items[keep[depth - 1]][1].stroke_id)
-        row_total: list[float] = []
-        row_parent: list[int] = []
-        for solution, _exit, _margin in options[keep[depth]]:
-            best_cost, best_source = float("inf"), 0
-            for source, (_prev_solution, prev_exit, _prev_margin) in enumerate(previous):
-                cost = total[depth - 1][source] + _step_cost(prev_exit,
-                                                            solution.joints_deg,
-                                                            weight, cap, travel)
-                if float(np.asarray(prev_exit)[4]) * float(solution.joints_deg[4]) < 0.0:
-                    cost += flip_cost
-                cost += _config_penalty(_prev_solution, solution, family_cost,
-                                        doubled=same_sweep)
-                if cost < best_cost:
-                    best_cost, best_source = cost, source
-            row_total.append(best_cost)
-            row_parent.append(best_source)
-        total.append(row_total)
-        parent.append(row_parent)
+
+    def solve(forbid_family: bool) -> tuple[list[list[float]], list[list[int]]]:
+        """The dynamic programme, with a family change either impossible or just priced."""
+        total: list[list[float]] = [[0.0] * len(options[keep[0]])]
+        parent: list[list[int]] = [[0] * len(options[keep[0]])]
+        for depth in range(1, len(keep)):
+            previous = options[keep[depth - 1]]
+            same_sweep = (
+                items[keep[depth]][1].stroke_id is not None
+                and items[keep[depth]][1].stroke_id == items[keep[depth - 1]][1].stroke_id)
+            row_total: list[float] = []
+            row_parent: list[int] = []
+            for solution, _exit, _margin, _exit_track in options[keep[depth]]:
+                best_cost, best_source = float("inf"), 0
+                family = _config_family(solution)
+                for source, (_prev_solution, prev_exit, _prev_margin,
+                             prev_exit_track) in enumerate(previous):
+                    if forbid_family and _config_family(_prev_solution) != family:
+                        # Not a cheap move - an impossible one for the L that may fly it.
+                        continue
+                    cost = total[depth - 1][source] + _step_cost(prev_exit,
+                                                                solution.joints_deg,
+                                                                weight, cap, travel)
+                    cost += _track_cost(prev_exit_track, float(solution.track_mm), track_price)
+                    if float(np.asarray(prev_exit)[4]) * float(solution.joints_deg[4]) < 0.0:
+                        cost += flip_cost
+                    cost += _config_penalty(_prev_solution, solution, family_cost,
+                                            doubled=same_sweep)
+                    if cost < best_cost:
+                        best_cost, best_source = cost, source
+                row_total.append(best_cost)
+                row_parent.append(best_source)
+            total.append(row_total)
+            parent.append(row_parent)
+        return total, parent
+
+    total, parent = solve(True)
+    if not np.isfinite(np.asarray(total[-1], dtype=float)).any():
+        total, parent = solve(False)
+        plan.violations.append(
+            "no single CONFIG family carries this program: the sequencing fell back to "
+            "pricing family changes at robot.config_change_cost_deg, and any straight move "
+            "that arrives on a family other than the one recorded will be refused at export")
     pick = int(np.argmin(total[-1]))
     for depth in range(len(keep) - 1, -1, -1):
         position = keep[depth]
-        solution, exit_deg, exit_margin = options[position][pick]
+        solution, exit_deg, exit_margin, exit_track = options[position][pick]
         states[position].start = solution
         states[position].exit_deg = exit_deg
         states[position].exit_margin_deg = exit_margin
+        states[position].exit_track_mm = float(exit_track)
         if depth:
             pick = parent[depth][pick]
     return states
+
+
+def _track_cost(first_mm, second_mm, price_deg_per_mm: float) -> float:
+    """What sliding the carriage between two points costs the sequencing, in degrees.
+
+    A rail is an axis: moving it is a move, and a programme that slides two metres to save
+    five degrees of wrist has usually chosen wrong. Pricing it on the same scale as a joint
+    step is what lets the search compare the two - `track_cost_deg_per_mm` is the exchange
+    rate, and 0 makes the rail free, which is what a floor-mounted arm is.
+    """
+    if not price_deg_per_mm:
+        return 0.0
+    return abs(float(second_mm) - float(first_mm)) * float(price_deg_per_mm)
 
 
 def _branch_record(points: Sequence[PathPoint], solutions: Sequence,
@@ -705,9 +760,11 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
     if kin is not None and kin.active:
         joints = _sequence_joints(targets, kin, cfg, plan)
         plan.joint_planned = True
+        plan.track_enabled = bool(getattr(kin.robot, "track_enabled", False))
 
     previous: PathPoint | None = None
     previous_joints = None
+    previous_track = 0.0
     for position, (index, entry, leave) in enumerate(targets):
         state = None if joints is None else joints[position]
         if state is not None and state.start is None:
@@ -717,17 +774,20 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
                 f"stroke {index} dropped: {state.reason or 'no joint solution'}")
             continue
         start_joints = None if state is None else state.start.joints_deg
+        start_track = 0.0 if state is None else float(getattr(state.start, "track_mm", 0.0))
         entry = PathPoint(
             position=entry.position, axis=entry.axis, roll_deg=entry.roll_deg,
             role=entry.role, source=entry.source, stroke_id=entry.stroke_id,
             coverage_index=entry.coverage_index,
             motion=("J" if state is not None else None),
-            representation=("joint" if state is not None else None))
+            representation=("joint" if state is not None else None),
+            track_mm=start_track)
         if previous is not None:
             routed = _connector(previous, entry, cfg, plan, station, model,
                                 visible=visible, strict=hard,
                                 kin=kin, start_joints=previous_joints,
-                                end_joints=start_joints)
+                                end_joints=start_joints,
+                                start_track=previous_track, end_track=start_track)
             if routed is None:
                 plan.dropped.append(index)
                 _note_drop(plan, "connector_no_route")
@@ -746,12 +806,20 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
             for corner, corner_solution in zip(routed.points,
                                                routed.solutions or [None] * len(
                                                    routed.points), strict=True):
+                # A corner inserted by the connector is a pose like any other, so it carries
+                # the rail reading its own solution was solved at. Without this the default
+                # 0.0 would command the carriage back to the rail's zero on every detour -
+                # outside the usable band, and a move nobody planned.
+                corner_track = (float(getattr(corner_solution, "track_mm", 0.0))
+                                if corner_solution is not None
+                                else float(previous_track))
                 points.append(PathPoint(
                     position=corner.position, axis=corner.axis,
                     roll_deg=corner.roll_deg, role=corner.role, source=corner.source,
                     stroke_id=corner.stroke_id,
                     motion=("J" if corner_solution is not None else None),
-                    representation=("joint" if corner_solution is not None else None)))
+                    representation=("joint" if corner_solution is not None else None),
+                    track_mm=corner_track))
                 solutions.append(corner_solution)
         points.append(entry)
         solutions.append(None if state is None else state.start)
@@ -763,10 +831,12 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
                 role=leave.role, source=leave.source, stroke_id=leave.stroke_id,
                 coverage_index=leave.coverage_index,
                 motion=("L" if state is not None else None),
-                representation=("cart" if state is not None else None)))
+                representation=("cart" if state is not None else None),
+                track_mm=0.0 if state is None else float(state.exit_track_mm)))
             solutions.append(None if state is None else _exit_solution(state, kin.robot))
         previous = points[-1]
         previous_joints = None if state is None else state.exit_deg
+        previous_track = 0.0 if state is None else float(state.exit_track_mm)
 
     if plan.joint_planned:
         _unwrap_readings(solutions, kin.robot)
@@ -779,8 +849,26 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
             verify=lambda a, b: _joint_move(a, b, cfg, station, model,
                                             visible=visible, kin=kin)[0])
         plan.violations.extend(eased)
+        # AGAIN, because `ease_over_cap_j6` replaces a point with a FRESHLY solved solution and
+        # a fresh solve is placed at the roomiest equivalent reading, not at the continuous
+        # one. Without this second pass the easing silently undid the unwrap: measured on the
+        # 2026-11-02 rail run, the chain was unwrapped to J6 = +191.5 and the easing put back
+        # -168.5, so P[14] -> P[15] commanded 299 degrees where 61 were meant. Every physical
+        # pose is unchanged by this pass; only the numbers the program carries are.
+        _unwrap_readings(solutions, kin.robot)
         plan.branches = _branch_record(points, solutions, float(cfg.robot.max_step_deg))
         plan.max_step_deg = plan.branches.max_step_deg
+        warn = float(getattr(cfg.robot, "min_margin_warn_deg", 2.0))
+        tight = [(index + 1, float(item.min_margin_deg))
+                 for index, item in enumerate(solutions)
+                 if item is not None and float(item.min_margin_deg) < warn]
+        if tight:
+            worst = min(tight, key=lambda pair: pair[1])
+            plan.violations.append(
+                f"{len(tight)} delivered point(s) sit within {warn:g} deg of the usable band "
+                f"(worst P[{worst[0]}] at {worst[1]:.2f} deg). A controller with even a "
+                "slightly different model can call those unreachable (MOTN-018), which is "
+                "what 'rides the limits' means in practice; --joint-margin adds a cushion")
         if plan.branches.broken:
             plan.violations.append(
                 f"{len(plan.branches.broken)} joint step(s) exceed max_step_deg "
@@ -843,7 +931,8 @@ def _exit_solution(state: _ItemJoints, robot):
         joints_deg=exit_deg, shoulder=str(start.shoulder), elbow=str(start.elbow),
         config=robot.config_string(exit_deg, start.shoulder, start.elbow),
         j5_margin_deg=float(start.j5_margin_deg),
-        min_margin_deg=min(margin, float(start.min_margin_deg)))
+        min_margin_deg=min(margin, float(start.min_margin_deg)),
+        track_mm=float(state.exit_track_mm))
 
 
 @dataclass(frozen=True)
@@ -856,6 +945,7 @@ class _BranchOnly:
     config: str
     j5_margin_deg: float
     min_margin_deg: float
+    track_mm: float = 0.0
 
 
 
@@ -881,6 +971,13 @@ def _unwrap_readings(solutions: list, robot) -> None:
     elsewhere. Both criteria are computed over the delivered order, so what is optimised is what
     the program commands. A few dozen states per point and a few hundred points, so this is exact
     and costs nothing next to the inverse kinematics that already ran.
+
+    Every candidate must also be expressible as a CONFIG turn digit (non-negative), because
+    that is the only column a Cartesian block has to name the revolution with. `+196.7` and
+    `-163.3` are the same wrist pose; the first needs digit 1 and the second digit 0, and a
+    chain that chooses the two sides of that seam at neighbouring points commands a 360 deg
+    turn that nobody planned. This pass is idempotent and is run AFTER the J6 easing as well,
+    for the same reason: a freshly solved point is placed roomiest, not continuously.
     """
     live = [index for index, item in enumerate(solutions) if item is not None]
     if len(live) < 2:
@@ -890,9 +987,24 @@ def _unwrap_readings(solutions: list, robot) -> None:
         values = np.asarray(solutions[index].joints_deg, dtype=float)
         per_axis = [robot.wraps(axis, float(values[axis])) or [float(values[axis])]
                     for axis in range(6)]
+        # Feasibility is judged at the point's OWN rail reading. Asking about `track_mm=0` - the
+        # default - makes every candidate infeasible on a rail that is in use, because 0 is the
+        # carriage's end stop, so the whole pass silently did nothing on a rail run: this is why
+        # the 2026-11-02 delivery kept a 307.9 deg J6 step between two readings that are 52 deg
+        # apart.
+        rail = float(getattr(solutions[index], "track_mm", 0.0) or 0.0)
         feasible = [np.array(combo, dtype=float) for combo in _readings_product(per_axis)
-                    if robot.feasible(combo)]
-        options.append(feasible or [values])
+                    if robot.feasible(combo, rail)]
+        # What the FILE can say comes first. A Cartesian block names the wrist revolution
+        # through the CONFIG turn digits, and a negative digit is refused at load (ASBN-009,
+        # measured 2026-10-27), so a reading of -200 can only be delivered as its equivalent
+        # +160. Offering the inexpressible ones would win the bottleneck objective with a
+        # number the exporter then has to refuse or silently rewrite. Readings with a
+        # non-negative turn digit only, with the full set as the fallback so a chain that
+        # cannot be expressed at all still gets its bottleneck minimised and reported.
+        expressible = [combo for combo in feasible
+                       if all(turn_digits(float(value)) >= 0 for value in combo)]
+        options.append(expressible or feasible or [values])
 
     infinity = (float("inf"), float("inf"))
     total = [[infinity] * len(option) for option in options]
@@ -942,6 +1054,11 @@ def ease_over_cap_j6(points: Sequence[PathPoint], solutions: Sequence, kin,
     guard the pass would happily trade a 200 deg wrist twist for a 250 deg J1 swing and call
     it an improvement, because J6 is the one axis a roll touches directly.
 
+    It is also accepted only when the worse of the two moves through the point - the one
+    arriving and the one leaving - gets strictly better. A point in the middle of a chain is
+    the endpoint of both, so judging one of them is how a "fix" turns into a 360 deg seam one
+    point later; see the note in the body.
+
     `verify(a, b)` is the caller's joint-move check, run on BOTH sides of the point that gets
     re-rolled. It has to be both: the corner is an endpoint of the move arriving and of the
     move leaving, so verifying one leaves the other checked against joints that no longer
@@ -969,14 +1086,39 @@ def ease_over_cap_j6(points: Sequence[PathPoint], solutions: Sequence, kin,
         if point.role != ROLE_COVERAGE:
             arm_budget = _other_axes_deg(first, second)
             after = solutions[index + 1] if index + 1 < len(solutions) else None
+            # A replacement is scored on the WORSE of the two moves that touch this point, not
+            # just the one that was over the cap. Changing the reading of a point in the middle
+            # of a chain moves both sides of it, and a pass that only looks at the arrival can
+            # hold that one down while it sends the departure through a 360 deg seam - which is
+            # not a hypothetical: on the 2026-11-02 rail run this function took J6 from +191.5
+            # to -168.5, kept the 61 deg wrist turn it was aiming at, and the program commanded
+            # 299 degrees for it. `_unwrap_readings` now runs again afterwards, but a pass that
+            # cannot make the chain worse should not depend on the repair.
+            budget = max(_j6_step_deg(first, second),
+                         0.0 if after is None else _j6_step_deg(second, after))
+            # A re-roll is a different ROLL of the same pose, not a different rail reading.
+            # `kin.solutions` re-solves with the carriage free, so its answer can sit at another
+            # offset - and the delivered `E1` comes from the route point, which this pass does
+            # not change. Taking such an option would write joints the program's own rail
+            # reading does not reproduce, which the delivery audit then reports as
+            # `track_mismatch` and refuses.
+            rail = float(getattr(point, "track_mm", 0.0) or 0.0)
             best = None
             for turn in ROLL_RETRY_DEG:
                 roll = (float(point.roll_deg) + turn) % 360.0
                 for option in kin.solutions(point.position, point.axis, roll):
                     if not option.ok:
                         continue
-                    step = _j6_step_deg(first, option)
-                    if step > limit or _j5_crossover(first, option):
+                    if abs(float(getattr(option, "track_mm", 0.0) or 0.0) - rail) > 1.0:
+                        continue
+                    score = max(_j6_step_deg(first, option),
+                                0.0 if after is None else _j6_step_deg(option, after))
+                    # Any strict improvement of the worse side is worth taking - a 200 deg
+                    # move cut to 100 is still over the cap and still better - but an option
+                    # under the cap always wins.
+                    if score >= budget - 1e-9:
+                        continue
+                    if _j5_crossover(first, option):
                         continue
                     if _other_axes_deg(first, option) > arm_budget + 1e-9:
                         continue
@@ -985,13 +1127,14 @@ def ease_over_cap_j6(points: Sequence[PathPoint], solutions: Sequence, kin,
                     if (after is not None and verify is not None
                             and not verify(option.joints_deg, after.joints_deg)):
                         continue
-                    if best is None or step < best[0]:
-                        best = (step, option)
+                    key = (score > limit, score)
+                    if best is None or key < best[0]:
+                        best = (key, score, option)
             if best is not None:
-                solutions[index] = best[1]
+                solutions[index] = best[2]
                 notes.append(
                     f"point {index + 1}: roll re-tried to hold the J6 step under "
-                    f"{limit:g} deg ({best[0]:.1f} deg)")
+                    f"{limit:g} deg ({best[1]:.1f} deg)")
                 continue
         stuck.append(index + 1)
     if stuck:
@@ -1056,7 +1199,12 @@ def _positions_margin(positions, station: Station, model: ScannerModel, *, visib
     if len(positions) == 0:
         return float("inf"), True
     stacked = np.asarray(positions, dtype=float)
-    margin = float(station.clearance_mm(stacked).min() - model.body_limit_mm)
+    # `body_clearance_mm`, not `clearance_mm`: the head must fit past the PART as well. A
+    # connector is a straight (or joint-interpolated) line between two legal poses and it can
+    # cross the sheet in between - the fixture/base gate could not see that, so a straight
+    # `L` move was written through the part on the 2026-11-03 rail run.
+    margin = float(station.body_clearance_mm(stacked, limit_mm=model.body_limit_mm).min()
+                   - model.body_limit_mm)
     seen = True if visible is None else bool(np.all(visible(stacked)))
     return margin, seen
 
@@ -1094,7 +1242,9 @@ def _cartesian_leg(previous: PathPoint, entry: PathPoint, ctx) -> tuple[bool, fl
         return False, margin, "straight_rate"
     if ctx.kin is not None and getattr(ctx.kin, "active", False) and ctx.start_joints is not None:
         verdict = ctx.kin.follow(ctx.start_joints, entry.position, entry.axis,
-                                 entry.roll_deg, step_mm=float(cfg.stroke.check_step_mm))
+                                 entry.roll_deg, step_mm=float(cfg.stroke.check_step_mm),
+                                 track_start=float(ctx.start_track),
+                                 track_end=float(ctx.end_track))
         if not verdict.ok:
             return False, margin, f"straight_{verdict.reason}"
     return True, margin, ""
@@ -1338,6 +1488,10 @@ class ConnectorContext:
     kin: Any = None
     start_joints: Any = None
     end_joints: Any = None
+    # The seventh axis at each end of the move. Equal values mean the carriage holds, which
+    # is what a floor-mounted arm always has.
+    start_track: float = 0.0
+    end_track: float = 0.0
 
 
 class ConnectorChain:
@@ -1489,7 +1643,8 @@ class StraightThenLateral(ConnectorChain):
 def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: PathPlan,
                station: Station, model: ScannerModel, *,
                visible=None, strict: bool = False, kin=None,
-               start_joints=None, end_joints=None) -> Route | None:
+               start_joints=None, end_joints=None,
+               start_track: float = 0.0, end_track: float = 0.0) -> Route | None:
     """Run slot B's chain and record what it decided.
 
     The mechanics live in :class:`ConnectorChain`; this function is the adapter that keeps
@@ -1500,7 +1655,8 @@ def _connector(previous: PathPoint, entry: PathPoint, cfg: PlannerConfig, plan: 
         previous, entry,
         ConnectorContext(cfg=cfg, plan=plan, station=station, model=model,
                          visible=visible, strict=strict, kin=kin,
-                         start_joints=start_joints, end_joints=end_joints))
+                         start_joints=start_joints, end_joints=end_joints,
+                         start_track=float(start_track), end_track=float(end_track)))
     if found is None:
         return None
     same = _same_pose(previous, entry)
@@ -1692,6 +1848,10 @@ class BranchAssignment:
     `max_step_deg`. They are separate because they mean different things: "the arm cannot be
     there" is a reachability problem, "the arm cannot get there from the previous point in
     one move" is an ordering problem.
+
+    `fallback` says the no-family-change rule could not be met and the search relaxed to
+    pricing changes: the plan may then contain a straight move whose recorded family is a
+    different one, which the delivery audit refuses.
     """
 
     solutions: list = field(default_factory=list)
@@ -1701,6 +1861,7 @@ class BranchAssignment:
     max_step_at: int | None = None
     min_margin_deg: float | None = None
     histogram: dict[str, int] = field(default_factory=dict)
+    fallback: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1711,7 +1872,8 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
                     j6_weight: float = 1.0,
                     j6_cap: float | None = None,
                     config_change_cost_deg: float = 0.0,
-                    j6_travel: float = 0.0) -> BranchAssignment:
+                    j6_travel: float = 0.0,
+                    track_price: float = 0.0) -> BranchAssignment:
     """Pick a joint branch for every delivered point so the sequence jumps as little as it can.
 
     Picking the locally best branch at every point is the mistake this exists to prevent:
@@ -1724,8 +1886,12 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
     `_joint_step_deg` gives; it decides between candidates, never whether a point is feasible.
     The steps it REPORTS are always the real degrees, because that is what the program does.
 
-    `config_change_cost_deg` prices a CONFIG family change the same way, and defaults to zero
-    so a caller that does not ask for it keeps the behaviour it had.
+    A CONFIG family change is treated as IMPOSSIBLE between two delivered points, for the
+    same reason `_sequence_joints` does: the moves that get proven as straight Cartesian lines
+    cannot change family, and the delivery audit refuses a program whose record disagrees with
+    the line it flies (`branch_mismatch`). `config_change_cost_deg` is the price of the
+    fallback, used only when no single family carries the whole chain; `fallback` in the result
+    says that happened.
 
     `j6_travel` adds a charge per degree of J6 on top of the all-axis step, which is what
     makes a run of moderate twists visible to the search; it defaults to zero for the same
@@ -1741,21 +1907,35 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
     if not points:
         return BranchAssignment()
     failed = [index for index, options in enumerate(candidates) if not options]
-    # `total[i][j]` is the cheapest joint travel that ends on option j of point i;
-    # `parent[i][j]` remembers which option of point i-1 got there.
-    total = [[0.0] * len(options) for options in candidates]
-    parent: list[list[int]] = [[0] * len(options) for options in candidates]
-    for index in range(1, len(candidates)):
-        for j, option in enumerate(candidates[index]):
-            best = (float("inf"), 0)
-            for k, previous in enumerate(candidates[index - 1]):
-                cost = total[index - 1][k] + _step_cost(previous, option,
-                                                        j6_weight, j6_cap, j6_travel)
-                cost += _config_penalty(previous, option, config_change_cost_deg)
-                if cost < best[0]:
-                    best = (cost, k)
-            total[index][j] = best[0]
-            parent[index][j] = best[1]
+
+    def solve(forbid_family: bool) -> tuple[list[list[float]], list[list[int]]]:
+        # `total[i][j]` is the cheapest joint travel that ends on option j of point i;
+        # `parent[i][j]` remembers which option of point i-1 got there.
+        total = [[0.0] * len(options) for options in candidates]
+        parent: list[list[int]] = [[0] * len(options) for options in candidates]
+        for index in range(1, len(candidates)):
+            for j, option in enumerate(candidates[index]):
+                family = _config_family(option)
+                best = (float("inf"), 0)
+                for k, previous in enumerate(candidates[index - 1]):
+                    if forbid_family and _config_family(previous) != family:
+                        continue
+                    cost = total[index - 1][k] + _step_cost(previous, option,
+                                                            j6_weight, j6_cap, j6_travel)
+                    cost += _track_cost(getattr(previous, "track_mm", 0.0),
+                                        getattr(option, "track_mm", 0.0), track_price)
+                    cost += _config_penalty(previous, option, config_change_cost_deg)
+                    if cost < best[0]:
+                        best = (cost, k)
+                total[index][j] = best[0]
+                parent[index][j] = best[1]
+        return total, parent
+
+    total, parent = solve(True)
+    fallback = False
+    if not np.isfinite(np.asarray(total[-1], dtype=float)).any():
+        total, parent = solve(False)
+        fallback = True
     choice = int(np.argmin(total[-1])) if candidates[-1] else 0
     picked: list = [None] * len(points)
     for index in range(len(candidates) - 1, -1, -1):
@@ -1779,7 +1959,7 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
         solutions=picked, failed=failed, broken=broken, max_step_deg=float(worst),
         max_step_at=(int(np.argmax(steps)) + 1 if steps else None),
         min_margin_deg=(float(min(margins)) if margins else None),
-        histogram=histogram)
+        histogram=histogram, fallback=fallback)
 
 
 def _step_between(first, second, j6_weight: float = 1.0) -> float:

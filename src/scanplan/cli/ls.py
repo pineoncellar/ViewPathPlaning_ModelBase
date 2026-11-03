@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import PLAN_MODES, load_config, plan_preset, read_json
+from ..config import PLAN_MODES, load_config, override, plan_preset, read_json
 from ..registration import load_registration
 from ..roboguide.adapt import export as export_ls
 from ..roboguide.registration_report import write_registration_report
@@ -74,6 +74,22 @@ def configure(subparsers) -> None:
                           help="write the program even when the joint audit refuses it; for "
                                "review only - the refusal is recorded in the contract file "
                                "and the file must not go to the cell")
+    exporter.add_argument("--no-e1", dest="no_e1", action="store_true",
+                          help="leave the seventh axis (E1) out of the program. Do this when "
+                               "the importing robot has six controlled axes: a point that "
+                               "declares seven is refused at load with ASBN-009 'Mismatch "
+                               "number of joint'. It does NOT un-plan the rail - re-plan "
+                               "with robot.track_enabled = false for that")
+    exporter.add_argument("--cartesian-only", dest="cartesian_only", action="store_true",
+                          help="write every point as a Cartesian block, even the ones the "
+                               "planner pinned as joint representation. Do this when the "
+                               "controller refuses a seventh axis inside a JOINT block "
+                               "(ASBN-009) but accepts E1 in a Cartesian one; the cost is "
+                               "that those poses are solved by the controller again")
+    exporter.add_argument("--joint-margin", dest="joint_margin", type=float, metavar="DEG",
+                          help="the margin the plan was made with, so the audit judges the "
+                               "file in the same envelope. It must match the `--joint-margin` "
+                               "the run was planned with, exactly like `--plan-mode`")
 
 
 def _ladder_entry_text(ladder, index: int) -> str:
@@ -176,6 +192,15 @@ def run(args, parser: argparse.ArgumentParser) -> int:
         except ValueError as error:
             parser.error(str(error))
             return 2
+    if getattr(args, "joint_margin", None) is not None:
+        if cfg is None:
+            parser.error("--joint-margin needs a configuration")
+            return 2
+        try:
+            cfg = override(cfg, robot={"joint_margin_deg": float(args.joint_margin)})
+        except ValueError as error:
+            parser.error(str(error))
+            return 2
     if stroke_plan:
         # The configuration is authoritative here: a stroke plan's motion, termination and
         # speed are one decision, and two sources for it is how a program ends up flown at
@@ -218,6 +243,8 @@ def run(args, parser: argparse.ArgumentParser) -> int:
                              joint_blocks=bool(args.joint_blocks),
                              order=order,
                              robot_params=(cfg.robot if cfg is not None else None),
+                             emit_e1=False if getattr(args, "no_e1", False) else None,
+                             cartesian_only=bool(getattr(args, "cartesian_only", False)),
                              allow_unverified=bool(args.allow_unverified))
     except ValueError as error:
         parser.error(str(error))

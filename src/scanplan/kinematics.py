@@ -87,22 +87,29 @@ def rotation_angle_deg(first, second) -> float:
 
 
 def turn_digits(value_deg: float) -> int:
-    """Whole revolutions past the axis's own travel; 0 for anything inside +-360.
+    """Whole revolutions past the BASE reading, which lives in (-180, 180].
 
-    This used to be `floor((j + 180) / 360)`, which wrote `-1` for any joint between -360
-    and -180 - and a negative turn digit is not a legal FANUC CONFIG. ROBOGUIDE stops at
-    that column on import with ASBN-009 `Configuration error` and refuses the WHOLE
-    program, even when every joint is well inside its limits: on 2026-10-27 a delivery
-    whose J1 was -102 deg carried `N U F, -1, -1, -1` and never loaded.
+    The CONFIG column is how a CARTESIAN point tells the controller which of the equivalent
+    wrist readings to take: `196.7` and `-163.3` are the same physical J6, and only the turn
+    digit says which one is meant. So the digit has to be measured against the +-180 base
+    reading, not against the axis's travel.
 
-    A turn is a revolution BEYOND the axis's own range (J1 +-185, J4/J6 +-360 here), not
-    the sign of the value. Every usable joint value lives inside that range, so the digit
-    is 0; a value outside it is one (or more) turns, and this returns a negative digit for
-    it so the exporter can refuse rather than write a program the controller cannot read.
+    What that fixed. The old rule returned 0 for anything inside +-360 (J4/J6 travel here),
+    which made `+196.7` and `-163.3` - both legal readings - write the SAME
+    `N U T, 0, 0, 0`. The controller then chose for itself, and the delivered program turned
+    J6 299 degrees between two points that are 61 apart (measured on the 2026-11-02 rail run,
+    `output/web_runs/20261102_164243_8d0a97d5`) because the two points sat on opposite sides
+    of the +-180 seam. Writing `..., 0, 0, 1` says "+196.7", and the move becomes 52 degrees.
+
+    Negative digits stay illegal and are still returned as such so the exporter can refuse:
+    `floor((j + 180) / 360)` wrote `-1` for any joint between -360 and -180, ROBOGUIDE stopped
+    at that column with ASBN-009 `Configuration error` and refused the WHOLE program, even
+    though every joint was inside its limits (2026-10-27: J1 = -102 wrote `N U F, -1, -1, -1`).
+    A reading that needs -1 has an equivalent reading that needs 0 (add 360) whenever the axis
+    travel allows it, and `path._unwrap_readings` prefers exactly those, so the refusal only
+    fires when the plan really cannot be expressed as a Cartesian program.
     """
-    if abs(float(value_deg)) <= 360.0:
-        return 0
-    return int(np.sign(value_deg) * np.floor(abs(float(value_deg)) / 360.0 + 0.5))
+    return int(np.rint(float(value_deg) / 360.0))
 
 
 @dataclass(frozen=True)
@@ -126,6 +133,9 @@ class Solution:
     min_margin_deg: float
     ok: bool
     singular: bool = False
+    #: The rail reading this solution was solved at (the seventh axis). 0.0 when the rail
+    #: is off, which is why every six-axis result compares unchanged.
+    track_mm: float = 0.0
 
     @property
     def j5_abs_deg(self) -> float:
@@ -175,10 +185,88 @@ class Robot:
                                                        strict=True))
         return "soft (intersected with mechanical)" if sharp else "mechanical"
 
+    # -- the seventh axis ----------------------------------------------------
+
+    @property
+    def track_enabled(self) -> bool:
+        return bool(getattr(self.params, "track_enabled", False))
+
+    @property
+    def track_axis_sign(self) -> float:
+        return -1.0 if str(getattr(self.params, "track_axis", "+X")) == "-X" else 1.0
+
+    @property
+    def track_usable(self) -> tuple[float, float]:
+        """The band of rail readings the planner may use, ends kept clear by the margin.
+
+        Same two numbers as a joint axis: what the controller accepts, and what we are
+        willing to sit on. A carriage parked on its end stop is not one the machine holds.
+        """
+        if not self.track_enabled:
+            return (0.0, 0.0)
+        limits = getattr(self.params, "track_limits_mm", None)
+        if limits is None:
+            low, high = 0.0, float(getattr(self.params, "track_length_mm", 0.0))
+        else:
+            low, high = float(limits[0]), float(limits[1])
+        margin = float(getattr(self.params, "track_margin_mm", 0.0))
+        if high - low <= 2.0 * margin:
+            centre = 0.5 * (low + high)
+            return (centre, centre)
+        return (low + margin, high - margin)
+
+    def track_margin(self, value_mm: float) -> float:
+        """Millimetres from `value_mm` to the nearer end of the usable rail band."""
+        low, high = self.track_usable
+        return float(min(float(value_mm) - low, high - float(value_mm)))
+
+    def _track_offset(self, track_mm: float) -> np.ndarray:
+        """The translation the rail adds to the base, in the base frame."""
+        if not self.track_enabled:
+            return np.zeros(3)
+        return np.array([self.track_axis_sign * float(track_mm), 0.0, 0.0])
+
+    def track_candidates(self, position, rotation) -> list[float]:
+        """Rail readings worth solving at for this pose, the best guess first.
+
+        A rail makes the arm redundant: the same pose can be reached from a range of rail
+        positions, trading elbow room against the length of rail the job needs. The guess is
+        geometric - put the base far enough back that the wrist centre sits at
+        `track_nominal_reach_mm` from it - and the few neighbours on either side let the
+        solver pick the one with real joint clearance instead of trusting the guess.
+        """
+        if not self.track_enabled:
+            return [0.0]
+        low, high = self.track_usable
+        point = np.asarray(position, dtype=float).reshape(3)
+        frame = np.asarray(rotation, dtype=float).reshape(3, 3)
+        wrist = point - frame @ self.tool_vector
+        nominal = float(self.params.track_nominal_reach_mm)
+        lateral = float(np.sqrt(max(nominal ** 2 - float(wrist[1]) ** 2, 0.0)))
+        sign = self.track_axis_sign
+        grid = float(self.params.track_grid_mm)
+        half = max(1, int(self.params.track_candidates)) // 2
+        # The base sits `lateral` behind the wrist in the rail's own direction.
+        ideals = [float(np.clip(shift / sign, low, high))
+                  for shift in (wrist[0] - lateral, wrist[0] + lateral)]
+        choices: list[float] = []
+        for ideal in ideals:
+            for step in range(-half, half + 1):
+                choices.append(float(np.clip(ideal + step * grid, low, high)))
+        wanted = max(1, int(self.params.track_candidates))
+        ordered = sorted(dict.fromkeys(round(value, 3) for value in choices),
+                         key=lambda value: (abs(value - ideals[0]), value))
+        return ordered[:wanted]
+
+
     # -- forward -------------------------------------------------------------
 
-    def forward(self, joints) -> tuple[np.ndarray, np.ndarray]:
+    def forward(self, joints, track_mm: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
         """TCP position and TCP rotation for `joints` (degrees, controller convention).
+
+        `track_mm` is the seventh axis: the rail reading, a translation along the base
+        frame's `+X`. It is added to the TCP after the arm has been solved, which is all a
+        linear carriage does.
 
         The returned rotation is the SCANNER frame: the flange rotation followed by the
         measured tool rotation, so its third column is the optical axis - the same
@@ -203,9 +291,9 @@ class Robot:
         # the offset. Applying it the other way round shifts every point by |Rt*v - v|,
         # which is ~550 mm - a constant that hides in a residual report and looks like a
         # geometry error.
-        return wrist + frame @ self.tool_vector, frame
+        return wrist + frame @ self.tool_vector + self._track_offset(track_mm), frame
 
-    def wrist_centre(self, joints) -> np.ndarray:
+    def wrist_centre(self, joints, track_mm: float = 0.0) -> np.ndarray:
         """The flange origin - the point the arm solution is written about."""
         angles = self._forward_angles(joints)
         a1x, a2, b = angles["a1x"], angles["a2"], angles["b"]
@@ -218,7 +306,8 @@ class Robot:
                   + params.upper_arm_mm * np.cos(a2)
                   + params.forearm_mm * np.cos(b)
                   + params.forearm_offset_mm * np.sin(b))
-        return np.array([radius * np.cos(a1x), radius * np.sin(a1x), height])
+        return (np.array([radius * np.cos(a1x), radius * np.sin(a1x), height])
+                + self._track_offset(track_mm))
 
     def _forward_angles(self, joints) -> dict[str, float]:
         params = self.params
@@ -287,14 +376,24 @@ class Robot:
         reachable = (high if value >= 0.0 else -low) - margin
         return float(min(abs(value) - self.params.j5_min_abs_deg, reachable - abs(value)))
 
-    def feasible(self, joints, margin_deg: float | None = None) -> bool:
-        """Whether this joint set is inside the limits with margin and away from J5 = 0."""
+    def feasible(self, joints, track_mm: float = 0.0,
+                 margin_deg: float | None = None) -> bool:
+        """Whether this joint set is inside the limits with margin and away from J5 = 0.
+
+        With a rail enabled the seventh axis is judged too: a pose whose arm is fine but
+        whose carriage sits on the end stop is not feasible.
+        """
         required = (self.params.joint_margin_deg if margin_deg is None else float(margin_deg))
-        return bool(self.margins(joints).min() >= required and self.j5_margin(joints) >= 0.0)
+        arm = bool(self.margins(joints).min() >= required and self.j5_margin(joints) >= 0.0)
+        if not self.track_enabled:
+            return arm
+        return bool(arm and self.track_margin(track_mm)
+                    >= float(getattr(self.params, "track_margin_mm", 0.0)))
 
     # -- inverse -------------------------------------------------------------
 
-    def solutions(self, position, rotation, *, verify: bool = True) -> list[Solution]:
+    def solutions(self, position, rotation, *, verify: bool = True,
+                  track_mm: float | None = None) -> list[Solution]:
         """Every USABLE joint solution for a TCP pose, best J5 margin first.
 
         At most eight: two shoulder sides times two elbow configurations times two wrist
@@ -309,12 +408,38 @@ class Robot:
         its first `L` with `MOTN-063 configuration mismatch`, and the same program with `F`
         written as a per-point CONFIG was refused at load with `ASBN-023`. Set the policy to
         `any` to see all eight again, which is what the solver-structure tests do.
+
+        With a rail, `track_mm=None` means "let the rail help": every offset from
+        `track_candidates` is solved and the usable answers are merged, each carrying the
+        offset it came from. Passing an offset solves that one carriage position, which is
+        what the segment walks, the branch DP and the delivery audit use.
         """
-        point = np.asarray(position, dtype=float).reshape(3)
+        if track_mm is not None or not self.track_enabled:
+            offsets = [0.0 if track_mm is None else float(track_mm)]
+        else:
+            offsets = self.track_candidates(position, rotation)
+        found: list[Solution] = []
+        for offset in offsets:
+            found.extend(self._solutions_at(position, rotation, offset, verify=verify))
+        if len(offsets) > 1:
+            usable = [item for item in found if item.ok]
+            found = usable or found
+        found.sort(key=lambda item: (item.j5_margin_deg, item.min_margin_deg),
+                   reverse=True)
+        return found
+
+    def _solutions_at(self, position, rotation, track_mm: float, *,
+                      verify: bool = True) -> list[Solution]:
+        """The eight branches at ONE carriage position, which is a six-axis problem."""
+        point = (np.asarray(position, dtype=float).reshape(3)
+                 - self._track_offset(track_mm))
         target = np.asarray(rotation, dtype=float).reshape(3, 3)
         flange = target @ self.tool_rotation.T
         wrist = point - target @ self.tool_vector
         wanted = str(self.params.wrist_flip_policy)
+        track_ok = (not self.track_enabled
+                    or self.track_margin(track_mm)
+                    >= float(getattr(self.params, "track_margin_mm", 0.0)))
         found: list[Solution] = []
         for shoulder, elbow, arm in self._arm_solutions(wrist):
             a1x, a2, b = arm["a1x"], arm["a2"], arm["b"]
@@ -334,9 +459,11 @@ class Robot:
                     config=self.config_string(placed, shoulder, elbow),
                     j5_margin_deg=self.j5_margin(placed),
                     min_margin_deg=float(margins.min()),
-                    ok=bool(margins.min() >= self.params.joint_margin_deg
+                    ok=bool(track_ok
+                            and margins.min() >= self.params.joint_margin_deg
                             and self.j5_margin(placed) >= 0.0),
                     singular=singular,
+                    track_mm=float(track_mm),
                 ))
         found.sort(key=lambda item: item.j5_margin_deg, reverse=True)
         return found
@@ -429,9 +556,9 @@ class Robot:
                 z6 = float(np.arctan2(-inner[2, 1], inner[2, 0]))
             yield flip, (z4, z5, z6), False
 
-    def _reproduces(self, joints, position, rotation) -> bool:
+    def _reproduces(self, joints, position, rotation, track_mm: float = 0.0) -> bool:
         """Forward-check a candidate solution against the pose it came from."""
-        point, frame = self.forward(joints)
+        point, frame = self.forward(joints, track_mm)
         return (float(np.linalg.norm(point - np.asarray(position, dtype=float).reshape(3)))
                 <= _VERIFY_POSITION_MM
                 and rotation_angle_deg(frame, rotation) <= _VERIFY_ANGLE_DEG)
@@ -451,23 +578,39 @@ class Robot:
         branch, which is the same pose turned 180 degrees.
 
         The turn digits count whole revolutions OUTSIDE the base reading, which lives in
-        [-180, 180): `-63.699` is turn 0, not turn -1. `floor(J / 360)` said -1 and matched
+        (-180, 180]: `-63.699` is turn 0, not turn -1. `floor(J / 360)` said -1 and matched
         none of the eight measured poses; this convention reproduces their `0, 0, 0` and the
-        pendant's own display. A turn digit that is one too low is the same 360 deg error the
-        letter can make, so it is worth getting right even though it is still a hint.
+        pendant's own display. It also separates `+196.7` (turn 1) from `-163.3` (turn 0) -
+        two legal readings of one wrist pose, and the only column in a CARTESIAN block that
+        can say which one is meant. A turn digit that is one too low is the same 360 deg
+        error the letter can make: the controller then turns the wrist the long way round.
         """
         values = np.asarray(joints, dtype=float).reshape(6)
-        turns = [turn_digits(float(values[index])) for index in (0, 3, 5)]
+        turns = []
+        for axis in (0, 3, 5):
+            value = float(values[axis])
+            low, high = self.limits[axis]
+            # A reading whose turn digit would be NEGATIVE cannot be written at all (ASBN-009),
+            # so the hint names the equivalent reading instead - the pose is the same and the
+            # digit is a hint. Picking the nearest such equivalent keeps the hint as close to
+            # what was planned as the column can express; when there is none the reading is
+            # kept and the exporter's own check refuses the file with a reason.
+            if turn_digits(value) < 0 and low - _WRAP_TOL_DEG <= value <= high + _WRAP_TOL_DEG:
+                alternatives = [candidate for candidate in self.wraps(axis, value)
+                                if turn_digits(candidate) >= 0]
+                if alternatives:
+                    value = min(alternatives, key=lambda candidate: abs(candidate - value))
+            turns.append(turn_digits(value))
         flip = "T" if values[4] < 0.0 else "F"
         return f"{shoulder} {elbow} {flip}, {turns[0]}, {turns[1]}, {turns[2]}"
 
-    def reproduces(self, joints, position, rotation) -> bool:
+    def reproduces(self, joints, position, rotation, track_mm: float = 0.0) -> bool:
         """Public forward-check, for callers that solved without verifying every root."""
-        return self._reproduces(joints, position, rotation)
+        return self._reproduces(joints, position, rotation, track_mm)
 
     # -- segments ------------------------------------------------------------
 
-    def branch_of(self, joints) -> tuple[str, str, str] | None:
+    def branch_of(self, joints, track_mm: float = 0.0) -> tuple[str, str, str] | None:
         """The (shoulder, elbow, wrist-flip) letters of a joint set that is already held.
 
         Derived by solving the arm's own forward pose and matching the answer back to
@@ -475,10 +618,10 @@ class Robot:
         values: "N" versus "F" is decided by the sign of the reach, and the reach is not
         recoverable from J1..J6 without going through the geometry again.
         """
-        point, frame = self.forward(joints)
+        point, frame = self.forward(joints, track_mm)
         values = np.asarray(joints, dtype=float).reshape(6)
         best = None
-        for item in self.solutions(point, frame, verify=False):
+        for item in self.solutions(point, frame, verify=False, track_mm=track_mm):
             gap = max(abs((float(a) - float(b) + 180.0) % 360.0 - 180.0)
                       for a, b in zip(item.joints_deg, values, strict=True))
             if best is None or gap < best[0]:
@@ -489,8 +632,16 @@ class Robot:
         return (item.shoulder, item.elbow, item.wrist_flip)
 
     def follow(self, joints_start, target_position, target_rotation, *,
-               step_mm: float = 10.0) -> MotionVerdict:
+               step_mm: float = 10.0, track_start: float = 0.0,
+               track_end: float | None = None) -> MotionVerdict:
         """Walk a straight Cartesian move from a held joint state to a target pose.
+
+        With a rail, the carriage travels too: `track_start` is where it starts and
+        `track_end` where the move must leave it (default: hold it still). A straight move
+        interpolates both together - that is what an extended axis in the motion group does
+        - so each sample is solved at its own rail reading, and the rail has its own margin
+        check alongside the six joints. `limiting_axis` reports 6 for the rail, so "axis index
+        out of range" is never the way that failure gets described.
 
         This is the check the gate was missing. `feasible` and `solutions` answer "is there
         ANY solution at this pose"; the controller asks a different question - "can the arm
@@ -507,26 +658,31 @@ class Robot:
         start = np.asarray(joints_start, dtype=float).reshape(6)
         target = np.asarray(target_position, dtype=float).reshape(3)
         target_frame = np.asarray(target_rotation, dtype=float).reshape(3, 3)
-        start_point, start_frame = self.forward(start)
-        branch = self.branch_of(start)
+        held_track = float(track_start)
+        final_track = held_track if track_end is None else float(track_end)
+        start_point, start_frame = self.forward(start, held_track)
+        branch = self.branch_of(start, held_track)
         if branch is None:
-            return MotionVerdict(False, "unknown_branch", None, 0.0, 0.0, None, -np.inf, 0)
+            return MotionVerdict(False, "unknown_branch", None, 0.0, 0.0, None, -np.inf, 0,
+                                 track_mm=held_track)
 
         length = float(np.linalg.norm(target - start_point))
         steps = max(1, int(np.ceil(length / float(step_mm))))
         worst = np.inf
+        track_required = float(getattr(self.params, "track_margin_mm", 0.0))
         for index in range(1, steps + 1):
             fraction = index / steps
             position = start_point + (target - start_point) * fraction
             frame = _interpolate_rotation(start_frame, target_frame, fraction)
-            found = self._on_branch(position, frame, branch)
+            rail = held_track + (final_track - held_track) * fraction
+            found = self._on_branch(position, frame, branch, rail)
             if found is None:
                 # No solution on this branch: the controller would alarm here whether or not
                 # the pose is reachable through some other shoulder.
-                inside = self.solutions(position, frame, verify=False)
+                inside = self.solutions(position, frame, verify=False, track_mm=rail)
                 reason = "unreachable" if not inside else "branch_lost"
                 return MotionVerdict(False, reason, None, fraction, length * fraction,
-                                     None, worst, index)
+                                     None, worst, index, track_mm=rail)
             margins = self.margins(found.joints_deg)
             axis = int(np.argmin(margins))
             worst = float(min(worst, margins[axis]))
@@ -536,28 +692,34 @@ class Robot:
                 return MotionVerdict(False, "joint_limit", culprit, fraction,
                                      length * fraction,
                                      tuple(float(v) for v in found.joints_deg),
-                                     worst, index)
+                                     worst, index, track_mm=rail)
+            if self.track_enabled and self.track_margin(rail) < track_required:
+                return MotionVerdict(False, "track_limit", 6, fraction, length * fraction,
+                                     tuple(float(v) for v in found.joints_deg),
+                                     worst, index, track_mm=rail)
         return MotionVerdict(True, "ok", None, None, None,
-                             tuple(float(v) for v in found.joints_deg), worst, steps)
+                             tuple(float(v) for v in found.joints_deg), worst, steps,
+                             track_mm=final_track)
 
-    def _on_branch(self, position, frame, branch) -> Solution | None:
+    def _on_branch(self, position, frame, branch, track_mm: float = 0.0) -> Solution | None:
         """The solution at this pose that belongs to `branch`, or None.
 
         Deliberately does not fall back to another branch: a silent branch switch is the
         failure mode this exists to catch, and the controller raises `MOTN-063` for it.
         """
         chosen = None
-        for item in self.solutions(position, frame, verify=False):
+        for item in self.solutions(position, frame, verify=False, track_mm=track_mm):
             if (item.shoulder, item.elbow, item.wrist_flip) == branch:
                 chosen = item
                 break
         if chosen is None:
             return None
-        if not self._reproduces(chosen.joints_deg, position, frame):
+        if not self._reproduces(chosen.joints_deg, position, frame, track_mm):
             return None
         return chosen
 
-    def sweep_points(self, first, second, *, step_deg: float = 5.0) -> np.ndarray:
+    def sweep_points(self, first, second, *, step_deg: float = 5.0,
+                     track_first: float = 0.0, track_second: float | None = None):
         """TCP positions along a joint-space straight move: start excluded, end included.
 
         Joint limits need no sampling here, and that is a proof rather than a shortcut: each
@@ -568,17 +730,22 @@ class Robot:
         What must be sampled is CLEARANCE, because the TCP does not travel a straight line
         when the joints do. `step_deg` is the joint resolution, which is the right unit: the
         TCP of a wrist-heavy move can swing hundreds of millimetres per degree of J6.
+        A rail travels linearly with the joints, so its reading is interpolated here and the
+        sampled TCP includes it.
         """
         if step_deg <= 0.0:
             raise ValueError("step_deg must be positive")
         start = np.asarray(first, dtype=float).reshape(6)
         end = np.asarray(second, dtype=float).reshape(6)
+        rail_first = float(track_first)
+        rail_last = rail_first if track_second is None else float(track_second)
         span = float(np.max(np.abs(end - start)))
         steps = max(1, int(np.ceil(span / float(step_deg))))
         out = np.empty((steps, 3), dtype=float)
         for index in range(steps):
             fraction = (index + 1) / steps
-            out[index], _ = self.forward(start + (end - start) * fraction)
+            out[index], _ = self.forward(start + (end - start) * fraction,
+                                         rail_first + (rail_last - rail_first) * fraction)
         return out
 
 
@@ -600,6 +767,8 @@ class MotionVerdict:
     joints_deg: tuple[float, ...] | None
     min_margin_deg: float
     steps: int
+    #: The rail reading the walk arrives with (the seventh axis); 0.0 when there is no rail.
+    track_mm: float | None = None
 
 
 def _interpolate_rotation(first, second, fraction: float) -> np.ndarray:
@@ -711,7 +880,8 @@ class KinematicGate:
         # eight forward checks per pose buys nothing.
         candidates = self.robot.solutions(position, rotation, verify=False)
         for item in candidates:
-            if item.ok and self.robot.reproduces(item.joints_deg, position, rotation):
+            if item.ok and self.robot.reproduces(item.joints_deg, position, rotation,
+                                                item.track_mm):
                 return Verdict(True, "ok", item)
         if not candidates:
             return Verdict(False, "unreachable", None)
@@ -724,7 +894,8 @@ class KinematicGate:
                 (self.robot.limits_source if self.robot is not None else "gate disabled")}
 
     def follow(self, joints_start, position, axis, roll_deg: float, *,
-               step_mm: float = 10.0) -> MotionVerdict:
+               step_mm: float = 10.0, track_start: float = 0.0,
+               track_end: float | None = None) -> MotionVerdict:
         """Whether the arm can carry `joints_start` along a straight move to this pose.
 
         The pose arrives in the planner's own convention (position, optical axis, roll), the
@@ -738,7 +909,8 @@ class KinematicGate:
         from .geometry import scanner_frame
 
         rotation = scanner_frame(np.asarray(axis, dtype=float).reshape(3), float(roll_deg))
-        return self.robot.follow(joints_start, position, rotation, step_mm=step_mm)
+        return self.robot.follow(joints_start, position, rotation, step_mm=step_mm,
+                                 track_start=track_start, track_end=track_end)
 
     def sweep_points(self, first, second, *, step_deg: float = 5.0):
         """TCP positions along a joint move, or None when the gate is off.

@@ -57,6 +57,9 @@ class Viewpoint:
     branch: str | None = None
     joints_deg: tuple[float, ...] | None = None
     j5_margin_deg: float | None = None
+    # The seventh axis: the carriage reading in millimetres of rail. None when the arm is
+    # floor-mounted, so an old record and a new one are told apart by this field alone.
+    track_mm: float | None = None
     # How the program reaches this point, and how its P[n] block is written. None means
     # "the program default", which is what keeps a gate-off export unchanged.
     motion: str | None = None
@@ -84,6 +87,7 @@ class Viewpoint:
                            else [round(float(v), 3) for v in self.joints_deg]),
             "j5_margin_deg": (None if self.j5_margin_deg is None
                               else round(float(self.j5_margin_deg), 3)),
+            "track_mm": None if self.track_mm is None else round(float(self.track_mm), 3),
             "motion": None if self.motion is None else str(self.motion),
             "representation": (None if self.representation is None
                                else str(self.representation)),
@@ -145,6 +149,9 @@ def viewpoints_from_path(plan, coverage: CoverageResult,
                            if solution is not None else None),
             "j5_margin_deg": (float(solution.j5_margin_deg)
                               if solution is not None else None),
+            "track_mm": (float(getattr(point, "track_mm", 0.0))
+                         if solution is not None
+                         and bool(getattr(plan, "track_enabled", False)) else None),
             "motion": getattr(point, "motion", None),
             "representation": getattr(point, "representation", None),
         }

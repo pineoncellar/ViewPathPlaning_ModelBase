@@ -58,6 +58,44 @@ def _steps(rows) -> tuple[np.ndarray, np.ndarray, list[str]]:
     return literal, circular, motions
 
 
+def _track_block(config, rows) -> dict | None:
+    """The seventh axis, as the program used it. None when there is no rail.
+
+    Reported for the same reason the joint steps are: "the rail helped" is a claim, and
+    "it slid 2.4 m over 6 moves, worst one 1.1 m" is a measurement. `steps_over_limit` is a
+    review trigger, not a refusal - the same contract as `max_step_deg`.
+    """
+    robot = config.robot
+    if not bool(getattr(robot, "track_enabled", False)):
+        return None
+    values = [float(row["track_mm"]) for row in rows if row.get("track_mm") is not None]
+    steps = [abs(second - first) for first, second in zip(values, values[1:], strict=False)]
+    limit = float(getattr(robot, "track_max_step_mm", 0.0))
+    length = float(getattr(robot, "track_length_mm", 0.0))
+    margin = float(getattr(robot, "track_margin_mm", 0.0))
+    return {
+        "enabled": True,
+        "axis": str(getattr(robot, "track_axis", "+X")),
+        "length_mm": length,
+        "usable_mm": [margin, length - margin],
+        "margin_mm": margin,
+        "points": len(values),
+        "used_span_mm": ([round(min(values), 3), round(max(values), 3)]
+                         if values else None),
+        "travel_mm": round(float(sum(steps)), 3),
+        "max_step_mm": round(float(max(steps)), 3) if steps else None,
+        "max_step_at": (int(np.argmax(steps)) + 1 if steps else None),
+        "max_step_limit_mm": limit,
+        "steps_over_limit": [index + 1 for index, step in enumerate(steps) if step > limit],
+        "program_column": "E1" if bool(getattr(robot, "track_emit_e1", True)) else None,
+        "note": (
+            "a linear seventh axis along the base frame's +X: it is planned with the arm "
+            "(chosen per point, held through a sweep, interpolated along a straight move) "
+            "and it is written into the program as the extended-axis column; the rail's own "
+            "servo tuning and its collision with the fixture are not modelled"),
+    }
+
+
 def kinematics_block(config: PlannerConfig, viewpoints, path, kinematics=None) -> dict:
     """Joint-side evidence: envelope, J5 distribution, branches, worst step.
 
@@ -108,6 +146,7 @@ def kinematics_block(config: PlannerConfig, viewpoints, path, kinematics=None) -
         "max_step_deg_limit": limit,
         "j5_histogram_deg": histogram,
         "branch_histogram": dict(getattr(assignment, "histogram", {})),
+        "track": _track_block(config, rows),
         "min_margin_deg": getattr(assignment, "min_margin_deg", None),
         # Schema 2: literal, and only for the points the program reaches with a `J`.
         "max_step_deg": worst,

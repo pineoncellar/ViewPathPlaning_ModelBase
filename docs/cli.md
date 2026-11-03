@@ -163,3 +163,31 @@ uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
 `--max-registration-error-mm` 调整。输出 `registration_report.json`，记录刚体变换和各点误差。
 三个定位点必须不共线、对应同一组 CAD 特征，且现场坐标必须是机器人基坐标，不能与其他
 坐标系混用。程序因此固定使用 `UFRAME 0`；导出后仍须在 ROBOGUIDE/现场核对点位。
+
+### 关节余量：`--joint-margin` / `--joint-span` / `--cartesian-only`
+
+`--plan-mode banded` 只多铺倾斜种子族、降低一条带的角价；**关节包络两档一致**且是硬上限
+（量程 98% + 5° 余量，放宽会被拒绝）。如果你想要更大的余量，用下面两个旗标——它们**只能收紧**：
+
+```bash
+uv run scanplan plan ... --plan-mode banded --joint-margin 8 --joint-span 0.98
+uv run scanplan ls  ... --plan-mode banded --joint-margin 8    # 审计必须用同一包络
+```
+
+`--cartesian-only` 让每个 `P[n]` 都写成笛卡尔块（带 `E1`），即使规划器把它钉成了关节表示。
+当控制器拒绝"关节块里的第七轴"（`ASBN-009`）时用它；代价是那些姿态交给控制器再解一次。
+
+### 第七轴：`--no-e1`
+走路轨（`robot.track_enabled: true`）规划出来的视点，导出时每个 `P[n]` 会多一行 `E1= <mm>`。
+导入的机器人若只有六个控制轴，会在第一行 `E1`（列 10）报 `ASBN-009 Mismatch number of joint`
+并中断加载——这不是文件坏了，是**单元和数据不匹配**。
+
+```bash
+uv run scanplan ls --viewpoints output/<零件>/viewpoints.json \
+                   --prog-name PART01 --no-e1 --out output/<零件>/
+```
+
+`--no-e1` 只是不写那一列，**不会**把姿态拉回六轴可达区：那些点是小车在某个导轨位置才
+够得到的。要真正回到六轴，得用 `robot.track_enabled: false` 重新规划。
+导出契约的 `program.extended_axis` 会记录写了没有、用了哪段、以及没写时的警告。
+

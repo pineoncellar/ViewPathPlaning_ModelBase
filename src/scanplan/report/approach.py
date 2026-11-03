@@ -75,6 +75,7 @@ def _poses(station: Station, viewpoints, path) -> dict:
     base_top = float(np.asarray(station.base.bounds, dtype=float)[1][2])
     upward = axes[:, 2] if len(axes) else np.zeros(0)
     clearance = station.clearance_mm(positions) if len(positions) else np.zeros(0)
+    body = station.body_clearance_mm(positions) if len(positions) else np.zeros(0)
     return {
         "available": True,
         "total": int(len(positions)),
@@ -86,7 +87,13 @@ def _poses(station: Station, viewpoints, path) -> dict:
         "max_look_up_deg": round(float(max(0.0, np.degrees(
             np.arcsin(np.clip(upward.max(), -1.0, 1.0))))) if len(upward) else 0.0, 1),
         "min_scanner_z_mm": round(float(positions[:, 2].min()), 1),
-        "min_body_clearance_mm": round(float(clearance.min()), 1),
+        # The gate's own number: distance to the nearest PART, fixture or base sample. The
+        # fixture-only figure is reported next to it, because "how tight is it against the
+        # clamp" and "does the head fit" are two different questions with two different
+        # answers, and before the part was in this test a band could be delivered 0.4 mm off
+        # the sheet it was scanning while this block showed several hundred millimetres.
+        "min_body_clearance_mm": round(float(body.min()), 1),
+        "min_fixture_base_clearance_mm": round(float(clearance.min()), 1),
         "note": ("looking_up counts the OPTICAL axis, so a side wall scanned almost "
                  "horizontally is not a violation; below_* count the scanner origin"),
     }

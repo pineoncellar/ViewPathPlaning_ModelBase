@@ -90,6 +90,14 @@ def summary_lines(report: dict) -> list[str]:
             f"worst J step {kinematics.get('max_step_deg')} deg "
             f"(limit {kinematics.get('max_step_deg_limit')}), "
             f"branches {kinematics.get('branch_histogram')}")
+        track = kinematics.get("track") or {}
+        if track.get("enabled"):
+            span = track.get("used_span_mm") or [0.0, 0.0]
+            lines.append(
+                f"track                  {track['axis']} rail {track['length_mm']:.0f} mm, "
+                f"used {span[0]:.0f}..{span[1]:.0f} mm, travel {track['travel_mm']:.0f} mm, "
+                f"worst step {track['max_step_mm']} mm "
+                f"(limit {track['max_step_limit_mm']:.0f}, reported not refused)")
         j6 = kinematics.get("j6") or {}
         if j6.get("available"):
             over = j6.get("over_cap") or []
