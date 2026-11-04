@@ -391,12 +391,15 @@ class RobotParams:
     branch was unreachable and the model was calling it reachable.
 
     `joint_span_fraction` is the "do not ride the limits" policy: each axis is only used
-    inside a fraction of its span, measured about the span's CENTRE. At 0.9 with the numbers
-    above the usable envelope is J1 +-166.5, J2 [-53.2, 69.2], J3 [-105.69, 164.97],
-    J4 +-324, J5 +-112.5, J6 +-324; `joint_margin_deg` is applied inside that again. The
-    reason it exists: J5 = -122 alarmed in ROBOGUIDE although -125 is the documented limit,
-    and a pose that sits three degrees from a limit is not one the machine will hold. The
-    tests are what keep this honest - see `test_kinematics.py`.
+    inside a fraction of its span, measured about the span's CENTRE. At 0.98 with the numbers
+    above the usable envelope is J1 +-181.3, J2 [-58.64, 74.64], J3 [-117.70, 176.99],
+    J4 +-352.8, J5 +-122.5, J6 +-352.8; `joint_margin_deg` is applied inside that again,
+    leaving J1 +-176.3, J2 [-53.64, 69.64], J3 [-112.70, 171.99], J4 +-347.8, J5 +-117.5,
+    J6 +-347.8. It exists at all because J5 = -122 alarmed in ROBOGUIDE although -125 is the
+    documented limit, and a pose that sits three degrees from a limit is not one the machine
+    will hold - that pose is still refused here, and the refusal comes from the 5 degree
+    margin, not from the span. The tests are what keep this honest - see
+    `test_kinematics.py`.
 
     `enabled=False` skips the whole gate, which is what keeps the pre-2026-10-22 result
     reproducible bit for bit.
@@ -439,7 +442,7 @@ class RobotParams:
     # enforced: refusing such a move means dropping the sweep behind it, and the coverage
     # that sweep carried. The lever arm below is what makes the number mean something.
     j6_report_deg: float = 90.0
-    joint_span_fraction: float = 0.9
+    joint_span_fraction: float = 0.98
     # Which wrist branch a delivered solution may use: `T` (J5 negative), `F` (J5 positive)
     # or `any`. `T` is the site default because the program writes Cartesian points with the
     # constant CONFIG `N U T` - see `Robot.solutions` for the two measurements behind it.
@@ -463,19 +466,80 @@ class RobotParams:
     # - one the worst step, one the running sum - and a site may want either, both or
     # neither. 0.0 is the behaviour before 2026-11-01, so the default changes nothing.
     j6_travel_weight: float = 0.0
-    # What it costs the sequencing to change the arm's CONFIG family between two points.
-    # Zero is the behaviour every program before 2026-11-01 was written with, and it is the
-    # default on purpose: the letters say which posture the arm is in, and two postures for
-    # one tool pose are not two nearby joint vectors - the controller swings the whole arm
-    # round to get from one to the other (measured 2026-10-28: J1 167.6 deg out and J3
-    # 158.8 deg back in, mid-scan). Nothing in the delivery geometry models that swing, so a
-    # zero here prices it as free. Charged, never refused: a point whose only solution sits
-    # in another family keeps it.
+    # What a CONFIG family change costs the sequencing, WHEN one is allowed at all. As of
+    # 2026-11-02 it is not: a straight Cartesian move cannot change family mid-line, the
+    # connector proves those lines wherever it can, and the delivery audit refuses a program
+    # whose recorded joints are on a different family than the line arrives at
+    # (`branch_mismatch` - it killed a whole 99% run at export). Both sequencing passes now
+    # treat the change as impossible and only fall back to this price when no single family
+    # carries the chain, so a point whose only solution sits in another family keeps it. Zero
+    # prices the fallback as free, which is the behaviour every program before 2026-11-01 was
+    # written with; `route_style = "tidy"` expands it to 240.
     config_change_cost_deg: float = 0.0
+    # REPORTED, not enforced: a delivered point closer than this to its usable band is named
+    # in the report. 0 margin is the `banded` mode's own choice, and it is how a plan looks
+    # healthy here and comes back `MOTN-018 position not reachable` from ROBOGUIDE: measured
+    # 2026-11-02, one point sat 1.25 deg under the J2 ceiling and the controller wanted a
+    # hair more than the model allowed.
+    min_margin_warn_deg: float = 2.0
     # What a wrist flip (J5 changing sign) costs the sequencing. A joint move interpolates
     # J5 linearly, so a sign change sends the wrist through the singularity where the arm
     # whips round. 180 is what every item-level sequence used before it was configurable.
     wrist_flip_cost_deg: float = 180.0
+
+    # --- the seventh axis: a linear rail under the arm ---------------------
+    # The arm rides a track along +X of its own base frame. `t` is millimetres from the
+    # rail's zero, and it is an axis like any other: it has a usable band, it is walked
+    # along with the arm on a straight move, it is priced in the sequencing, and it is
+    # written into the program as `E1`. Disabled by default so every stored run and every
+    # test keeps the six-axis behaviour it was measured with; the shipped configuration
+    # turns it on for this cell.
+    track_enabled: bool = False
+    # Only `+X` is implemented. The rail is a translation along one base-frame axis and the
+    # pose table, the CONFIG letters and the frame contract all assume the arm's own axes;
+    # a rail at an angle would need a mounting transform nothing here measures.
+    track_axis: str = "+X"
+    track_length_mm: float = 3300.0
+    # The controller's travel, if it is shorter than the rail. None means "the whole rail".
+    track_limits_mm: tuple[float, float] | None = None
+    # Kept clear of the ends, for the same reason `joint_margin_deg` exists. 0 means the
+    # carriage may sit on either end stop, which is this cell: the rail is used end to end.
+    track_margin_mm: float = 0.0
+    # Where the carriage is parked when the programme starts, and the reading the rail's own
+    # zero is defined at. It is PRICED into the sequencing as the first move rather than
+    # forced: a first item that cannot be reached from here may still be the right one, and
+    # the report then says how far the carriage had to travel before the first scan.
+    track_home_mm: float = 0.0
+    # Candidate offsets tried per pose, spaced this far apart around the geometric best.
+    track_grid_mm: float = 250.0
+    track_candidates: int = 5
+    # The horizontal distance from the base to the wrist centre the arm likes to work at.
+    # The rail is placed to bring the pose to roughly this radius, then a few neighbours are
+    # tried - that is what keeps the rail from parking the arm at full stretch.
+    track_nominal_reach_mm: float = 1900.0
+    # What one millimetre of rail travel costs the sequencing, in degrees: the same scale as
+    # a joint step, so "slide 2 m" has to earn its place against "turn the wrist 30 deg".
+    track_cost_deg_per_mm: float = 0.05
+    # REPORTED, not enforced - the same contract as `max_step_deg`.
+    track_max_step_mm: float = 1500.0
+    # Write the rail value into the `.LS` as `E1`. Kept switchable because where that column
+    # sits depends on how the controller's group is configured, and the post-processor here
+    # assumes the extended-axis form.
+    track_emit_e1: bool = True
+    # How the seventh axis is spelled in a JOINT-representation block. A joint block counts
+    # axes by NUMBER inside the group, so the extended axis is `J7` there, while a Cartesian
+    # block names it `E1`. `J7` is the default because a joint block carrying six `J` values
+    # and a stray `E1` is refused at load with `ASBN-009 Mismatch number of joint` - measured
+    # on a real ROBOGUIDE import 2026-11-02. Set this to `E1` if a controller insists on the
+    # Cartesian spelling there as well.
+    track_joint_label: str = "J7"
+    # Whether a joint-representation point may carry the rail at all. `false` - the default
+    # WITH a rail - writes those points as Cartesian blocks instead, which is the shape a
+    # working export from the cell has. Measured 2026-11-02: a real ROBOGUIDE import refused
+    # BOTH spellings inside a joint block (`J7=` and `E1=`) at the same column with `ASBN-009
+    # Mismatch number of joint`, while the same value in a Cartesian block is accepted. The
+    # cost is that those poses are solved by the controller again instead of being pinned.
+    track_joint_blocks: bool = False
 
     @classmethod
     def disabled(cls) -> RobotParams:
@@ -495,7 +559,7 @@ class RobotParams:
             soft_limits_deg=((-185.0, 185.0), (-60.0, 76.0), (-120.71, 180.0),
                              (-360.0, 360.0), (-125.0, 125.0), (-360.0, 360.0)),
             joint_margin_deg=5.0, j5_min_abs_deg=8.0, max_step_deg=40.0,
-            wrist_identified=True, joint_span_fraction=0.9, wrist_flip_policy="T",
+            wrist_identified=True, joint_span_fraction=0.98, wrist_flip_policy="T",
         )
 
 
@@ -756,45 +820,50 @@ def _route_values(config: PlannerConfig, style: str) -> PlannerConfig:
 #: Which plan mode the page and the command line offer.
 PLAN_MODES: tuple[str, ...] = ("standard", "banded")
 
+#: The joint envelope every run has to fit in, and a CEILING rather than a default: the usable
+#: band of each axis is its controller span times `MAX_JOINT_SPAN_FRACTION`, taken about the
+#: span's centre, minus `MIN_JOINT_MARGIN_DEG` at each end. Measured twice:
+#:
+#:  * J5 = -122 alarmed in ROBOGUIDE while -125 is the documented limit, which is where the
+#:    margin came from;
+#:  * a `banded` run at full span and zero margin delivered a point at J2 = 74.75 of 76 and the
+#:    controller answered `MOTN-018 position not reachable` - our model said legal, theirs
+#:    wanted a hair more room (2026-11-02).
+#:
+#: So a configuration may be STRICTER than this and never looser; `_validate_robot` refuses the
+#: rest, and no plan mode may widen it. Widening it is not a knob, it is how a program that
+#: plans cleanly here fails on the cell.
+MAX_JOINT_SPAN_FRACTION = 0.98
+MIN_JOINT_MARGIN_DEG = 5.0
+
 #: What each plan mode expands to. `standard` is spelled out as the values the shipped
 #: configuration already carries, so asking for it is the identity on any file - that is what
 #: makes "no mode chosen" reproduce the old runs exactly.
 #:
-#: `banded` is ONE decision split into the three things that have to move together, because
-#: moving any one of them alone does nothing measurable (measured 2026-11-01 on the track-scan
-#: station, same 10 mm grid, same 99% target):
-#:
-#:   side_scan_azimuths / spacing   the tilted seed family is laid on 12 axes 30 degrees
-#:                                  apart and every 40 mm instead of 2 axes every 200 mm, so
-#:                                  walls, bends and clamped rims get bands at all. Without
-#:                                  this the other two have nothing to choose.
-#:   joint_span_fraction / margin   the gate stops shrinking each axis to 90% and reserving
-#:                                  5 more degrees. A tilted band leaves the shrunken
-#:                                  envelope halfway along and `gate_ok` drops the WHOLE band,
-#:                                  not the part that left: measured 43 grown candidates with
-#:                                  the shrink and 216 without, same station and grid. This is
-#:                                  the item that makes a station ride its limits, which is
-#:                                  why it is a mode and not a default.
-#:   stroke_corner_cost             a band is charged one corner like a pose instead of the
-#:                                  two it really needs, so a 150-300 mm band stops losing to
-#:                                  the two stops that cover the same area.
+#: `banded` used to move THREE things at once, and the third was the joint envelope: it stopped
+#: shrinking each axis to 98% and reserving 5 more degrees, because a tilted band leaves a
+#: shrunken envelope halfway along and `gate_ok` drops the WHOLE band (measured 2026-11-01: 43
+#: grown candidates with the shrink, 216 without). That widening is GONE by policy (2026-11-02):
+#: a banded run at 0 % margin put one delivered point 1.25 deg under the J2 ceiling and
+#: ROBOGUIDE answered `MOTN-018 position not reachable`. The envelope is now a ceiling no mode
+#: may raise - see `MAX_JOINT_SPAN_FRACTION` / `MIN_JOINT_MARGIN_DEG` - so `banded` keeps its
+#: dense tilted seed family and its corner price and nothing else.
 PLAN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
     "standard": {
         "stroke": {"plan_mode": "standard", "side_scan_azimuths": 1,
                    "side_scan_spacing_mm": 0.0, "side_scan_wall_deg": 0.0,
                    "side_scan_max_seeds": 0, "stroke_corner_cost": 2.0},
-        "robot": {"joint_span_fraction": 0.9, "joint_margin_deg": 5.0},
+        "robot": {"joint_span_fraction": MAX_JOINT_SPAN_FRACTION,
+                  "joint_margin_deg": MIN_JOINT_MARGIN_DEG},
     },
     "banded": {
         "stroke": {"plan_mode": "banded", "side_scan_azimuths": 3,
                    "side_scan_spacing_mm": 60.0, "side_scan_wall_deg": 45.0,
                    "side_scan_max_seeds": 96, "stroke_corner_cost": 1.0},
-        # Zero margin and a full span on purpose, and it is the honest description of what
-        # this mode does: it asks the planner to use the envelope the controller enforces
-        # instead of a self-imposed smaller one. The poses are still inside the soft limits
-        # and still clear of the J5 singularity, so nothing here is unreachable - it is
-        # "no self-imposed comfort zone", not "ignore the limits".
-        "robot": {"joint_span_fraction": 1.0, "joint_margin_deg": 0.0},
+        # Same envelope as `standard`, spelled out rather than left empty so the mode still
+        # describes the whole state it asks for - and so a later mode cannot drift from it.
+        "robot": {"joint_span_fraction": MAX_JOINT_SPAN_FRACTION,
+                  "joint_margin_deg": MIN_JOINT_MARGIN_DEG},
     },
 }
 
@@ -1012,6 +1081,19 @@ MOTION_TYPES = ("J", "L")
 TERMINATIONS = ("FINE", "CNT0", "CNT100")
 POOL_MODES = ("full", "grid", "rails")
 WRIST_FLIP_POLICIES = ("T", "F", "any")
+TRACK_AXES = ("+X", "-X")
+#: How a joint-representation block names the seventh axis. `J7` is the axis number in the
+#: group; `E1` is the Cartesian spelling, kept as an escape hatch.
+TRACK_JOINT_LABELS = ("J7", "E1")
+
+
+def _track_limits(robot) -> tuple[float, float]:
+    """The rail's controller travel: what the file says, else the whole rail."""
+    limits = getattr(robot, "track_limits_mm", None)
+    if limits is None:
+        return (0.0, float(getattr(robot, "track_length_mm", 0.0)))
+    low, high = (float(value) for value in limits)
+    return (low, high)
 
 
 def _validate(config: PlannerConfig) -> None:
@@ -1219,6 +1301,25 @@ def _validate_robot(robot: RobotParams) -> None:
             raise ValueError(f"'robot.{name}' cannot be negative: it is a cost added to the "
                              "alternative that carries the change, so a negative value "
                              "would reward the change it exists to avoid")
+    _validate_track(robot)
+    # The envelope ceiling is checked BEFORE the `enabled` early return, because it is a fact
+    # about the machine rather than a setting of the planning sieve: a file that carries a
+    # wider band would otherwise only be refused on the day someone turned the gate on.
+    if robot.joint_margin_deg < MIN_JOINT_MARGIN_DEG:
+        raise ValueError(
+            f"'robot.joint_margin_deg' must be at least {MIN_JOINT_MARGIN_DEG:g} deg, not "
+            f"{robot.joint_margin_deg:g}: the usable band is the "
+            f"{MAX_JOINT_SPAN_FRACTION:.0%} span with this margin inside it, and a point that "
+            "sits closer than this to a limit is one ROBOGUIDE calls unreachable over a hair "
+            "of model difference (measured 2026-11-02: J2 = 74.75 of 76 answered MOTN-018). "
+            "Tighter is fine; looser is refused")
+    if not 0.0 < robot.joint_span_fraction <= MAX_JOINT_SPAN_FRACTION:
+        raise ValueError(
+            f"'robot.joint_span_fraction' must be in (0, {MAX_JOINT_SPAN_FRACTION:g}]: the "
+            "usable band is the axis span times this fraction, about the span's centre, and "
+            f"{MAX_JOINT_SPAN_FRACTION:g} is the ceiling. A wider envelope is how a plan looks "
+            "healthy here and comes back 'position not reachable' from the controller; "
+            "tighter is fine, looser is refused")
     if not robot.enabled:
         return
     for name in ("upper_arm_mm", "forearm_mm", "forearm_offset_mm"):
@@ -1249,14 +1350,10 @@ def _validate_robot(robot: RobotParams) -> None:
                     f"'robot.soft_limits_deg' axis J{axis} [{soft_low}, {soft_high}] is "
                     f"wider than the mechanical envelope [{low}, {high}]: the controller "
                     "cannot be more permissive than the arm")
-    if robot.joint_margin_deg < 0.0:
-        raise ValueError("'robot.joint_margin_deg' cannot be negative")
-    if not 0.0 < robot.joint_span_fraction <= 1.0:
-        raise ValueError("'robot.joint_span_fraction' must be in (0, 1]: it is the fraction "
-                         "of each axis span the planner may use, so 1.0 means 'right up to "
-                         "the limit', which is what the alarm-prone poses looked like")
     if robot.max_step_deg <= 0.0:
         raise ValueError("'robot.max_step_deg' must be positive")
+    if robot.min_margin_warn_deg < 0.0:
+        raise ValueError("'robot.min_margin_warn_deg' cannot be negative")
     if robot.j6_weight <= 0.0:
         raise ValueError("'robot.j6_weight' must be positive: it multiplies the cost of a "
                          "J6 change when two solutions are compared, and 1.0 is 'no "
@@ -1272,5 +1369,50 @@ def _validate_robot(robot: RobotParams) -> None:
     if robot.j5_min_abs_deg <= 0.0:
         raise ValueError("'robot.j5_min_abs_deg' must be positive: J5 = 0 is the wrist "
                          "singularity, not a safe centre")
+
+
+def _validate_track(robot: RobotParams) -> None:
+    """The seventh axis, checked whether or not the gate is on.
+
+    Separate from `_validate_robot`'s early return on `enabled=false` on purpose: the shipped
+    configuration ships the gate off, and a rail whose limits fall outside its own length is
+    a typo that would otherwise only surface on the day someone turned the gate on.
+    """
+    if not robot.track_enabled:
+        return
+    if robot.track_axis not in TRACK_AXES:
+        raise ValueError(f"'robot.track_axis' must be one of {TRACK_AXES}, not "
+                         f"{robot.track_axis!r}: the rail is a translation along one "
+                         "base-frame axis and nothing here measures a mounting angle")
+    if robot.track_length_mm <= 0.0:
+        raise ValueError("'robot.track_length_mm' must be positive")
+    low, high = _track_limits(robot)
+    if not 0.0 <= low < high <= robot.track_length_mm:
+        raise ValueError(
+            f"'robot.track_limits_mm' [{low}, {high}] must sit inside the rail "
+            f"[0, {robot.track_length_mm:g}] and be non-empty")
+    if robot.track_margin_mm < 0.0:
+        raise ValueError("'robot.track_margin_mm' cannot be negative")
+    if high - low <= 2.0 * robot.track_margin_mm:
+        raise ValueError("'robot.track_margin_mm' leaves no usable travel on the rail")
+    home = float(getattr(robot, "track_home_mm", 0.0))
+    if not low + robot.track_margin_mm <= home <= high - robot.track_margin_mm:
+        raise ValueError(
+            f"'robot.track_home_mm' is {home:g} mm, outside the usable travel "
+            f"[{low + robot.track_margin_mm:g}, {high - robot.track_margin_mm:g}]: the "
+            "programme starts where the carriage is parked, so that reading has to be one "
+            "the rail can hold")
+    if robot.track_grid_mm <= 0.0:
+        raise ValueError("'robot.track_grid_mm' must be positive")
+    if int(robot.track_candidates) < 1:
+        raise ValueError("'robot.track_candidates' must be at least 1")
+    if robot.track_nominal_reach_mm <= 0.0:
+        raise ValueError("'robot.track_nominal_reach_mm' must be positive")
+    if robot.track_cost_deg_per_mm < 0.0:
+        raise ValueError("'robot.track_cost_deg_per_mm' cannot be negative")
+    if str(robot.track_joint_label).upper() not in TRACK_JOINT_LABELS:
+        raise ValueError(f"'robot.track_joint_label' must be one of {TRACK_JOINT_LABELS}, "
+                         f"not {robot.track_joint_label!r}: it is how the seventh axis is "
+                         "spelled inside a joint-representation block")
 
 

@@ -190,6 +190,28 @@ def test_the_generator_does_not_offer_two_strokes_over_the_same_line():
     assert first in kept and same_line_shorter not in kept
 
 
+def test_a_band_that_dives_into_the_plate_is_refused(bench, cfg):
+    """A band is a straight line at a CONSTANT pose, so it can walk back into the sheet.
+
+    On a flat plate this needs a deliberately diving band to show, but on the real part it is
+    what actually happened: `_extend` only ever asked about the fixture and the base, so a
+    band whose far end sank to a few millimetres off the metal was legal all the way to the
+    `.LS` file (2026-11-03 rail run: three delivered bands, worst 0.4 mm).
+    """
+    samples = grid_samples(-400.0, 400.0, -300.0, 300.0, PLATE_TOP_MM, 10.0)
+    builder = StrokeBuilder(samples, bench, ScannerModel(cfg.scanner), cfg)
+    step = cfg.stroke.check_step_mm
+    safe = Stroke(start=np.array([-100.0, 0.0, PLATE_TOP_MM + 300.0]),
+                  end=np.array([100.0, 0.0, PLATE_TOP_MM + 300.0]),
+                  axis=np.array([0.0, 0.0, -1.0]))
+    diving = Stroke(start=np.array([-100.0, 0.0, PLATE_TOP_MM + 300.0]),
+                    end=np.array([100.0, 0.0, PLATE_TOP_MM + 20.0]),
+                    axis=np.array([0.0, 0.0, -1.0]))
+    assert builder.fits_at(safe.check_positions_mm(step))[0] is True
+    fits, margin = builder.fits_at(diving.check_positions_mm(step))
+    assert fits is False and margin < 0.0
+
+
 def test_a_pose_change_becomes_a_reorientation_and_a_translation_does_not(bench, cfg):
     model = ScannerModel(cfg.scanner)
     rolled_back = replace(cfg, stroke=replace(cfg.stroke, connector_level=2))

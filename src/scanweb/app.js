@@ -44,6 +44,8 @@ const glState = {
   home: null,
   pathLine: null,
   pathLineCount: 0,
+  pathJump: null,
+  pathJumpCount: 0,
   pathPoint: null,
   pathPointCount: 0,
   raf: 0,
@@ -363,14 +365,22 @@ function render() {
 
   const shift = glState.radius * 0.004;
   if (state.result && state.showPath && $("showPath").checked && glState.pathLine) {
-    gl.disable(gl.DEPTH_TEST);
+    // Drawn WITH depth testing, which is the whole point of splitting the two line sets:
+    // the old pass disabled the depth test and painted every connector on top of the model,
+    // so a plan that never touched the part still looked like it went through it. A sweep is
+    // thick and opaque, a transition is thin and faint, and either one behind the metal is
+    // simply hidden - rotate the view to look from the other side.
+    //
+    // Same reading as the standalone 3D view (viewer.html): bright = the sweep the head
+    // scans along, muted grey-blue = the transition between strokes.
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.lineWidth(Math.max(1, Math.round(2 * dpr)));
-    drawFlat(glState.pathLine, gl.LINES, glState.pathLineCount, [0.06, 0.72, 0.88], 1, 0, 0.95);
-    drawFlat(glState.pathPoint, gl.POINTS, glState.pathPointCount, [1.0, 0.58, 0.12], Math.max(6, 8 * dpr), 0, 1.0);
+    gl.lineWidth(Math.max(1, Math.round(1 * dpr)));
+    drawFlat(glState.pathJump, gl.LINES, glState.pathJumpCount, [0.45, 0.52, 0.60], 1, shift, 0.55);
+    gl.lineWidth(Math.max(1, Math.round(3 * dpr)));
+    drawFlat(glState.pathLine, gl.LINES, glState.pathLineCount, [0.06, 0.72, 0.88], 1, shift, 1.0);
+    drawFlat(glState.pathPoint, gl.POINTS, glState.pathPointCount, [1.0, 0.58, 0.12], Math.max(6, 8 * dpr), shift, 1.0);
     gl.disable(gl.BLEND);
-    gl.enable(gl.DEPTH_TEST);
   }
 
   drawOverlay(view, projection, cssWidth, cssHeight, dpr);
@@ -1336,24 +1346,37 @@ async function solve() {
 function buildPathBuffers() {
   const gl = glState.gl;
   if (!gl || !state.result || !Array.isArray(state.result.viewpoints)) return;
-  const points = state.result.viewpoints
-    .slice()
-    .sort((a, b) => a.order - b.order)
-    .map((viewpoint) => viewpoint.position);
-  const line = [];
+  const views = state.result.viewpoints.slice().sort((a, b) => a.order - b.order);
+  const points = views.map((viewpoint) => viewpoint.position);
+  // Two line sets, because they mean different things on the floor. A SWEEP is the head
+  // travelling while it scans - one stroke, so both ends belong to the same stroke. A
+  // TRANSITION is the head flying to the next stroke. Drawn in one style they read as a
+  // single spider net over the part, and a long transition looked exactly like a scan line
+  // crossing the sheet.
+  const sweep = [];
+  const jump = [];
   for (let index = 0; index < points.length - 1; index += 1) {
-    line.push(...points[index], ...points[index + 1]);
+    const left = views[index];
+    const right = views[index + 1];
+    const inside = left.role === "coverage" && right.role === "coverage"
+      && left.stroke_id === right.stroke_id;
+    (inside ? sweep : jump).push(...points[index], ...points[index + 1]);
   }
-  const lineData = new Float32Array(line);
-  const pointData = new Float32Array(points.flat());
-  if (!glState.pathLine) glState.pathLine = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, glState.pathLine);
-  gl.bufferData(gl.ARRAY_BUFFER, lineData, gl.STATIC_DRAW);
-  glState.pathLineCount = line.length / 3;
-  if (!glState.pathPoint) glState.pathPoint = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, glState.pathPoint);
-  gl.bufferData(gl.ARRAY_BUFFER, pointData, gl.STATIC_DRAW);
+  glState.pathLine = uploadFlatBuffer(glState.pathLine, new Float32Array(sweep));
+  glState.pathLineCount = sweep.length / 3;
+  glState.pathJump = uploadFlatBuffer(glState.pathJump, new Float32Array(jump));
+  glState.pathJumpCount = jump.length / 3;
+  glState.pathPoint = uploadFlatBuffer(glState.pathPoint,
+    new Float32Array(points.flat()));
   glState.pathPointCount = points.length;
+}
+
+function uploadFlatBuffer(buffer, data) {
+  const gl = glState.gl;
+  const target = buffer || gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, target);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  return target;
 }
 
 function formatElapsed(seconds) {
@@ -1406,7 +1429,11 @@ function renderResult(result) {
       ? [["定位方式", "自 " + result.relocated_from + " 变换 "
           + Number(result.shift_mm || 0).toFixed(2) + " mm（未重新规划）"]]
       : []),
-    ["底座", result.base_supplied ? "已导入" : "未导入 · 已自动生成参考板"],
+    ["底座", result.base_source === "uploaded" || (!result.base_source && result.base_supplied)
+      ? "已导入"
+      : result.base_source === "synthetic"
+        ? "未导入 · 已自动生成参考板"
+        : "未导入 · 使用默认底座 input/base.stl"],
     ["未覆盖原因", reasons],
     ["输出目录", result.output_dir]
   ];
@@ -2099,6 +2126,8 @@ function resetWorkspace() {
   glState.meshes = {};
   glState.pathLine = null;
   glState.pathLineCount = 0;
+  glState.pathJump = null;
+  glState.pathJumpCount = 0;
   glState.pathPoint = null;
   glState.pathPointCount = 0;
   glState.center = [0, 0, 0];
@@ -2115,7 +2144,7 @@ function resetWorkspace() {
   }
   $("partName").textContent = "选择零件模型";
   $("supportName").textContent = "选择夹具模型";
-  $("baseName").textContent = "未导入时自动生成参考板";
+  $("baseName").textContent = "未导入时使用 input/base.stl";
 
   document.querySelectorAll("[data-point-count]").forEach((button) => {
     button.classList.toggle("active", Number(button.dataset.pointCount) === 3);

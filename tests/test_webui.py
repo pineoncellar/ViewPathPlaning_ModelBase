@@ -16,6 +16,7 @@ from scanview import save_target_samples
 from scanweb import (
     _available_run_id,
     _decode_stl,
+    _default_base,
     _delete_history_run,
     _history_run_payload,
     _history_runs,
@@ -114,6 +115,43 @@ def test_synthetic_base_sits_below_the_part_and_fixture():
     assert base.bounds[1][2] < part.bounds[0][2]
     assert base.extents[0] >= fixture.extents[0]
     assert base.extents[1] >= fixture.extents[1]
+
+
+def test_a_run_without_an_uploaded_base_uses_the_station_base(tmp_path):
+    """`input/base.stl` is the default base; the synthetic plate is only a last resort."""
+    part = trimesh.creation.box(extents=[100.0, 80.0, 2.0])
+    fixture = trimesh.creation.box(extents=[140.0, 120.0, 40.0])
+    station = trimesh.creation.box(extents=[300.0, 200.0, 20.0])
+    station.apply_translation([0.0, 0.0, -15.0])
+    (tmp_path / "input").mkdir()
+    (tmp_path / "input" / "base.stl").write_bytes(station.export(file_type="stl"))
+
+    base, source = _default_base(part, fixture, tmp_path / "input")
+
+    assert source == "default"
+    assert base.extents == pytest.approx(station.extents, abs=1e-6)
+
+
+def test_without_a_station_base_the_synthetic_plate_is_the_last_resort(tmp_path):
+    part = trimesh.creation.box(extents=[100.0, 80.0, 2.0])
+    part.apply_translation([0.0, 0.0, 50.0])
+    fixture = trimesh.creation.box(extents=[140.0, 120.0, 40.0])
+    fixture.apply_translation([0.0, 0.0, 20.0])
+
+    base, source = _default_base(part, fixture, tmp_path / "input")
+
+    assert source == "synthetic"
+    assert base.bounds[1][2] < fixture.bounds[0][2]
+
+
+def test_an_unreadable_station_base_is_reported_instead_of_ignored(tmp_path):
+    part = trimesh.creation.box(extents=[100.0, 80.0, 2.0])
+    fixture = trimesh.creation.box(extents=[140.0, 120.0, 40.0])
+    (tmp_path / "input").mkdir()
+    (tmp_path / "input" / "base.stl").write_bytes(b"not an stl")
+
+    with pytest.raises(ValueError, match="default base"):
+        _default_base(part, fixture, tmp_path / "input")
 
 
 def test_reset_poses_are_parsed_as_vehicle_frame_rigid_transforms():

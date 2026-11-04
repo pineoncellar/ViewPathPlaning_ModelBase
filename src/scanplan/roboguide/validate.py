@@ -40,6 +40,9 @@ BRANCH_TOLERANCE_DEG = 1.0
 # that was planned and the point that will be reached are two different points.
 POSE_TOL_MM = 1.0
 POSE_TOL_DEG = 0.2
+# How far a straight move may arrive from the rail reading its block claims, in mm. The same
+# order as the pose tolerance: this is rounding, not preference.
+TRACK_TOL_MM = 1.0
 
 
 def _joint_gap_deg(first, second) -> float:
@@ -72,6 +75,7 @@ def check_points(points: list[dict], *, default_motion: str = "L",
     robot = Robot(replace(base, enabled=True))
     failures: list[dict] = []
     held: np.ndarray | None = None
+    held_track = 0.0
     segments = 0
     solved = 0
 
@@ -84,68 +88,94 @@ def check_points(points: list[dict], *, default_motion: str = "L",
         motion = str(point.get("motion") or default_motion).upper()
         raw = point.get("joints_deg")
         target = None if raw is None else np.asarray(raw, dtype=float).reshape(6)
+        # The seventh axis. Absent means a floor-mounted arm, which is 0.0 and commutes with
+        # every check below unchanged.
+        rail_raw = point.get("track_mm")
+        rail = 0.0 if rail_raw is None else float(rail_raw)
+        if target is not None and robot.feasible(target, rail):
+            # A record has to agree with itself before anything is walked: the joints AND the
+            # rail reading must reproduce the XYZ the block claims. With a rail this is not
+            # redundant bookkeeping - the rail makes the arm redundant, so a wrong `E1` still
+            # solves, it just lands somewhere else. Gated on feasibility so a pose that is
+            # simply out of band is reported as `joint_limit` (the reason someone can act on)
+            # rather than as a record that disagrees with itself.
+            reached, frame = robot.forward(target, rail)
+            gap_mm = float(np.linalg.norm(
+                np.asarray(reached, dtype=float).reshape(3) - position))
+            gap_deg = rotation_angle_deg(frame, rotation)
+            if gap_mm > POSE_TOL_MM or gap_deg > POSE_TOL_DEG:
+                fail(index,
+                     "track_mismatch" if robot.track_enabled else "joint_pose_mismatch",
+                     detail=f"joints + E1 = {rail:.1f} mm land "
+                            f"{gap_mm:.2f} mm / {gap_deg:.2f} deg from the block's XYZ"
+                            if robot.track_enabled else
+                            f"{gap_mm:.2f} mm / {gap_deg:.2f} deg from its own XYZ")
 
         if held is None:
             if target is not None:
-                if not robot.feasible(target):
+                if not robot.feasible(target, rail):
                     fail(index, "joint_limit", axis=int(np.argmin(robot.margins(target))))
                 held = target
+                held_track = rail
             else:
-                found = [item for item in robot.solutions(position, rotation) if item.ok]
+                found = [item for item in robot.solutions(position, rotation,
+                                                          track_mm=rail) if item.ok]
                 if not found:
                     fail(index, "no_ik_solution")
                 else:
                     solved += 1
                     held = np.asarray(found[0].joints_deg, dtype=float)
+                    held_track = rail
             continue
 
         segments += 1
         if motion == "J":
             if target is None:
-                found = [item for item in robot.solutions(position, rotation) if item.ok]
+                found = [item for item in robot.solutions(position, rotation,
+                                                          track_mm=rail) if item.ok]
                 if not found:
                     fail(index, "no_ik_solution")
                 else:
                     solved += 1
                     held = np.asarray(found[0].joints_deg, dtype=float)
+                    held_track = rail
                 continue
-            if not robot.feasible(target):
+            if not robot.feasible(target, rail):
                 # out-of-band target: the move cannot be flown, then carry on from it so one
                 # bad point does not blame every point after it
                 fail(index, "joint_limit", axis=int(np.argmin(robot.margins(target))))
                 held = target
+                held_track = rail
                 continue
-            # A joint-representation point is flown by the numbers in it, so the numbers have
-            # to describe the pose the plan says. This is the check that would have caught a
-            # file whose joint block and XYZ block disagreed.
-            reached, frame = robot.forward(target)
-            gap_mm = float(np.linalg.norm(np.asarray(reached, dtype=float).reshape(3) - position))
-            gap_deg = rotation_angle_deg(frame, rotation)
-            if gap_mm > POSE_TOL_MM or gap_deg > POSE_TOL_DEG:
-                fail(index, "joint_pose_mismatch",
-                     detail=f"{gap_mm:.2f} mm / {gap_deg:.2f} deg from its own XYZ")
+            # A joint-representation point is flown by the numbers in it; the record's own
+            # consistency was checked above.
             if float(held[4]) * float(target[4]) < 0.0:
                 fail(index, "j5_crossover")
             held = target
+            held_track = rail
             continue
 
-        verdict = robot.follow(held, position, rotation, step_mm=STEP_MM)
+        verdict = robot.follow(held, position, rotation, step_mm=STEP_MM,
+                               track_start=held_track, track_end=rail)
         if verdict.ok:
             arrived = np.asarray(verdict.joints_deg, dtype=float)
+            # The record's own consistency (joints + E1 against XYZ) was checked above.
             if target is not None:
                 gap = _joint_gap_deg(arrived, target)
                 if gap > BRANCH_TOLERANCE_DEG:
                     fail(index, "branch_mismatch", at_deg=round(gap, 2))
             held = arrived
+            held_track = rail
             continue
         fail(index, verdict.reason or "unverified",
              axis=None if verdict.limiting_axis is None else int(verdict.limiting_axis),
              at_mm=None if verdict.failure_mm is None else round(float(verdict.failure_mm), 1))
         # continue from where the pose can be held, so the report names the first failure of
         # each run of failures rather than every point downstream of the first one
-        found = [item for item in robot.solutions(position, rotation) if item.ok]
+        found = [item for item in robot.solutions(position, rotation, track_mm=rail) if item.ok]
         if found:
             held = np.asarray(found[0].joints_deg, dtype=float)
+            held_track = rail
 
     return {
         "enabled": True,

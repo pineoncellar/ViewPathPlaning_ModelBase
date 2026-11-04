@@ -56,19 +56,42 @@ def test_standard_restores_every_number_the_mode_names():
         assert getattr(back.robot, name) == getattr(shipped.robot, name), name
 
 
-def test_banded_moves_exactly_the_three_things_it_says_it_moves():
-    """One mode, one decision - but three settings, because moving any one alone does nothing.
+def test_banded_moves_the_seed_family_and_the_price_and_nothing_else():
+    """One mode, one decision - the envelope is NOT part of it any more.
 
-    Measured 2026-11-01 on the track-scan station, same 10 mm grid and 99% target: the joint
-    envelope shrink alone cuts the grown candidates from 216 to 43, and the tilted family at
-    one azimuth every 200 mm never reaches a wall.
+    `banded` used to widen the joint envelope to full span and zero margin, because a tilted
+    band leaves a shrunken envelope halfway along and `gate_ok` drops the whole band. That
+    widening is gone by policy (2026-11-02): a run at zero margin delivered a point 1.25 deg
+    under the J2 ceiling and ROBOGUIDE answered `MOTN-018 position not reachable`.
     """
     banded = plan_preset(_config(), "banded")
     assert banded.stroke.side_scan_azimuths > 1
     assert banded.stroke.side_scan_spacing_mm > 0.0
     assert banded.stroke.stroke_corner_cost < 2.0
-    assert banded.robot.joint_span_fraction == 1.0
-    assert banded.robot.joint_margin_deg == 0.0
+    # the envelope is the same ceiling `standard` uses, spelled out by both modes
+    assert banded.robot.joint_span_fraction == pytest.approx(0.98)
+    assert banded.robot.joint_margin_deg == pytest.approx(5.0)
+
+
+def test_no_mode_and_no_file_can_widen_the_joint_envelope():
+    """98 % of the span with 5 deg inside it is a ceiling, not a default.
+
+    Tighter is allowed - a site may want 10 deg - and looser is refused, because a plan that
+    rides the limits plans cleanly here and comes back unreachable from the controller.
+    """
+    for mode in PLAN_MODES:
+        expanded = plan_preset(_config(), mode)
+        assert expanded.robot.joint_span_fraction <= 0.98
+        assert expanded.robot.joint_margin_deg >= 5.0
+    with pytest.raises(ValueError, match="joint_span_fraction"):
+        override(_config(), robot={"joint_span_fraction": 1.0})
+    with pytest.raises(ValueError, match="joint_margin_deg"):
+        override(_config(), robot={"joint_margin_deg": 0.0})
+    # stricter is not an error
+    tighter = override(_config(), robot={"joint_span_fraction": 0.9,
+                                         "joint_margin_deg": 10.0})
+    assert tighter.robot.joint_span_fraction == pytest.approx(0.9)
+    assert tighter.robot.joint_margin_deg == pytest.approx(10.0)
 
 
 def test_a_mode_and_a_route_style_are_independent():
@@ -241,7 +264,7 @@ def test_the_report_block_records_the_mode_and_the_numbers_it_stands_for():
     assert settings["side_scan_wall_deg"] == 45.0
     assert settings["side_scan_max_seeds"] == 96
     assert settings["stroke_corner_cost"] == 1.0
-    assert settings["joint_span_fraction"] == 1.0
+    assert settings["joint_span_fraction"] == pytest.approx(0.98)
     assert "banded" in block["caveat"]
 
 
@@ -273,7 +296,7 @@ def test_the_shipped_configuration_ships_the_standard_mode():
     assert config.stroke.side_scan_azimuths == 1
     assert config.stroke.side_scan_spacing_mm == 0.0
     assert config.stroke.stroke_corner_cost == 2.0
-    assert config.robot.joint_span_fraction == 0.9
+    assert config.robot.joint_span_fraction == 0.98
     assert config.robot.joint_margin_deg == 5.0
 
 
@@ -294,7 +317,8 @@ def test_the_page_can_ask_for_a_mode_and_omitting_it_keeps_the_file():
     asked = _delivery_config({"delivery_mode": "stroke", "plan_mode": "banded"})
     assert asked.stroke.plan_mode == "banded"
     assert asked.stroke.stroke_corner_cost == 1.0
-    assert asked.robot.joint_span_fraction == 1.0
+    assert asked.robot.joint_span_fraction == pytest.approx(0.98)
+    assert asked.robot.joint_margin_deg == pytest.approx(5.0)
 
     # an explicit price still wins over the mode's, which is what the page's own control is
     mixed = _delivery_config({"delivery_mode": "stroke", "plan_mode": "banded",

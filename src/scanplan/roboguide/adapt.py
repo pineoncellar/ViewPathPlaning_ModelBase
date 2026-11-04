@@ -108,6 +108,10 @@ def viewpoints_to_points(viewpoints, *, per_point_config: bool = False) -> list[
                 # fills it in from `joint_speed_ladder` when it is absent, and never
                 # overwrites one that is already here.
                 "speed": _field(item, "speed", None),
+                # The seventh axis: the carriage reading this pose was planned at, in mm of
+                # rail. None on a floor-mounted arm, which is what keeps the `E1` column out
+                # of every program written before a rail existed.
+                "track_mm": _field(item, "track_mm", None),
             }
         )
     return wpr.unwrap_wpr(points)
@@ -423,6 +427,38 @@ def _contract_blocks(
     }
 
 
+def _extended_axis_note(points, written: bool) -> dict:
+    """What the seventh axis looks like in the file, and what the cell has to have.
+
+    The column has to match the CONTROLLER, not the plan. A robot configured with six
+    controlled axes refuses a point that declares seven, and the alarm it raises is
+    `ASBN-009 Mismatch number of joint` on the first `E1` line - which reads like a broken
+    file rather than a cell that has no rail. Saying this in the contract is the difference
+    between a five-minute fix and an afternoon.
+    """
+    carried = [float(point["track_mm"]) for point in points
+               if point.get("track_mm") is not None]
+    note = {
+        "column": "E1",
+        "written": bool(written and carried),
+        "plan_carries_rail_mm": bool(carried),
+        "used_span_mm": ([round(min(carried), 3), round(max(carried), 3)]
+                         if carried else None),
+        "requires": (
+            "a seventh axis in motion group 1 (an extended linear axis) on the controller "
+            "the program is imported into; with six controlled axes ROBOGUIDE stops at the "
+            "first E1 line with 'ASBN-009 Mismatch number of joint'"),
+    }
+    if carried and not written:
+        note["warning"] = (
+            "this plan WAS made with the rail - the points sit where the carriage made them "
+            "reachable - but the program does not command it. Either configure the rail on "
+            "the controller, or re-plan with robot.track_enabled = false so the poses and "
+            "the program describe the same machine. Re-exporting alone does not move the "
+            "points")
+    return note
+
+
 def export(
     viewpoints,
     out_dir,
@@ -442,6 +478,8 @@ def export(
     order=True,
     allow_unverified: bool = False,
     robot_params=None,
+    emit_e1: bool | None = None,
+    cartesian_only: bool = False,
 ) -> dict:
     """Write `<NAME>.LS`, `<NAME>_points.csv`, `<NAME>_frame.json` and return the contract.
 
@@ -465,7 +503,14 @@ def export(
     dataclass DEFAULTS - which happen to agree with the shipped file, so the omission was
     invisible until a plan was made in a different envelope: a `banded` run (full span, zero
     margin) then came back as "25 point(s) would not run (joint_limit)" because the audit was
-    demanding the default 5 degrees of margin inside the default 90% span.
+    demanding the default 5 degrees of margin inside the default 98% span.
+
+    `emit_e1` decides whether the seventh axis is written, and `None` means "whatever the arm
+    parameters say". It exists because the column has to match the CELL, not the plan: a
+    robot in ROBOGUIDE with six controlled axes refuses a point that declares seven with
+    `ASBN-009 Mismatch number of joint` at load. Turning it off does NOT un-plan the rail -
+    the poses are still the ones the carriage made reachable - so the contract records that
+    the program and the plan disagree on purpose.
     """
     name = wpr.normalise_prog_name(prog_name)
     points = viewpoints_to_points(viewpoints, per_point_config=per_point_config)
@@ -516,6 +561,14 @@ def export(
     else:
         speed_stats = None
 
+    rail_written = (bool(getattr(robot_params, "track_emit_e1", True))
+                    if emit_e1 is None else bool(emit_e1))
+    # A joint block that carries the seventh axis is not loadable on the cell measured
+    # 2026-11-02, so a rail run writes Cartesian blocks by default and `cartesian_only`
+    # follows from the parameters unless the caller says otherwise.
+    if not cartesian_only:
+        cartesian_only = bool(getattr(robot_params, "track_enabled", False)
+                              and not getattr(robot_params, "track_joint_blocks", False))
     ls_text = ls.build_ls(
         points,
         prog_name=name,
@@ -528,6 +581,9 @@ def export(
         config=config,
         comment=_COMMENT,
         joint_blocks=joint_blocks,
+        emit_e1=rail_written,
+        joint_rail_label=str(getattr(robot_params, "track_joint_label", "J7")),
+        cartesian_only=bool(cartesian_only),
     )
     # Stage 5's gate: the file is audited BEFORE a byte of it is written.  Two independent
     # checks on purpose - `check_points` re-walks the program with its own Robot (no planner
@@ -579,6 +635,7 @@ def export(
     contract["program"]["termination"] = str(termination).upper()
     contract["program"]["strokes"] = sorted(strokes) if strokes else []
     contract["program"]["motion_speeds"] = _motion_speeds(speed, joint_speed, speed_stats)
+    contract["program"]["extended_axis"] = _extended_axis_note(points, rail_written)
     contract["joint_audit"] = {
         "ok": audit["ok"] and hints["ok"],
         "refused": bool(refusals),

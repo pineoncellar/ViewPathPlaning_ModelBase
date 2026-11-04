@@ -216,6 +216,30 @@ def _sync_input_part(raw: bytes, input_dir: Path) -> Path:
     return part_path
 
 
+def _input_dir() -> Path:
+    """The station's shared model folder, next to the run output folder."""
+    return Path.cwd() / "input"
+
+
+def _default_base(part: trimesh.Trimesh, fixture: trimesh.Trimesh,
+                  input_dir: Path | None = None) -> tuple[trimesh.Trimesh, str]:
+    """The base to plan against when the page did not upload one.
+
+    `input/base.stl` is the station's own base, kept beside `input/part.stl`, so a run
+    without an uploaded base traces the real fixture geometry instead of a stand-in.
+    The returned tag tells the result where the mesh came from. Only when that file is
+    absent does the service fall back to a synthetic plate, which keeps a checkout with
+    no station base planable.
+    """
+    path = (input_dir or _input_dir()) / "base.stl"
+    if path.is_file():
+        try:
+            return _load_stl(path.read_bytes(), f"default base ({path})"), "default"
+        except ValueError as error:
+            raise ValueError(f"{path} cannot be used as the default base: {error}") from error
+    return _synthetic_base(part, fixture), "synthetic"
+
+
 def _synthetic_base(part: trimesh.Trimesh, fixture: trimesh.Trimesh) -> trimesh.Trimesh:
     """A flat reference plate under the uploaded models when no base is supplied.
 
@@ -318,13 +342,12 @@ def _write_planning_report(path: Path, *, run_id: str, prog_name: str,
             f'{html.escape(str(route.get("plan_mode")))}</b>：倾斜种子族铺在 '
             f'{int(plan_settings.get("side_scan_azimuths") or 1) * 2} 个方向（每 '
             f'{float(plan_settings.get("side_scan_spacing_mm") or 0.0):g} mm 一颗），'
-            f'关节包络用满量程的 '
-            f'{float(plan_settings.get("joint_span_fraction") or 1.0):g}、余量 '
-            f'{float(plan_settings.get("joint_margin_deg") or 0.0):g}°，'
             f'一条扫描带按 '
             f'{float(plan_settings.get("stroke_corner_cost") or 2.0):g} 个转角计价。'
-            "这个模式会让更多区域被<b>扫</b>而不是被<b>停</b>，代价是点数上升、"
-            "并且贴着关节限位跑；与 <code>standard</code> 档的结果<b>不能互相作为回归"
+            "这个模式会让更多区域被<b>扫</b>而不是被<b>停</b>，代价是点数上升；"
+            f"关节包络两档一致（量程 {float(plan_settings.get('joint_span_fraction') or 0.98):g} "
+            f"+ 余量 {float(plan_settings.get('joint_margin_deg') or 5.0):g}°），"
+            "且<b>不允许放宽</b>。与 <code>standard</code> 档的结果<b>不能互相作为回归"
             "基准</b>。</div></section>"
         )
     body = f"""<!doctype html>
@@ -612,12 +635,20 @@ def _export_options(config, viewpoints, data: dict) -> dict:
     """
     ladder = getattr(config.motion, "joint_speed_ladder", None)
     ladder = [list(entry) for entry in ladder] if ladder and len(ladder) > 1 else None
+    # Per-point CONFIG, always. It carries more than the branch letters: the last three digits
+    # are the wrist REVOLUTION (`turn_digits`), and that column is the only way a Cartesian
+    # point can say which of two equivalent J6 readings it wants. With one constant
+    # `N U T, 0, 0, 0` the controller chooses for itself, and on this rail run it chose a
+    # reading a full turn from the planned one - a 299 deg wrist swing between two points that
+    # are 61 apart. The letters still come from the solved solution, so they stay `T` for the
+    # negative-J5 branch the site measured.
     if any(point.stroke_id is not None for point in viewpoints):
         return {
             "motion": config.motion.type,
             "speed": f"{config.motion.speed_mm_s:g} mm/sec",
             "termination": config.motion.termination,
             "joint_speed_ladder": ladder,
+            "per_point_config": True,
             "order": False,
         }
     return {
@@ -625,6 +656,7 @@ def _export_options(config, viewpoints, data: dict) -> dict:
         "speed": str(data.get("speed", "100%")),
         "termination": "FINE",
         "joint_speed_ladder": ladder,
+        "per_point_config": True,
         "order": True,
     }
 
@@ -656,10 +688,13 @@ def solve_job(data: dict, progress=None) -> dict:
     support = _decode_stl(models.get("support", {}), "support/fixture")
     part_raw = _decode_stl_bytes(models.get("part", {}), "part")
     part = _load_stl(part_raw, "part")
+    input_dir = _input_dir()
     base_payload = models.get("base") or {}
     base_supplied = isinstance(base_payload, dict) and bool(base_payload.get("stl_base64"))
-    base = (_decode_stl(base_payload, "base") if base_supplied
-            else _synthetic_base(part, support))
+    if base_supplied:
+        base, base_source = _decode_stl(base_payload, "base"), "uploaded"
+    else:
+        base, base_source = _default_base(part, support, input_dir)
     base_reset, support_reset, part_reset = resets
 
     try:
@@ -698,7 +733,7 @@ def solve_job(data: dict, progress=None) -> dict:
     run_id = _available_run_id(requested_run_id, runs_root)
     output = (runs_root / run_id).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    _sync_input_part(part_raw, Path.cwd() / "input")
+    _sync_input_part(part_raw, input_dir)
 
     base_path = output / "base.stl"
     base_vehicle_path = output / "base_vehicle.stl"
@@ -909,6 +944,9 @@ def solve_job(data: dict, progress=None) -> dict:
         "utool": int(data.get("utool", 1)),
         "elapsed_seconds": round(time.perf_counter() - started, 2),
         "base_supplied": base_supplied,
+        # `uploaded` / `default` (input/base.stl) / `synthetic`, so a stored run still
+        # says which base its occlusion numbers were computed against.
+        "base_source": base_source,
         "viewpoints": delivered,
         "viewer_url": f"/api/viewer?run_id={run_id}",
         "downloads": _download_entries(prog_name),
@@ -1053,6 +1091,9 @@ def _relocation_export_options(run_dir: Path, prog_name: str) -> dict:
         "motion": str(program.get("motion") or "J"),
         "speed": str(program.get("speed") or "100%"),
         "termination": str(program.get("termination") or "FINE"),
+        # Same reason as `_export_options`: the recorded CONFIG carries the wrist revolution,
+        # and a rigidly moved path needs it just as much as a planned one.
+        "per_point_config": True,
     }
 
 
@@ -1070,7 +1111,7 @@ def _robot_params_from_report(report: dict):
 
     A relocation does not re-plan, so there is no configuration object to hand - and the
     export audit would otherwise walk the file against the dataclass DEFAULTS, i.e. a 5 degree
-    margin inside a 90 % span, which is not the envelope a `banded` run was made in.
+    margin inside a 98 % span, which is not the envelope a `banded` run was made in.
 
     Only the envelope is reconstructed, because that is the only part the audit uses to decide
     `joint_limit`: the measured geometry, signs and tool all come from the shipped defaults,
@@ -1084,6 +1125,7 @@ def _robot_params_from_report(report: dict):
     if not usable:
         return None
     band = tuple(tuple(float(value) for value in pair) for pair in usable)
+    track = ((report or {}).get("kinematics") or {}).get("track") or {}
     return replace(
         RobotParams.disabled(),
         enabled=True,
@@ -1092,6 +1134,15 @@ def _robot_params_from_report(report: dict):
         joint_span_fraction=1.0,
         joint_margin_deg=float(envelope.get("margin_deg") or 0.0),
         wrist_flip_policy=str(envelope.get("wrist_policy") or "T"),
+        # A relocation does not re-plan, so the rail has to be rebuilt from the report too -
+        # otherwise the audit walks a rail plan with a floor-mounted arm and every point
+        # that the carriage made reachable comes back as unreachable.
+        track_enabled=bool(track.get("enabled")),
+        track_axis=str(track.get("axis") or "+X"),
+        track_length_mm=float(track.get("length_mm") or 0.0),
+        track_margin_mm=float(track.get("margin_mm") or 0.0),
+        track_home_mm=float(track.get("home_mm") or 0.0),
+        track_limits_mm=None,
     )
 
 

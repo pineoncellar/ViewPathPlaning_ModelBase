@@ -149,7 +149,10 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
         if buried[index]:
             counters["rejected_inside_part"] += 1
             rejected = "inside_part"
-        elif not model.body_fits(pose.position, station.clearance_mm(pose.position)[0]):
+        elif not model.body_fits(
+                pose.position,
+                station.body_clearance_mm(pose.position,
+                                          limit_mm=model.body_limit_mm)[0]):
             counters["rejected_clearance"] += 1
             rejected = "clearance"
         elif not tracker_ok[index]:

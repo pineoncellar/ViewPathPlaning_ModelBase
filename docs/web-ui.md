@@ -30,8 +30,8 @@ New-NetFirewallRule -DisplayName "ScanPlan Web 8765" -Direction Inbound `
 
 - **本次运行名称**：留空则按时间自动命名。
 - **方案**：把当前整套配置存下来，重启程序后一键恢复。详见下一节。
-- **工位模型**：零件模型与夹具模型必填，底座可选（留空时服务自动生成一块位于零件下方的
-  参考平板作遮挡基准）。可直接上传 STL / OBJ / PLY / OFF / 3MF / GLB，以及 STEP（`.stp`、
+- **工位模型**：零件模型与夹具模型必填，底座可选（留空时自动使用 `input/base.stl` 作为默认底座；
+  该文件也不存在时才生成一块位于零件下方的参考平板作遮挡基准）。可直接上传 STL / OBJ / PLY / OFF / 3MF / GLB，以及 STEP（`.stp`、
   `.step`）、IGES（`.igs`、`.iges`）、BREP——后三种由服务端调用 OpenCASCADE 三角化，需要可选
   依赖（`uv sync --extra cad`，或 `pip install cadquery-ocp`），没装时页面只接受网格格式。
   PRT / SLDPRT / CATPart 等原生格式没有免费读取器，会提示先在 CAD 里导出 STEP 或 IGES。
@@ -88,6 +88,10 @@ New-NetFirewallRule -DisplayName "ScanPlan Web 8765" -Direction Inbound `
   最坏单轴步长和无解点数。带门的覆盖率必然低于纯几何（这台机器实测 99.0% → 91.8%），
   那是关节门如实反映现状，不是判据写错了；不带门的旧行为命令行还能跑，用不含
   `configs/robot_gate.json` 的配置即可。
+- **导出默认逐点写 CONFIG**（CLI 的 `scanplan ls` 要显式加 `--per-point-config`）。字母一律是
+  `T`（负 J5 那支），真正起作用的是**圈位**：`N U T, 0, 0, 1` 表示 J6 取 +196.7 而不是 −163.3。
+  少了这一位，控制器自己挑读数，J6 会在 ±180 接缝上多转一整圈（2026-11-02 实测 298.6°），
+  见 [configuration.md](configuration.md#腕部分支只能选-tj5-为负)。
 - **定位点数量**：3 点或 4 点。
 
 ### 2. 在 3D 模型上点定位点，再填现场坐标（第 02 步）
@@ -133,6 +137,10 @@ New-NetFirewallRule -DisplayName "ScanPlan Web 8765" -Direction Inbound `
   假装快完成；请求结束才跳到 100%。
 - 结果区显示目标面覆盖率、扫描视点数、目标采样点、漏扫点数与本次规划耗时，并可「查看扫描
   路径」把程序顺序叠到模型上，或「打开 viewer.html 3D 分析」逐视点、逐采样核对。
+- 「查看扫描路径」的画法与 `viewer.html` 同一套读法：**亮色粗线 = 扫描带**（同一条带的两端），
+  **灰蓝色细线 = 过渡/退刀**（换条时的移动），且两者都**按深度遮挡**——在零件背面的线就是背
+  面，旋转视角才看得到。以前整条路径关掉深度测试画在模型上面，一条完全没碰零件的计划也会
+  看着像穿模。
 - 下载列表里 **`<程序名>.LS` 就是交给 ROBOGUIDE 的程序**；同批还有 `<程序名>_points.csv`
   （点位表）、`<程序名>_frame.json`（帧契约）、`planning_report.html`、`coverage_report.json`、
   `registration_report.json`、`summary.txt` 与三个 CSV。

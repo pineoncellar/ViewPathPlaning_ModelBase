@@ -90,6 +90,11 @@ class Station:
     base_cloud_mm: np.ndarray
     fixture_tree: cKDTree
     base_tree: cKDTree
+    # The part's own surface samples, used ONLY by `body_clearance_mm`. `clearance_mm`
+    # must not see them: it answers "how close is the clamp", and a sample ON the sheet
+    # would answer zero everywhere.
+    part_cloud_mm: np.ndarray | None = None
+    part_tree: cKDTree | None = None
     # What `winding.repair_winding` did to the part, empty when nothing had to be fixed.
     # Stage 1 owns this: the split, the sampling and the feature mask all read `face_normals`,
     # so a mis-wound patch poisons every one of them at once.
@@ -117,13 +122,79 @@ class Station:
         return self._obstacles
 
     def clearance_mm(self, points) -> np.ndarray:
-        """Distance from each point to the nearest fixture or base sample."""
+        """Distance from each point to the nearest fixture or base sample.
+
+        This is the CLAMP question - "is this point next to the fixture or the base" - which
+        is what the exempt (clamped) region and the fixture's own resolution are about. It
+        deliberately excludes the part: the part is what the head has come to scan, its own
+        surface samples would read zero at the target, and a gate built on this number could
+        never accept a scan pose.
+
+        The BODY question - "does the head fit here" - is :meth:`body_clearance_mm`, and it
+        does include the part.
+        """
         points = np.asarray(points, dtype=float).reshape(-1, 3)
         if len(points) == 0:
             return np.zeros(0)
         to_fixture = self.fixture_tree.query(points, k=1)[0]
         to_base = self.base_tree.query(points, k=1)[0]
         return np.minimum(to_fixture, to_base)
+
+    def body_clearance_mm(self, points, *, limit_mm: float | None = None) -> np.ndarray:
+        """Distance from each point to the nearest PART, FIXTURE or BASE sample.
+
+        The head is a body of `body_sphere_r_mm`, and "the head fits" has to mean "there is
+        material nowhere near it" - not "there is no fixture near it". The part was left out
+        of :meth:`clearance_mm` for the clamp question, and leaving it out here too was a
+        real defect: a scan band grows along a STRAIGHT line at a constant pose, so on a
+        curved or stepped panel it can dive back into the very sheet it is scanning. Nothing
+        downstream could see that - `clearance_mm` never looked at the part, and the band was
+        delivered with its far end a few millimetres off the metal (measured on the
+        2026-11-03 web run: 3 delivered bands came within 10 mm, and 2 delivered points sat
+        12 mm and 27 mm from the part with a 45 mm body sphere).
+
+        Approximate to the cloud's own resolution (about 3 mm on a 2 m2 part), which is two
+        orders of magnitude below the body radius it is compared against.
+
+        `limit_mm` is not a clamp on the ANSWER, it is what makes the query affordable. A
+        part is a thin shell, so a point sitting 300 mm off it is roughly equidistant from
+        the whole cloud: an unbounded nearest-neighbour search there has no bounding box to
+        prune with and degenerates into a full scan (measured 0.9 ms PER POINT, which on a
+        real run is minutes). Every caller only compares this number with the body limit, so
+        a cut-off there is free: past it the part answer is dropped and the fixture/base
+        distance - exact and cheap - is what comes back. Pass `None` when the exact figure is
+        wanted for a report of a handful of points.
+        """
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if len(points) == 0:
+            return np.zeros(0)
+        near = self.clearance_mm(points)
+        if limit_mm is None:
+            to_part = self._part_tree().query(points, k=1)[0]
+        else:
+            to_part = self._part_tree().query(points, k=1,
+                                              distance_upper_bound=float(limit_mm))[0]
+            to_part = np.where(np.isfinite(to_part), to_part, np.inf)
+        return np.minimum(near, to_part)
+
+    def _part_tree(self) -> cKDTree:
+        """The part's surface samples as a KD-tree, sampled on first use.
+
+        Lazy because :func:`load_models` and the 3D view build a Station-shaped object to
+        draw a picture and never ask this question; sampling half a million points to draw
+        the part would waste the bulk of their runtime.
+
+        A hand-built Station (tests, fixtures) usually has no cloud, so it is sampled here
+        from the mesh itself at the same area-driven density
+        :func:`load_station` uses. Seeded, so two runs of the same station agree.
+        """
+        if self.part_tree is None:
+            cloud = (self.part_cloud_mm if self.part_cloud_mm is not None
+                     else sample_surface_seeded(self.part,
+                                                _cloud_points(self.part, 400_000), 0)[0])
+            self.part_cloud_mm = cloud
+            self.part_tree = cKDTree(cloud)
+        return self.part_tree
 
     def _parity(self, points) -> np.ndarray:
         """The raw three-axis parity vote, with no trust check."""
@@ -310,7 +381,8 @@ def load_models(description: StationDescription, *, repair: bool = True
 
 def load_station(description: StationDescription, *, cloud_seed: int,
                  fixture_cloud_points: int = 200_000,
-                 base_cloud_points: int = 200_000) -> Station:
+                 base_cloud_points: int = 200_000,
+                 part_cloud_points: int = 400_000) -> Station:
     """Load the three models, repair the part's winding, and sample the obstacles."""
     part, fixture, base, winding = load_models(description)
 
@@ -318,10 +390,15 @@ def load_station(description: StationDescription, *, cloud_seed: int,
         fixture, _cloud_points(fixture, fixture_cloud_points), cloud_seed)[0]
     base_cloud = sample_surface_seeded(
         base, _cloud_points(base, base_cloud_points), cloud_seed + 1)[0]
+    # The part is sampled for the body-clearance question only; its density is set by the
+    # body radius it is compared against, not by the target sampling.
+    part_cloud = sample_surface_seeded(
+        part, _cloud_points(part, part_cloud_points), cloud_seed + 2)[0]
     return Station(
         part=part, fixture=fixture, base=base, description=description,
         fixture_cloud_mm=fixture_cloud, base_cloud_mm=base_cloud,
         fixture_tree=cKDTree(fixture_cloud), base_tree=cKDTree(base_cloud),
+        part_cloud_mm=part_cloud, part_tree=cKDTree(part_cloud),
         winding=winding,
     )
 

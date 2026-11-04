@@ -119,6 +119,37 @@ def test_nearest_obstacle_point_is_where_that_distance_was_measured(station):
                        station.clearance_mm(probe), atol=1e-9)
 
 
+def test_body_clearance_counts_the_part_and_clearance_mm_does_not(station):
+    """The clamp question and the body question have two different answers.
+
+    Two millimetres above the highest point of the sheet: the fixture is 7 mm away (the plate
+    is propped 5 mm above it), but the HEAD is 2 mm from the part it came to scan. Before the
+    part was in the body test, a scan band could be delivered at this distance - measured on
+    the 2026-11-03 web run, two delivered points sat 12 mm and 27 mm from the part with a
+    45 mm body sphere - and nothing downstream could see it.
+    """
+    top = station.part.vertices[int(np.argmax(station.part.vertices[:, 2]))]
+    probe = np.array([top + np.array([0.0, 0.0, 2.0])])
+    assert float(station.clearance_mm(probe)[0]) > 5.0
+    # the cloud is sampled, so the figure is a little larger than the exact 2.0 mm
+    assert 1.5 < float(station.body_clearance_mm(probe)[0]) < 2.6
+
+
+def test_body_clearance_still_answers_on_a_station_built_by_hand(station):
+    """A Station assembled in code has no part cloud; it is sampled from the mesh on demand."""
+    from scanplan.scene import Station
+
+    rebuilt = Station(part=station.part, fixture=station.fixture, base=station.base,
+                      description=station.description,
+                      fixture_cloud_mm=station.fixture_cloud_mm,
+                      base_cloud_mm=station.base_cloud_mm,
+                      fixture_tree=station.fixture_tree, base_tree=station.base_tree)
+    assert rebuilt.part_tree is None
+    probe = np.array([[0.0, 0.0, 50.0]])
+    assert float(rebuilt.body_clearance_mm(probe)[0]) > 10.0
+    assert rebuilt.part_tree is not None
+
+
 def test_a_typo_in_the_station_file_is_rejected(tmp_path, folded_plate, fixture_box, base_box):
     path = write_station_file(tmp_path, folded_plate, fixture_box, base_box)
     body = json.loads(path.read_text(encoding="utf-8"))

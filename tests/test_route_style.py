@@ -153,6 +153,10 @@ class _StubStation:
         inside = (np.abs(points[:, 0]) < 5.0) & (np.abs(points[:, 1]) < 5.0)
         return np.where(inside, -5.0, 120.0)
 
+    def body_clearance_mm(self, positions, *, limit_mm=None):
+        """The same box stands in for the part: the stub has no separate mesh."""
+        return self.clearance_mm(positions)
+
 
 class _StubModel:
     body_limit_mm = 45.0
@@ -181,9 +185,11 @@ class _StubKin:
     def check(self, position, axis, roll_deg):
         return SimpleNamespace(ok=True, reason="", solution=_StubSolution(self.joints))
 
-    def follow(self, joints_start, position, axis, roll_deg, *, step_mm=10.0):
+    def follow(self, joints_start, position, axis, roll_deg, *, step_mm=10.0,
+               track_start=0.0, track_end=None):
         """The straight-line walk the connector now uses to earn `LEVEL_STRAIGHT`."""
-        return SimpleNamespace(ok=True, reason="", joints_deg=self.joints)
+        return SimpleNamespace(ok=True, reason="", joints_deg=self.joints,
+                               track_mm=track_start if track_end is None else track_end)
 
     def sweep_points(self, start, end, step_deg):
         return np.asarray([[60.0, 60.0, 0.0], [60.0, 60.0, 0.0]])
@@ -255,8 +261,10 @@ def test_a_straight_leg_that_loses_the_branch_on_the_way_is_refused():
     """Clearance is not reachability: the controller solves every point along the line."""
 
     class _Lost(_StubKin):
-        def follow(self, joints_start, position, axis, roll_deg, *, step_mm=10.0):
-            return SimpleNamespace(ok=False, reason="branch_lost", joints_deg=self.joints)
+        def follow(self, joints_start, position, axis, roll_deg, *, step_mm=10.0,
+                   track_start=0.0, track_end=None):
+            return SimpleNamespace(ok=False, reason="branch_lost", joints_deg=self.joints,
+                                   track_mm=track_start)
 
     cfg = route_preset(_config(), "tidy")
     ok, _margin, reason = _leg(cfg, _StubStation(blocked=False), _Lost())
@@ -366,9 +374,13 @@ def test_a_config_family_change_is_priced_and_doubled_inside_one_sweep():
     assert _config_penalty(same, other, 240.0, doubled=True) == 480.0
 
 
-def test_assign_branches_keeps_the_family_it_is_already_on_when_asked_to():
-    """Two branches for one pose; without a price the cheapest step wins, with one the
-    posture is kept - and the reported degrees never change either way."""
+def test_assign_branches_refuses_a_family_change_even_when_it_is_cheaper():
+    """Two branches for one pose, and the cheaper step sits in the other family.
+
+    That is a refusal now, not a price: the move into the point may be proven as a straight
+    Cartesian line, and a line cannot change family mid-flight (the controller answers
+    `MOTN-063`, and `roboguide.validate` refuses to write a record that disagrees with it).
+    """
     near = np.array([0.0, 0.0, 0.0])
     far = np.array([100.0, 0.0, 0.0])
 
@@ -392,9 +404,41 @@ def test_assign_branches_keeps_the_family_it_is_already_on_when_asked_to():
     ]
     gate = _Gate()
     plain = assign_branches(points, gate, 400.0)
-    assert plain.solutions[1].config.startswith("F"), "the cheaper step is the other posture"
-
+    assert plain.solutions[1].config.startswith("N"), \
+        "the cheaper step is the other posture, and it is not available"
+    assert plain.fallback is False
+    # The price changes nothing while one family can carry the chain, and it never changes
+    # what the program is told to move.
     priced = assign_branches(points, gate, 400.0, config_change_cost_deg=240.0)
-    assert priced.solutions[1].config.startswith("N"), "240 degrees buys the posture back"
-    # The price decides between options; it never changes what the program is told to move.
+    assert priced.solutions[1].config.startswith("N")
+    assert priced.fallback is False
     assert priced.max_step_deg == 40.0
+
+
+def test_a_point_that_only_exists_in_another_family_keeps_it():
+    """The refusal is a rule with a documented way out, not a dead end.
+
+    When no single family carries the chain, the search relaxes to the configured price and
+    says so (`fallback`), because dropping the point would drop the sweep behind it.
+    """
+    near = np.array([0.0, 0.0, 0.0])
+    far = np.array([100.0, 0.0, 0.0])
+
+    class _Gate:
+        active = True
+
+        def solutions(self, position, axis, roll_deg):
+            key = tuple(np.round(np.asarray(position, dtype=float), 6))
+            if key == tuple(np.round(near, 6)):
+                return [_StubSolution((0.0, 0.0, 0.0, 0.0, -60.0, 0.0), "N U T, 0, 0, 0")]
+            return [_StubSolution((5.0, 0.0, 0.0, 0.0, -60.0, 0.0), "F D T, 0, 0, 0")]
+
+    points = [
+        PathPoint(position=near, axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                  role=ROLE_COVERAGE, source="greedy"),
+        PathPoint(position=far, axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0,
+                  role=ROLE_COVERAGE, source="greedy"),
+    ]
+    kept = assign_branches(points, _Gate(), 400.0, config_change_cost_deg=240.0)
+    assert kept.solutions[1].config.startswith("F")
+    assert kept.fallback is True

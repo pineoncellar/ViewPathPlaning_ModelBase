@@ -51,7 +51,7 @@ uv run scanplan web                 # 浏览器工位界面，默认 http://127.
 
 | 文件 | 内容 |
 |---|---|
-| `viewpoints.json` | 视点集：位置 + 光轴 + 滚转 + 覆盖点数/面积 + 入射角 + `tracker_ok` + 来源，以及程序顺序 `order` / 所属带 `stroke_id` / 角色 `role`；关节门打开时另带 `config` / `branch` / `joints_deg` / `j5_margin_deg` |
+| `viewpoints.json` | 视点集：位置 + 光轴 + 滚转 + 覆盖点数/面积 + 入射角 + `tracker_ok` + 来源，以及程序顺序 `order` / 所属带 `stroke_id` / 角色 `role`；关节门打开时另带 `config` / `branch` / `joints_deg` / `j5_margin_deg`，行走轴打开时再带 `track_mm`（`E1` 读数） |
 | `viewpoints.csv` | 同一份数据，便于 Excel 目视 |
 | `exempt_points.csv` | 被夹持区豁免的点云（供人工核对 CAD 夹持区与实物是否一致） |
 | `unreachable_points.csv` | 漏扫点云，**每点带原因**（`blocked_by_part` / `blocked_by_fixture` / `blocked_by_base` / `blocked_by_tracker` / `never_in_view` / `only_poses_that_collide` / `unreachable_joint_limit` / `no_line` / `not_facing`） |

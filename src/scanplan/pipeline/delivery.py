@@ -295,9 +295,18 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
                                      j6_travel=float(getattr(cfg.robot,
                                                              "j6_travel_weight", 0.0)),
                                      config_change_cost_deg=float(
-                                         cfg.robot.config_change_cost_deg))
+                                         cfg.robot.config_change_cost_deg),
+                                     track_price=float(getattr(
+                                         cfg.robot, "track_cost_deg_per_mm", 0.0)),
+                                     track_home=float(getattr(cfg.robot, "track_home_mm", 0.0)))
         path.branches = assignment
         path.max_step_deg = assignment.max_step_deg
+        if assignment.fallback:
+            path.violations.append(
+                "no single CONFIG family carries the program: branch assignment fell back "
+                "to pricing family changes at robot.config_change_cost_deg, and a straight "
+                "move that arrives on a different family than the one recorded will be "
+                "refused at export")
         if assignment.failed:
             path.violations.append(
                 f"{len(assignment.failed)} delivered point(s) have no joint solution at all")

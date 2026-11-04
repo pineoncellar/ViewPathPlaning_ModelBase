@@ -313,9 +313,17 @@ class StrokeBuilder:
                             occlusion_tol_mm=self.cfg.occlusion_tol_mm)
 
     def fits_at(self, positions) -> tuple[bool, float]:
-        """Condition 5 over a set of positions: `(all fit, smallest margin in mm)`."""
+        """Condition 5 over a set of positions: `(all fit, smallest margin in mm)`.
+
+        `body_clearance_mm`, not `clearance_mm`: the part counts here. A band is a straight
+        line at a constant pose, so on a curved or stepped panel it can walk back into the
+        sheet it is scanning - and a gate that only looked at the fixture and the base let it
+        (measured on the 2026-11-03 run: three delivered bands ended 0.4, 10 and 3 mm off the
+        part with a 45 mm body sphere).
+        """
         positions = np.asarray(positions, dtype=float).reshape(-1, 3)
-        clearance = self.station.clearance_mm(positions)
+        clearance = self.station.body_clearance_mm(positions,
+                                                   limit_mm=self.model.body_limit_mm)
         margin = float(clearance.min() - self.model.body_limit_mm)
         return bool(margin > 0.0), margin
 

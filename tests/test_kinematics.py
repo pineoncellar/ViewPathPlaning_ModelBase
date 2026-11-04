@@ -147,13 +147,35 @@ def test_config_string_reads_the_joint_values(robot):
 
 
 def test_turn_counts_are_reported_for_the_wrist_axes(robot):
-    """The digit counts revolutions OUTSIDE the [-180, 180) base reading.
+    """The digit counts revolutions OUTSIDE the [-180, 180] base reading.
 
     `-63.699` is turn 0 - the pendant's own display - so `floor(J / 360)`, which said -1,
     was one too low for every negative reading in the measured bank.
     """
     assert robot.config_string((0, 0, 0, 370, 30, -370), "N", "U").endswith(", 0, 1, -1")
     assert robot.config_string((-63.699, 0, 0, 0, -40, 0), "N", "U").endswith(", 0, 0, 0")
+
+
+def test_a_wrist_reading_across_the_seam_carries_its_turn(robot):
+    """+196.7 and -163.3 are ONE wrist pose, and only the turn digit says which is meant.
+
+    Both are legal (J6 travel is +-360), so a rule that wrote 0 for both - as the old
+    "inside the axis's own range is turn 0" rule did - left the controller to choose. It
+    chose the far side on the 2026-11-02 rail run and the program turned J6 299 degrees
+    between two points 61 apart.
+    """
+    assert robot.config_string((0, 0, 0, 0, -40, 196.7), "N", "U").endswith(", 0, 0, 1")
+    assert robot.config_string((0, 0, 0, 0, -40, -163.3), "N", "U").endswith(", 0, 0, 0")
+
+
+def test_an_in_limit_reading_never_gets_a_negative_turn_digit(robot):
+    """FANUC has no negative turn digit: -284 is written as its equivalent +76 instead.
+
+    `-1` in that column makes ROBOGUIDE refuse the WHOLE program at load (`ASBN-009`,
+    measured 2026-10-27 with a J1 of -102). The reading is a hint for a pose that is already
+    fixed, so naming the equivalent reading costs nothing and keeps the file loadable.
+    """
+    assert robot.config_string((0, 0, 0, 0, -40, -284.0), "N", "U").endswith(", 0, 0, 0")
 
 
 def test_wraps_accepts_the_equivalent_reading(robot):
@@ -166,7 +188,10 @@ def test_wraps_accepts_the_equivalent_reading(robot):
 def test_margins_prefer_the_roomiest_equivalent_reading(robot):
     """J4 spans +-360, so a reading of 200 has a roomier equivalent at -160."""
     roomy = robot.margins((0, 0, 0, 200.0, 30.0, 0))[3]
-    assert roomy == pytest.approx(164.0)
+    # 192.8 at the shipped span fraction (0.98): the usable band ends at +-352.8 and the
+    # equivalent reading -160 is 192.8 short of it.
+    assert roomy == pytest.approx(robot.usable[3][1] - 160.0)
+    assert roomy > 180.0
 
 
 def test_a_value_outside_every_reading_has_no_margin(robot):
@@ -184,21 +209,25 @@ def test_j5_margin_prefers_a_mid_band_angle_over_zero(robot):
 def test_j5_is_rejected_three_degrees_short_of_the_documented_limit(robot):
     """J5 = -122 alarmed in ROBOGUIDE although the limit is -125.
 
-    This is the reason `joint_span_fraction` exists: a pose three degrees from a limit is
-    legal on paper and not one the machine holds. With the span at 0.9 the usable band ends
-    at +-112.5, so -122 must fail even though the controller would accept the number.
+    This is the reason `joint_margin_deg` exists: a pose three degrees from a limit is legal
+    on paper and not one the machine holds. At the shipped span fraction (0.98) the usable
+    band ends at +-122.5, so -122 is INSIDE the band by half a degree and is refused by the
+    5 degree margin alone - the span is not what is holding the arm back.
     """
     assert robot.limits[4] == (-125.0, 125.0)
-    assert robot.usable[4] == pytest.approx((-112.5, 112.5))
-    assert robot.margins((0, 0, 0, 0, -122.0, 0))[4] < 0.0
+    assert robot.usable[4] == pytest.approx((-122.5, 122.5))
+    assert robot.margins((0, 0, 0, 0, -122.0, 0))[4] == pytest.approx(0.5)
+    assert robot.margins((0, 0, 0, 0, -122.0, 0))[4] < robot.params.joint_margin_deg
     assert not robot.feasible((0, 0, 0, 0, -122.0, 0))
     assert robot.feasible((0, 0, 0, 0, -100.0, 0))
 
 
 def test_feasible_rejects_a_point_sitting_on_the_usable_edge(robot):
-    """J2's usable floor is -53.2; the controller's is -60, and neither is free."""
+    """J2's usable floor is -58.64; the controller's is -60, and neither is free."""
+    floor = robot.usable[1][0]
+    assert floor == pytest.approx(-58.64)
     assert robot.margins((0.0, -60.0, 0.0, 0.0, 64.0, 0.0))[1] < 0.0
-    on_edge = (0.0, -53.2, 0.0, 0.0, 64.0, 0.0)
+    on_edge = (0.0, floor, 0.0, 0.0, 64.0, 0.0)
     assert robot.margins(on_edge)[1] == pytest.approx(0.0, abs=1e-6)
     assert not robot.feasible(on_edge)
 
@@ -217,12 +246,12 @@ def test_j3_floor_comes_from_the_pendant_readout(robot):
 
 
 def test_usable_band_is_a_fraction_of_the_span_about_its_centre(robot):
-    """J2 is [-60, 76]: centre 8, half-span 68, so 90 percent leaves [-53.2, 69.2]."""
+    """J2 is [-60, 76]: centre 8, half-span 68, so 98 percent leaves [-58.64, 74.64]."""
     low, high = robot.usable[1]
-    assert (low, high) == pytest.approx((-53.2, 69.2))
-    # Not 90 percent of each number, which would have given [-54, 68.4]: the spans are not
+    assert (low, high) == pytest.approx((-58.64, 74.64))
+    # Not 98 percent of each number, which would have given [-58.8, 74.48]: the spans are not
     # symmetric and the fraction is about the room that exists on each side.
-    assert high > 68.4
+    assert high > 74.48
 
 
 def test_span_fraction_of_one_reproduces_the_bare_limits(robot):
@@ -287,8 +316,11 @@ def test_follow_names_the_axis_and_where_the_segment_dies(any_wrist):
     end and still dies partway along, so a per-point check passes it. The axis is reported
     0-based, the same index `margins` uses, so J2 is axis 1 and not axis 2.
     """
-    start = (10.0, -46.0, -10.0, 30.0, 60.0, 20.0)
-    finish = (10.0, -52.0, -10.0, 30.0, 60.0, 20.0)
+    # J2 sits 7.2 degrees inside the floor at the start and 1.2 at the finish: both readings
+    # are inside the usable band, and the walk still dies before it gets there.
+    floor = any_wrist.usable[1][0]
+    start = (10.0, floor + 7.2, -10.0, 30.0, 60.0, 20.0)
+    finish = (10.0, floor + 1.2, -10.0, 30.0, 60.0, 20.0)
     verdict = any_wrist.follow(start, *any_wrist.forward(finish), step_mm=2.0)
     assert not verdict.ok
     assert verdict.reason == "joint_limit"

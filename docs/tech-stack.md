@@ -237,7 +237,7 @@ v1 行为。
 
 | 文件 | 格式 | 内容 |
 |---|---|---|
-| `viewpoints.json` | JSON | 交付位姿：位置、光轴、滚转、覆盖点数与面积、入射角、跟踪器判定；机器人门打开时另带 `config` / `branch` / `joints_deg` / `j5_margin_deg` |
+| `viewpoints.json` | JSON | 交付位姿：位置、光轴、滚转、覆盖点数与面积、入射角、跟踪器判定；机器人门打开时另带 `config` / `branch` / `joints_deg` / `j5_margin_deg`，行走轴打开时再带 `track_mm` |
 | `viewpoints.csv` | CSV | 同上，给表格工具 |
 | `exempt_points.csv` | CSV | 夹具接触而豁免的采样点 |
 | `unreachable_points.csv` | CSV | 未覆盖采样点，附逐点原因（含 `unreachable_joint_limit` / `no_line` / `not_facing`） |
