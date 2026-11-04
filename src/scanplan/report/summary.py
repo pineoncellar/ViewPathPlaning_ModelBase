@@ -94,8 +94,10 @@ def summary_lines(report: dict) -> list[str]:
         if track.get("enabled"):
             span = track.get("used_span_mm") or [0.0, 0.0]
             lines.append(
-                f"track                  {track['axis']} rail {track['length_mm']:.0f} mm, "
-                f"used {span[0]:.0f}..{span[1]:.0f} mm, travel {track['travel_mm']:.0f} mm, "
+                f"track                  {track['axis']} rail {track['length_mm']:.0f} mm "
+                f"(parked at {track.get('home_mm', 0.0):.0f}), "
+                f"used {span[0]:.0f}..{span[1]:.0f} mm, travel {track['travel_mm']:.0f} mm "
+                f"(+{track.get('travel_from_home_mm', 0.0):.0f} from park), "
                 f"worst step {track['max_step_mm']} mm "
                 f"(limit {track['max_step_limit_mm']:.0f}, reported not refused)")
         j6 = kinematics.get("j6") or {}

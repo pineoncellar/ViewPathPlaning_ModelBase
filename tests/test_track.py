@@ -85,13 +85,19 @@ def _points(records):
 # ------------------------------------------------------------------ the axis itself
 
 
-def test_the_shipped_configuration_carries_an_eight_metre_rail():
-    """The cell's rail is part of the shipped numbers, not a local experiment."""
+def test_the_shipped_configuration_carries_the_cells_rail():
+    """The cell's rail is part of the shipped numbers, not a local experiment.
+
+    3.3 m, used end to end: no margin at either stop, and the carriage is parked at 0 when
+    the programme starts.
+    """
     config = load_config()
     assert config.robot.track_enabled is True
     assert config.robot.track_axis == "+X"
-    assert config.robot.track_length_mm == pytest.approx(8000.0)
-    assert _robot().track_usable == pytest.approx((100.0, 7900.0))
+    assert config.robot.track_length_mm == pytest.approx(3300.0)
+    assert config.robot.track_margin_mm == pytest.approx(0.0)
+    assert config.robot.track_home_mm == pytest.approx(0.0)
+    assert _robot().track_usable == pytest.approx((0.0, 3300.0))
 
 
 def test_the_rail_moves_the_base_and_nothing_else():
@@ -105,8 +111,8 @@ def test_the_rail_moves_the_base_and_nothing_else():
 
 def test_a_pose_only_the_rail_can_reach_is_reachable_with_it():
     """The point of the feature: the same pose, two envelopes, two answers."""
-    far = np.array([9500.0, 0.0, 1400.0])
-    rotation = _robot().forward(JOINTS, 7000.0)[1]
+    far = np.array([5000.0, 0.0, 1200.0])
+    rotation = _robot().forward(JOINTS, 3000.0)[1]
 
     assert any(item.ok for item in _robot().solutions(far, rotation))
     assert not any(item.ok for item in _robot(track_enabled=False).solutions(far, rotation))
@@ -115,7 +121,7 @@ def test_a_pose_only_the_rail_can_reach_is_reachable_with_it():
 def test_every_solution_carries_the_rail_reading_it_was_solved_at():
     """A joint set without its rail value is half an answer, so the pair travels together."""
     robot = _robot()
-    position, rotation = robot.forward(JOINTS, 5000.0)
+    position, rotation = robot.forward(JOINTS, 1000.0)
     found = [item for item in robot.solutions(position, rotation) if item.ok]
     assert found, "the pose must be reachable"
     for item in found:
@@ -128,20 +134,23 @@ def test_every_solution_carries_the_rail_reading_it_was_solved_at():
 
 def test_a_straight_move_carries_the_carriage_with_it():
     robot = _robot()
-    target = robot.forward((5.0, 10.0, -20.0, 0.0, -60.0, 0.0), 5400.0)
+    target = robot.forward((5.0, 10.0, -20.0, 0.0, -60.0, 0.0), 1400.0)
     moving = robot.follow(JOINTS, *target, step_mm=20.0,
-                          track_start=5000.0, track_end=5400.0)
+                          track_start=1000.0, track_end=1400.0)
     assert moving.ok, moving.reason
-    assert moving.track_mm == pytest.approx(5400.0)
+    assert moving.track_mm == pytest.approx(1400.0)
 
 
-def test_the_rail_keeps_its_margin_like_any_other_axis():
-    """A carriage on its end stop is not a carriage the machine holds."""
+def test_the_rail_band_is_exactly_the_travel_it_has():
+    """No margin at either end: 0 and 3300 are usable, anything outside is not."""
     robot = _robot()
     position, rotation = robot.forward(JOINTS, 0.0)
-    assert not [item for item in robot.solutions(position, rotation, track_mm=10.0)
-                if item.ok], "10 mm of travel is inside the forbidden margin"
-    assert not robot.feasible(JOINTS, 10.0)
+    assert robot.feasible(JOINTS, 0.0)
+    assert robot.feasible(JOINTS, 3300.0)
+    assert not robot.feasible(JOINTS, -1.0)
+    assert not robot.feasible(JOINTS, 3301.0)
+    assert not [item for item in robot.solutions(position, rotation, track_mm=-50.0)
+                if item.ok]
 
 
 def test_a_rail_that_does_not_fit_the_cell_is_refused():
@@ -149,6 +158,8 @@ def test_a_rail_that_does_not_fit_the_cell_is_refused():
         _config(track_limits_mm=(0.0, 9000.0))
     with pytest.raises(ValueError, match="track_axis"):
         _config(track_axis="+Y")
+    with pytest.raises(ValueError, match="track_home_mm"):
+        _config(track_home_mm=4000.0)
 
 
 # ------------------------------------------------------------------ the programme
@@ -156,9 +167,9 @@ def test_a_rail_that_does_not_fit_the_cell_is_refused():
 
 def test_the_programme_writes_the_rail_as_the_extended_axis_column():
     robot = _robot()
-    points = _points([_record(robot, rail=5000.0)])
+    points = _points([_record(robot, rail=1000.0)])
     text = build_ls(points, prog_name="RAIL01", uframe=1, utool=1, motion="L")
-    assert "E1=" in text and "5000.000" in text
+    assert "E1=" in text and "1000.000" in text
 
     without = build_ls(points, prog_name="RAIL01", uframe=1, utool=1, motion="L",
                        emit_e1=False)
@@ -167,19 +178,19 @@ def test_the_programme_writes_the_rail_as_the_extended_axis_column():
 
 def test_export_writes_the_rail_into_the_file(tmp_path):
     robot = _robot()
-    export([_record(robot, rail=5000.0), _record(robot, rail=5400.0)],
+    export([_record(robot, rail=1000.0), _record(robot, rail=1400.0)],
            tmp_path, prog_name="RAIL02", motion="L", termination="CNT0",
            robot_params=robot.params)
     text = (tmp_path / "RAIL02.LS").read_text(encoding="utf-8")
-    assert "E1=  5000.000  mm" in text
-    assert "E1=  5400.000  mm" in text
+    assert "E1=  1000.000  mm" in text
+    assert "E1=  1400.000  mm" in text
 
 
 def test_an_e1_that_does_not_belong_to_the_joints_is_refused():
     """The rail is redundant, so a wrong `E1` still solves - it just lands elsewhere."""
     robot = _robot()
-    points = _points([_record(robot, rail=5000.0)])
-    points[0]["track_mm"] = 3000.0  # the joints belong to 5000 mm of travel
+    points = _points([_record(robot, rail=1000.0)])
+    points[0]["track_mm"] = 500.0  # the joints belong to 1000 mm of travel
     audit = check_points(points, default_motion="L", params=robot.params)
     assert not audit["ok"]
     assert [item["reason"] for item in audit["failures"]] == ["track_mismatch"]
@@ -187,7 +198,7 @@ def test_an_e1_that_does_not_belong_to_the_joints_is_refused():
 
 def test_a_consistent_rail_record_passes_the_audit():
     robot = _robot()
-    audit = check_points(_points([_record(robot, rail=5000.0)]), default_motion="L",
+    audit = check_points(_points([_record(robot, rail=1000.0)]), default_motion="L",
                          params=robot.params)
     assert audit["ok"], audit["failures"]
 
@@ -201,11 +212,11 @@ def test_a_joint_block_names_the_rail_by_its_axis_number():
     blocks. Both spellings exist; they are not interchangeable.
     """
     robot = _robot()
-    points = _points([_record(robot, rail=5000.0, motion="J")])
+    points = _points([_record(robot, rail=1000.0, motion="J")])
     points[0]["motion"] = "J"
     points[0]["representation"] = "joint"
     text = build_ls(points, prog_name="RAIL04", uframe=1, utool=1, motion="J")
-    assert "J7=" in text and "5000.000" in text
+    assert "J7=" in text and "1000.000" in text
     assert "E1" not in text
 
     # the escape hatch, for a controller that wants the Cartesian spelling everywhere
@@ -234,12 +245,12 @@ def test_a_rail_run_exports_cartesian_blocks_only(tmp_path):
     recorded rather than hidden: those poses are solved by the controller again.
     """
     robot = _robot()
-    record = _record(robot, rail=5000.0, motion="J")
+    record = _record(robot, rail=1000.0, motion="J")
     export([record], tmp_path, prog_name="RAIL06", motion="J", termination="FINE",
            robot_params=robot.params)
     text = (tmp_path / "RAIL06.LS").read_text(encoding="utf-8")
     assert "J1=" not in text and "J7" not in text
-    assert "E1=  5000.000  mm" in text
+    assert "E1=  1000.000  mm" in text
 
 
 def test_a_floor_mounted_run_still_writes_the_joint_block(tmp_path):
@@ -260,14 +271,14 @@ def test_export_can_leave_the_rail_out_and_says_so(tmp_path):
     supported answer, as long as the contract says the plan and the program now disagree.
     """
     robot = _robot()
-    export([_record(robot, rail=5000.0)], tmp_path, prog_name="RAIL03", motion="L",
+    export([_record(robot, rail=1000.0)], tmp_path, prog_name="RAIL03", motion="L",
            termination="CNT0", robot_params=robot.params, emit_e1=False)
     assert "E1" not in (tmp_path / "RAIL03.LS").read_text(encoding="utf-8")
     contract = json.loads((tmp_path / "RAIL03_frame.json").read_text(encoding="utf-8"))
     axis = contract["program"]["extended_axis"]
     assert axis["written"] is False
     assert axis["plan_carries_rail_mm"] is True
-    assert axis["used_span_mm"] == [5000.0, 5000.0]
+    assert axis["used_span_mm"] == [1000.0, 1000.0]
     assert "ASBN-009" in axis["requires"]
     assert "robot.track_enabled = false" in axis["warning"]
 
@@ -286,7 +297,7 @@ def test_a_floor_mounted_programme_carries_no_e1_at_all():
 def test_the_report_measures_what_the_rail_did():
     robot = _robot()
     records = []
-    for order, rail in enumerate((5000.0, 5400.0, 5300.0)):
+    for order, rail in enumerate((1000.0, 1400.0, 1300.0)):
         position, frame = robot.forward(JOINTS, rail)
         records.append(Viewpoint(
             id=order, position=position, axis=frame[:, 2], roll_deg=0.0,
@@ -296,10 +307,12 @@ def test_the_report_measures_what_the_rail_did():
 
     track = kinematics_block(load_config(), records, path=None)["track"]
     assert track["enabled"] is True
-    assert track["length_mm"] == pytest.approx(8000.0)
+    assert track["length_mm"] == pytest.approx(3300.0)
+    assert track["home_mm"] == pytest.approx(0.0)
     assert track["travel_mm"] == pytest.approx(500.0)
+    assert track["travel_from_home_mm"] == pytest.approx(1000.0)
     assert track["max_step_mm"] == pytest.approx(400.0)
-    assert track["used_span_mm"] == pytest.approx([5000.0, 5400.0])
+    assert track["used_span_mm"] == pytest.approx([1000.0, 1400.0])
 
 
 def test_a_run_without_a_rail_reports_no_track_block():

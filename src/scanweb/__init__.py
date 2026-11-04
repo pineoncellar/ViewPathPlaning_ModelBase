@@ -1141,6 +1141,7 @@ def _robot_params_from_report(report: dict):
         track_axis=str(track.get("axis") or "+X"),
         track_length_mm=float(track.get("length_mm") or 0.0),
         track_margin_mm=float(track.get("margin_mm") or 0.0),
+        track_home_mm=float(track.get("home_mm") or 0.0),
         track_limits_mm=None,
     )
 

@@ -499,12 +499,17 @@ class RobotParams:
     # pose table, the CONFIG letters and the frame contract all assume the arm's own axes;
     # a rail at an angle would need a mounting transform nothing here measures.
     track_axis: str = "+X"
-    track_length_mm: float = 8000.0
+    track_length_mm: float = 3300.0
     # The controller's travel, if it is shorter than the rail. None means "the whole rail".
     track_limits_mm: tuple[float, float] | None = None
-    # Kept clear of the ends for the same reason `joint_margin_deg` exists: a carriage on
-    # its end stop is not a carriage the machine holds.
-    track_margin_mm: float = 100.0
+    # Kept clear of the ends, for the same reason `joint_margin_deg` exists. 0 means the
+    # carriage may sit on either end stop, which is this cell: the rail is used end to end.
+    track_margin_mm: float = 0.0
+    # Where the carriage is parked when the programme starts, and the reading the rail's own
+    # zero is defined at. It is PRICED into the sequencing as the first move rather than
+    # forced: a first item that cannot be reached from here may still be the right one, and
+    # the report then says how far the carriage had to travel before the first scan.
+    track_home_mm: float = 0.0
     # Candidate offsets tried per pose, spaced this far apart around the geometric best.
     track_grid_mm: float = 250.0
     track_candidates: int = 5
@@ -1390,6 +1395,13 @@ def _validate_track(robot: RobotParams) -> None:
         raise ValueError("'robot.track_margin_mm' cannot be negative")
     if high - low <= 2.0 * robot.track_margin_mm:
         raise ValueError("'robot.track_margin_mm' leaves no usable travel on the rail")
+    home = float(getattr(robot, "track_home_mm", 0.0))
+    if not low + robot.track_margin_mm <= home <= high - robot.track_margin_mm:
+        raise ValueError(
+            f"'robot.track_home_mm' is {home:g} mm, outside the usable travel "
+            f"[{low + robot.track_margin_mm:g}, {high - robot.track_margin_mm:g}]: the "
+            "programme starts where the carriage is parked, so that reading has to be one "
+            "the rail can hold")
     if robot.track_grid_mm <= 0.0:
         raise ValueError("'robot.track_grid_mm' must be positive")
     if int(robot.track_candidates) < 1:

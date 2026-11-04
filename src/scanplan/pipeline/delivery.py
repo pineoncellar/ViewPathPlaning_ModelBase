@@ -297,7 +297,8 @@ def _delivery(combined: CoverageResult, rows: Sequence[int], sources: dict[int, 
                                      config_change_cost_deg=float(
                                          cfg.robot.config_change_cost_deg),
                                      track_price=float(getattr(
-                                         cfg.robot, "track_cost_deg_per_mm", 0.0)))
+                                         cfg.robot, "track_cost_deg_per_mm", 0.0)),
+                                     track_home=float(getattr(cfg.robot, "track_home_mm", 0.0)))
         path.branches = assignment
         path.max_step_deg = assignment.max_step_deg
         if assignment.fallback:

@@ -538,7 +538,8 @@ def _item_options(entry: PathPoint, leave: PathPoint | None, kin, cfg: PlannerCo
         return [], "no_ik_solution"
     if leave is None:
         return [(item, np.asarray(item.joints_deg, dtype=float),
-                 float(item.min_margin_deg), float(item.track_mm)) for item in found], ""
+                 float(item.min_margin_deg), float(getattr(item, "track_mm", 0.0)))
+                for item in found], ""
     options = []
     reason = ""
     for item in found:
@@ -591,6 +592,7 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
     flip_cost = float(getattr(cfg.robot, "wrist_flip_cost_deg", 0.0))
     family_cost = float(getattr(cfg.robot, "config_change_cost_deg", 0.0))
     track_price = float(getattr(cfg.robot, "track_cost_deg_per_mm", 0.0))
+    home_track = float(getattr(cfg.robot, "track_home_mm", 0.0))
     options: list[list[tuple]] = []
     for position, (_index, entry, leave) in enumerate(items):
         found, reason = _item_options(entry, leave, kin, cfg)
@@ -603,7 +605,12 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
 
     def solve(forbid_family: bool) -> tuple[list[list[float]], list[list[int]]]:
         """The dynamic programme, with a family change either impossible or just priced."""
-        total: list[list[float]] = [[0.0] * len(options[keep[0]])]
+        # The programme starts where the carriage is parked: that first move is real, so it is
+        # priced like any other. Forcing the first item onto the park position instead would
+        # make an otherwise fine band look unreachable.
+        total: list[list[float]] = [[
+            _track_cost(home_track, float(getattr(solution, "track_mm", 0.0)), track_price)
+            for solution, _exit, _margin, _track in options[keep[0]]]]
         parent: list[list[int]] = [[0] * len(options[keep[0]])]
         for depth in range(1, len(keep)):
             previous = options[keep[depth - 1]]
@@ -623,7 +630,8 @@ def _sequence_joints(items, kin, cfg: PlannerConfig, plan: PathPlan) -> list[_It
                     cost = total[depth - 1][source] + _step_cost(prev_exit,
                                                                 solution.joints_deg,
                                                                 weight, cap, travel)
-                    cost += _track_cost(prev_exit_track, float(solution.track_mm), track_price)
+                    cost += _track_cost(prev_exit_track, float(getattr(solution, "track_mm", 0.0)),
+                                        track_price)
                     if float(np.asarray(prev_exit)[4]) * float(solution.joints_deg[4]) < 0.0:
                         cost += flip_cost
                     cost += _config_penalty(_prev_solution, solution, family_cost,
@@ -1873,7 +1881,8 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
                     j6_cap: float | None = None,
                     config_change_cost_deg: float = 0.0,
                     j6_travel: float = 0.0,
-                    track_price: float = 0.0) -> BranchAssignment:
+                    track_price: float = 0.0,
+                    track_home: float = 0.0) -> BranchAssignment:
     """Pick a joint branch for every delivered point so the sequence jumps as little as it can.
 
     Picking the locally best branch at every point is the mistake this exists to prevent:
@@ -1910,8 +1919,14 @@ def assign_branches(points: Sequence[PathPoint], gate, max_step_deg: float,
 
     def solve(forbid_family: bool) -> tuple[list[list[float]], list[list[int]]]:
         # `total[i][j]` is the cheapest joint travel that ends on option j of point i;
-        # `parent[i][j]` remembers which option of point i-1 got there.
+        # `parent[i][j]` remembers which option of point i-1 got there. The first row pays for
+        # the carriage moving from where it is parked, because that move is real.
         total = [[0.0] * len(options) for options in candidates]
+        if candidates and candidates[0]:
+            for j in range(len(candidates[0])):
+                total[0][j] = _track_cost(
+                    track_home, float(getattr(candidates[0][j], "track_mm", 0.0)),
+                    track_price)
         parent: list[list[int]] = [[0] * len(options) for options in candidates]
         for index in range(1, len(candidates)):
             for j, option in enumerate(candidates[index]):

@@ -73,16 +73,21 @@ def _track_block(config, rows) -> dict | None:
     limit = float(getattr(robot, "track_max_step_mm", 0.0))
     length = float(getattr(robot, "track_length_mm", 0.0))
     margin = float(getattr(robot, "track_margin_mm", 0.0))
+    home = float(getattr(robot, "track_home_mm", 0.0))
     return {
         "enabled": True,
         "axis": str(getattr(robot, "track_axis", "+X")),
         "length_mm": length,
         "usable_mm": [margin, length - margin],
         "margin_mm": margin,
+        "home_mm": home,
         "points": len(values),
         "used_span_mm": ([round(min(values), 3), round(max(values), 3)]
                          if values else None),
         "travel_mm": round(float(sum(steps)), 3),
+        # The programme starts where the carriage is parked, so the first move is a move the
+        # cell will make even though it has no delivered point of its own.
+        "travel_from_home_mm": (round(abs(values[0] - home), 3) if values else 0.0),
         "max_step_mm": round(float(max(steps)), 3) if steps else None,
         "max_step_at": (int(np.argmax(steps)) + 1 if steps else None),
         "max_step_limit_mm": limit,
