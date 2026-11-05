@@ -140,6 +140,37 @@ class Station:
         to_base = self.base_tree.query(points, k=1)[0]
         return np.minimum(to_fixture, to_base)
 
+    def part_clearance_mm(self, points, *, limit_mm: float | None = None) -> np.ndarray:
+        """Distance from each point to the nearest PART sample.
+
+        The part is what the head has come to scan, so it is not an obstacle in the clamp
+        sense - but it is still material, and a head that comes closer to it than its own
+        near range has either ducked into a hole or is grazing the sheet on its way to
+        somewhere else. That is the number this answers; `body_clearance_mm` folds it
+        together with the fixture and the base.
+        """
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if len(points) == 0:
+            return np.zeros(0)
+        if limit_mm is None:
+            return self._part_tree().query(points, k=1)[0]
+        distance = self._part_tree().query(points, k=1,
+                                           distance_upper_bound=float(limit_mm))[0]
+        return np.where(np.isfinite(distance), distance, np.inf)
+
+    def fixture_clearance_mm(self, points) -> np.ndarray:
+        """Distance from each point to the nearest FIXTURE sample.
+
+        This is the obstacle-avoidance keep-out, and it is deliberately narrower than
+        :meth:`clearance_mm`: the base is a floor the head may legitimately fly low over,
+        while a clamp is something the head must never approach. Folding the base in here
+        would reject every pose whose part sits close to the base for no collision reason.
+        """
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if len(points) == 0:
+            return np.zeros(0)
+        return self.fixture_tree.query(points, k=1)[0]
+
     def body_clearance_mm(self, points, *, limit_mm: float | None = None) -> np.ndarray:
         """Distance from each point to the nearest PART, FIXTURE or BASE sample.
 
@@ -168,14 +199,8 @@ class Station:
         points = np.asarray(points, dtype=float).reshape(-1, 3)
         if len(points) == 0:
             return np.zeros(0)
-        near = self.clearance_mm(points)
-        if limit_mm is None:
-            to_part = self._part_tree().query(points, k=1)[0]
-        else:
-            to_part = self._part_tree().query(points, k=1,
-                                              distance_upper_bound=float(limit_mm))[0]
-            to_part = np.where(np.isfinite(to_part), to_part, np.inf)
-        return np.minimum(near, to_part)
+        return np.minimum(self.clearance_mm(points),
+                          self.part_clearance_mm(points, limit_mm=limit_mm))
 
     def _part_tree(self) -> cKDTree:
         """The part's surface samples as a KD-tree, sampled on first use.

@@ -563,6 +563,59 @@ def _stroke_corner_cost(raw):
     return value
 
 
+_AXIS_NAMES = {"+X": (1.0, 0.0, 0.0), "-X": (-1.0, 0.0, 0.0),
+               "+Y": (0.0, 1.0, 0.0), "-Y": (0.0, -1.0, 0.0),
+               "+Z": (0.0, 0.0, 1.0), "-Z": (0.0, 0.0, -1.0)}
+
+
+def _max_points(raw):
+    """One page value for `target.max_points`, refused here rather than clamped.
+
+    `None`, an empty string and `"null"` all mean "no ceiling", which is the configuration
+    file's own spelling. Anything that is not a positive whole number is refused with a
+    sentence the operator can act on: a fractional or negative ceiling would silently
+    behave like a different number than the one on screen.
+    """
+    if raw is None or (isinstance(raw, str) and (not raw.strip() or raw.strip().lower() == "null")):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("最大视点点数必须是正整数，或留空表示不限制") from error
+    if not value.is_integer() or value < 1:
+        raise ValueError("最大视点点数必须是正整数，或留空表示不限制")
+    return int(value)
+
+
+def _extra_scan_axes(data: dict) -> list[tuple[float, float, float]]:
+    """The additional scan directions the page asked for, in vehicle coordinates.
+
+    The page sends either the six axis names or the surface normal it snapped a click to;
+    both are vehicle CAD directions, and the caller rotates them into the measured frame
+    along with the main face. Naming a direction twice, or naming the main face, is not an
+    error - the target merge drops samples it already has.
+    """
+    raw = data.get("extra_scan_axes") or []
+    if not isinstance(raw, list):
+        raise ValueError("补充扫描方向必须是列表")
+    axes: list[tuple[float, float, float]] = []
+    for item in raw:
+        if isinstance(item, str):
+            name = item.strip().upper()
+            if name not in _AXIS_NAMES:
+                raise ValueError(f"补充扫描方向只能是 {list(_AXIS_NAMES)} 之一，不是 {item!r}")
+            vector = np.asarray(_AXIS_NAMES[name], dtype=float)
+        else:
+            vector = np.asarray(item, dtype=float).reshape(-1)
+            if vector.shape != (3,):
+                raise ValueError("补充扫描方向必须是 x,y,z 三个分量")
+        length = float(np.linalg.norm(vector))
+        if not np.isfinite(length) or length <= 0.0:
+            raise ValueError("补充扫描方向不能是零向量")
+        axes.append(tuple(float(value) for value in vector / length))
+    return axes
+
+
 def _delivery_config(data: dict):
     """The configuration for one job: the shipped file plus the page's delivery mode.
 
@@ -603,6 +656,8 @@ def _delivery_config(data: dict):
     if target is not _KEEP:
         config = override(config, target={"coverage_target_pct": target})
     corner_cost = _stroke_corner_cost(data.get("stroke_corner_cost", _KEEP))
+    if "max_points" in data:
+        config = override(config, target={"max_points": _max_points(data.get("max_points"))})
     plan_mode_value = data.get("plan_mode", _KEEP)
     if plan_mode_value is not _KEEP and plan_mode_value not in (None, ""):
         if str(plan_mode_value) not in PLAN_MODES:
@@ -791,7 +846,13 @@ def solve_job(data: dict, progress=None) -> dict:
             through_axis=axis_in_measured,
         )
         announce("segmentation", 0.12, "blank split")
-        result = plan(station, config, face="upper", split=split,
+        extra_axes_vehicle = _extra_scan_axes(data)
+        extra_axes = [registration.rotation @ np.asarray(axis, dtype=float)
+                      for axis in extra_axes_vehicle]
+        if extra_axes:
+            announce("segmentation", 0.12,
+                     f"extra scan directions: {len(extra_axes)}")
+        result = plan(station, config, face="upper", split=split, extra_axes=extra_axes,
                       progress=lambda stage, fraction, detail="": announce(
                           stage, 0.12 + 0.78 * fraction, detail))
         announce("report", 0.92, "planning finished")
@@ -802,6 +863,7 @@ def solve_job(data: dict, progress=None) -> dict:
             "max_error_mm": registration.max_error_mm,
             "cad_face_axis_vehicle": face_axis_vehicle.tolist(),
             "scan_face_axis_measured_frame": axis_in_measured.tolist(),
+            "extra_scan_axes_vehicle": [list(axis) for axis in extra_axes_vehicle],
         }
         write_outputs(result, output)
         announce("export", 0.93, "coverage and viewer written")
@@ -912,6 +974,12 @@ def solve_job(data: dict, progress=None) -> dict:
         "target_face_mm2": float(result.report.get("target_face_mm2", 0.0)),
         "face": str(result.report.get("face", "")),
         "uncovered_by_reason": result.report.get("uncovered_by_reason", {}),
+        # The extra sides this run also had to cover: "did it scan the flange I asked for"
+        # has to be answerable from the result, not from what the panel still shows.
+        "target_directions": [str(name) for name in
+                              (result.report.get("definition", {}).get("directions")
+                               or [result.report.get("face", "")])],
+        "extra_scan_axes_vehicle": [list(axis) for axis in extra_axes_vehicle],
         # The report's own `fast_mode` block, passed through rather than re-derived: the
         # page must not be able to describe a faster run than the one that happened.
         "fast": result.report.get("fast_mode", {"enabled": False}),
@@ -921,6 +989,11 @@ def solve_job(data: dict, progress=None) -> dict:
         # The target this run actually used, so the page shows the number it ran with
         # rather than whatever the field happens to hold afterwards.
         "coverage_target_pct": config.target.coverage_target_pct,
+        # The point ceiling this run actually used, and what the budget layer says about it:
+        # `budget_bound` means the ceiling is what stopped the selection, which is a
+        # different result from `target_bound` and must not be read as one.
+        "max_points": config.target.max_points,
+        "budget": result.report.get("budget", {}),
         "sample_grid_mm": float(config.target.sample_grid_mm),
         "scan_face_axis_vehicle": face_axis_vehicle.tolist(),
         "scan_face_axis_measured_frame": scan_axis_target.tolist(),

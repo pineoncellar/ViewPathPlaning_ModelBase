@@ -161,6 +161,51 @@ def test_the_page_repaints_while_the_mouse_is_still_moving(tmp_path, flat_plate,
     assert text.count("requestRender();") >= 4
 
 
+def test_a_joint_move_is_shipped_as_the_arc_it_really_is(flat_plate, cfg):
+    """The page must not draw a chord where the robot flies an arc.
+
+    Interpolating the six axes does not move the TCP along the straight line between the
+    two poses. On the 2026-11-05 run the chord of points 24 -> 25 passes 36 mm from the
+    clamp while the commanded move keeps 15 mm with the carriage travelling - which is why
+    a reviewer looking at the straight line saw a collision. `sweeps` carries the
+    forward-kinematics walk so the picture and the motion cannot disagree.
+    """
+    start = viewpoint(id=0, position=(-100.0, 0.0, 300.0), order=0,
+                      joints_deg=[0.0, 10.0, -20.0, 0.0, -60.0, 0.0], motion="J",
+                      track_mm=0.0)
+    end = viewpoint(id=1, position=(0.0, 0.0, 300.0), order=1,
+                    joints_deg=[6.0, 10.0, -20.0, 0.0, -60.0, 0.0], motion="J",
+                    track_mm=0.0, axis=(0.0, 0.0, -1.0))
+    payload = build_payload(part=flat_plate, viewpoints=[start, end], scanner=cfg.scanner,
+                            robot=cfg.robot)
+    route = payload["sweeps"][0]
+    assert route is not None and len(route) > 2, "a joint move must be walked, not assumed"
+    assert np.allclose(route[0], start["position"], atol=1e-6)
+    assert not np.allclose(route[0], route[-1], atol=1e-6)
+
+
+def test_a_straight_move_stays_a_straight_line(flat_plate, cfg):
+    start = viewpoint(id=0, position=(-100.0, 0.0, 300.0), order=0, motion="L")
+    end = viewpoint(id=1, position=(0.0, 0.0, 300.0), order=1, motion="L")
+    payload = build_payload(part=flat_plate, viewpoints=[start, end], scanner=cfg.scanner,
+                            robot=cfg.robot)
+    assert payload["sweeps"] == [None]
+
+
+def test_the_page_has_no_legend_panel(tmp_path, flat_plate, cfg):
+    """The colour key sat over the part and hid the thing it explained.
+
+    The layer switches in 显示 carry the same names, so nothing was lost by removing it.
+    """
+    path = write_viewer(tmp_path / "view.html", part=flat_plate,
+                        viewpoints=[viewpoint()], scanner=cfg.scanner)
+    text = path.read_text(encoding="utf-8")
+    assert 'id="legend"' not in text
+    assert "视点（跟踪器可见）" not in text
+    # and the selected viewpoint's figures moved to the top, between the two side panels
+    assert "#info { top: 14px; left: 50%;" in text
+
+
 def test_a_malformed_viewpoint_is_refused(flat_plate, cfg):
     with pytest.raises(ValueError, match="position"):
         build_payload(part=flat_plate,

@@ -60,6 +60,9 @@ def definition_block(*, config: PlannerConfig, target: TargetSet, split: SheetSp
         "definition": {
             "name": "topological: one face of the original flat blank",
             "target": f"the {target.face} face of the blank, minus fixture contact",
+            # One entry for an ordinary run. More than one means the site asked for extra
+            # sides on top of the main face, and each contributed its own samples.
+            "directions": list(target.directions or (target.face,)),
             "split": "mirror partner per face -> mid-surface PCA -> local sheet normal m; "
                      "|n.m| ~ 1 = a face of the blank, ~ 0 = sheared cross-section; the "
                      "sign of n.m after orienting m says which face",
@@ -104,6 +107,8 @@ def placeholders_block(config: PlannerConfig, tracker: Tracker | None) -> dict:
         "standoff_mm": config.scanner.standoff_mm,
         "body_sphere_r_mm": config.scanner.body_sphere_r_mm,
         "body_clearance_mm": config.scanner.body_clearance_mm,
+        "fixture_clearance_mm": config.scanner.fixture_clearance_mm,
+        "min_part_clearance_mm": config.scanner.min_part_clearance_mm,
         "tracker_half_angle_deg": config.tracker.half_angle_deg,
         "tracker_distance_mm": list(config.tracker.distance_mm),
         "tracker_model_position": ([round(float(v), 1) for v in tracker.position]
@@ -143,6 +148,8 @@ def provenance(config: PlannerConfig) -> dict:
             "max_stroke_mm": config.stroke.max_stroke_mm,
             "coverage_step_mm": config.stroke.coverage_step_mm,
             "check_step_mm": config.stroke.check_step_mm,
+            "fixture_clearance_mm": scanner.fixture_clearance_mm,
+            "min_part_clearance_mm": scanner.min_part_clearance_mm,
         },
         "note": ("the unmeasured block is the one to look at before believing a coverage "
                  "figure; max_incidence_deg is the most sensitive of them and "

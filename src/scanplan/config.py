@@ -77,6 +77,17 @@ class ScannerParams:
     # station for no scan benefit - but it is a trade-off, not a law, which is why it
     # is a key rather than a constant.
     roll_mode: str = "locked"
+    # Obstacle avoidance: every delivered viewpoint AND every sampled point of the path
+    # between them keeps at least this distance from the fixture. 100 mm is the site's
+    # requirement, not a scanner datasheet value; unlike `body_clearance_mm` it does not
+    # apply to the part or the base, which the head may legitimately scan or fly over.
+    fixture_clearance_mm: float = 100.0
+    # Closest the head may come to the PART. Set to the scanner's own near range, this is
+    # the rule that keeps the head out of a hole: a pose that ducks through an internal hole
+    # to reach the underside ends up well inside its near range of the metal it just passed,
+    # and one that grazes the sheet to see a far region at a glancing angle does too. 0
+    # disables the rule and reproduces the runs recorded before 2026-11-05.
+    min_part_clearance_mm: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -857,9 +868,15 @@ PLAN_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
                   "joint_margin_deg": MIN_JOINT_MARGIN_DEG},
     },
     "banded": {
+        # `side_scan_spacing_mm` / `side_scan_max_seeds` are the lever the site asked for on
+        # 2026-11-05: "the side walls are the hard part, spend more viewpoints on them".
+        # 60 mm / 96 seeds left the bends with a handful of walks each; 40 mm / 192 doubles
+        # the wall families and costs roughly a third more runtime, because every seed is a
+        # grown band and a set of rays. The ceiling is still a ceiling: the aim points are
+        # thinned evenly, so a capped family spans the whole wall rather than its first corner.
         "stroke": {"plan_mode": "banded", "side_scan_azimuths": 3,
-                   "side_scan_spacing_mm": 60.0, "side_scan_wall_deg": 45.0,
-                   "side_scan_max_seeds": 96, "stroke_corner_cost": 1.0},
+                   "side_scan_spacing_mm": 40.0, "side_scan_wall_deg": 45.0,
+                   "side_scan_max_seeds": 192, "stroke_corner_cost": 1.0},
         # Same envelope as `standard`, spelled out rather than left empty so the mode still
         # describes the whole state it asks for - and so a later mode cannot drift from it.
         "robot": {"joint_span_fraction": MAX_JOINT_SPAN_FRACTION,
@@ -1122,6 +1139,10 @@ def _validate(config: PlannerConfig) -> None:
         raise ValueError("'standoff_mm' and 'sample_grid_mm' must be positive")
     if scanner.fov_anchor_distance_mm <= 0.0:
         raise ValueError("'fov_anchor_distance_mm' must be positive")
+    if scanner.fixture_clearance_mm < 0.0:
+        raise ValueError("'fixture_clearance_mm' cannot be negative")
+    if scanner.min_part_clearance_mm < 0.0:
+        raise ValueError("'min_part_clearance_mm' cannot be negative")
     if scanner.depth_of_field_mm <= 0.0:
         raise ValueError("'depth_of_field_mm' must be positive")
     if target.face not in FACES:

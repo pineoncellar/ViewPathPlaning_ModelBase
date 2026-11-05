@@ -17,6 +17,8 @@ const state = {
   pointCount: 3,
   measured: Array.from({ length: 4 }, () => ["", "", ""]),
   autoFace: false,
+  // 补充扫描面：在第二个 3D 视图里点选的**面**，各带自己的法向与面积估计。
+  sideArea: null,
   registration: null,
   solving: false,
   result: null,
@@ -162,38 +164,9 @@ function initRenderer() {
   }
   glState.gl = gl;
   try {
-    glState.meshProgram = link(gl,
-      [
-        "attribute vec3 aPos;", "attribute vec3 aNrm;",
-        "uniform mat4 uProj;", "uniform mat4 uView;", "uniform mat3 uNormal;",
-        "varying vec3 vNrm;",
-        "void main() {",
-        "  vNrm = uNormal * aNrm;",
-        "  gl_Position = uProj * (uView * vec4(aPos, 1.0));",
-        "}"
-      ].join("\n"),
-      [
-        "precision mediump float;",
-        "varying vec3 vNrm;",
-        "uniform vec3 uColor;",
-        "uniform vec3 uScanAxis;",
-        "uniform float uHighlight;",
-        "void main() {",
-        "  vec3 n = normalize(vNrm);",
-        "  if (!gl_FrontFacing) n = -n;",
-        "  vec3 c = uColor;",
-        "  if (uHighlight > 0.5) {",
-        "    float a = dot(n, uScanAxis);",
-        "    if (a > 0.45) c = vec3(0.83, 0.39, 0.20);",
-        "    else if (a < -0.45) c = vec3(0.40, 0.52, 0.60);",
-        "    else c = vec3(0.62, 0.67, 0.71);",
-        "  }",
-        "  vec3 light = normalize(vec3(0.35, 0.55, 1.0));",
-        "  float diffuse = max(dot(n, light), 0.0);",
-        "  gl_FragColor = vec4(c * (0.38 + 0.62 * diffuse), 1.0);",
-        "}"
-      ].join("\n")
-    );
+    // The same two shader sources the side-pick viewport uses: one definition of how the
+    // part looks, so the two views cannot drift apart.
+    glState.meshProgram = link(gl, MESH_VERTEX_SOURCE, MESH_FRAGMENT_SOURCE);
     glState.flatProgram = link(gl,
       [
         "attribute vec3 aPos;",
@@ -423,7 +396,6 @@ function drawOverlay(view, projection, width, height, dpr) {
     ctx.fillText(label, projected.x + 15, projected.y - 6);
   });
 }
-
 function requestRender() {
   if (glState.raf) return;
   glState.raf = requestAnimationFrame(render);
@@ -598,6 +570,17 @@ function handleCanvasClick(clientX, clientY) {
 
 function round(value) { return Math.round(value * 1000) / 1000; }
 
+// 单位法向 → 最近的那个整车轴（+X/-X/...）。主扫描面与补充扫描面共用这一条，
+// 所以“点哪个面选哪个方向”在两处不会给出不同答案。
+function axisFromNormal(normal) {
+  const component = [Math.abs(normal[0]), Math.abs(normal[1]), Math.abs(normal[2])];
+  let axisIndex = 0;
+  if (component[1] > component[axisIndex]) axisIndex = 1;
+  if (component[2] > component[axisIndex]) axisIndex = 2;
+  const sign = normal[axisIndex] >= 0 ? "+" : "-";
+  return sign + "XYZ"[axisIndex];
+}
+
 /* ---------- UI: models and datum rows ---------- */
 
 function parseStl(buffer) {
@@ -702,6 +685,7 @@ async function loadModel(name, file) {
     base64: null
   };
   buildMeshBuffers(name, triangles);
+  if (name === "part") state.sideArea = null;
   const card = document.querySelector('label[for="' + name + 'File"]');
   if (card) card.classList.add("has-file");
   const target = $(name + "Name");
@@ -808,13 +792,13 @@ function updateAxisBadge(text) {
   $("axisBadge").textContent = text;
 }
 
-function recommendAxis(showToast) {
+// 模型在每个整车轴向上的面积估计：法向与轴夹角 ≤ 41° 的三角面求和。
+// 只用来在补充扫描面面板里给一个“值不值得补”的概念，不参与任何规划计算——
+// 真正的目标面由规划器在 3D 上按拓扑切分后重新采样。
+function sideAreaByAxis() {
   const model = state.models.part;
-  if (!model) {
-    updateAxisBadge("尚未导入零件");
-    if (showToast) toast("请先导入零件 STL");
-    return;
-  }
+  if (!model) return null;
+  if (state.sideArea && state.sideArea.model === model) return state.sideArea.areas;
   const areas = { "+X": 0, "-X": 0, "+Y": 0, "-Y": 0, "+Z": 0, "-Z": 0 };
   for (const triangle of model.triangles) {
     const edge1 = sub(triangle[1], triangle[0]);
@@ -826,6 +810,57 @@ function recommendAxis(showToast) {
       if (dot(normal, SIDE_VECTORS[axis]) > 0.75) areas[axis] += area;
     }
   }
+  state.sideArea = { model, areas };
+  return areas;
+}
+
+/* ---------- shared mesh shaders ---------- */
+/* Both the model viewport and (before 2026-11-05) the side-pick viewport drew the part
+ * with this pair. The side-pick viewport is gone - the target is the blank face and its
+ * stamped walls, chosen by topology rather than clicked - so only one consumer is left,
+ * but the sources stay named rather than inlined: they are the definition of how the
+ * part looks, and a second viewport is one call away if a site ever needs it. */
+const MESH_VERTEX_SOURCE = [
+  "attribute vec3 aPos;", "attribute vec3 aNrm;",
+  "uniform mat4 uProj;", "uniform mat4 uView;", "uniform mat3 uNormal;",
+  "varying vec3 vNrm;",
+  "void main() {",
+  "  vNrm = uNormal * aNrm;",
+  "  gl_Position = uProj * (uView * vec4(aPos, 1.0));",
+  "}"
+].join("\n");
+
+const MESH_FRAGMENT_SOURCE = [
+  "precision mediump float;",
+  "varying vec3 vNrm;",
+  "uniform vec3 uColor;",
+  "uniform vec3 uScanAxis;",
+  "uniform float uHighlight;",
+  "void main() {",
+  "  vec3 n = normalize(vNrm);",
+  "  if (!gl_FrontFacing) n = -n;",
+  "  vec3 c = uColor;",
+  "  if (uHighlight > 0.5) {",
+  "    float a = dot(n, uScanAxis);",
+  "    if (a > 0.45) c = vec3(0.83, 0.39, 0.20);",
+  "    else if (a < -0.45) c = vec3(0.40, 0.52, 0.60);",
+  "    else c = vec3(0.62, 0.67, 0.71);",
+  "  }",
+  "  vec3 light = normalize(vec3(0.35, 0.55, 1.0));",
+  "  float diffuse = max(dot(n, light), 0.0);",
+  "  gl_FragColor = vec4(c * (0.38 + 0.62 * diffuse), 1.0);",
+  "}"
+].join("\n");
+
+
+function recommendAxis(showToast) {
+  const model = state.models.part;
+  if (!model) {
+    updateAxisBadge("尚未导入零件");
+    if (showToast) toast("请先导入零件 STL");
+    return;
+  }
+  const areas = sideAreaByAxis() || { "+X": 0, "-X": 0, "+Y": 0, "-Y": 0, "+Z": 0, "-Z": 0 };
   let bestAxis = "+Z";
   let bestArea = -1;
   for (const axis of Object.keys(areas)) {
@@ -900,6 +935,31 @@ function showCoverageTarget(value) {
   $("coverageTarget").value = Number.isFinite(numeric) ? String(numeric) : String(value);
 }
 
+// 最大视点点数：程序点数的硬上限，留空 = 不限制（配置里的 max_points: null）。
+// 与覆盖率目标是两条独立的刹车——一个按面积算够就停，一个按停点数算够就停。
+// 非法输入原样回传，由服务端拒绝并说明原因，而不是在这里悄悄夹到边界值。
+function maxPointsInput() {
+  const raw = $("maxPoints") ? $("maxPoints").value.trim() : "";
+  if (!raw) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : raw;
+}
+
+function requireMaxPoints() {
+  const value = maxPointsInput();
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || value < 1 || !Number.isInteger(value)) {
+    throw new Error("最大视点点数必须是正整数，或留空表示不限制");
+  }
+  return value;
+}
+
+function showMaxPoints(value) {
+  if (!$("maxPoints")) return;
+  const unlimited = value === null || value === undefined || value === "";
+  $("maxPoints").value = unlimited ? "" : String(value);
+}
+
 // 扫描带角价：一条带在选择阶段算几个转角（单点恒为 1）。
 // 越界就原样回传，让服务端拒绝并说明原因，而不是在这里悄悄夹到边界值。
 function strokeCornerCostInput() {
@@ -929,7 +989,8 @@ function renderAdvancedReadout() {
     $("fastMode").value === "fast" ? "快速网格" : "精确网格",
     $("planMode").value === "banded" ? "扫掠优先" : "标准",
     $("routeStyle").value === "tidy" ? "整齐" : "直连",
-    target === null ? "覆盖率不限" : "覆盖率 " + target + "%"
+    target === null ? "覆盖率不限" : "覆盖率 " + target + "%",
+    maxPointsInput() === null ? "点数不限" : "最多 " + maxPointsInput() + " 点"
   ].join(" · ");
 }
 
@@ -957,6 +1018,7 @@ function payload(includeMeshes) {
     route_style: $("routeStyle").value,
     coverage_target_pct: coverageTargetInput(),
     stroke_corner_cost: strokeCornerCostInput(),
+    max_points: maxPointsInput(),
     plan_mode: $("planMode").value,
     run_name: runName || undefined,
     run_id: /^[A-Za-z0-9_-]{1,64}$/.test(runName) ? runName : undefined
@@ -1287,9 +1349,10 @@ async function solve() {
   if (state.solving) return;
   try {
     payload(false);
-    // 覆盖率目标和扫描带角价都在发请求前就验一遍：填错了不该等到传完模型才失败
+    // 覆盖率目标、扫描带角价和点数上限都在发请求前就验一遍：填错了不该等到传完模型才失败
     requireCoverageTarget();
     requireStrokeCornerCost();
+    requireMaxPoints();
   } catch (error) {
     $("formFeedback").textContent = error.message;
     toast(error.message);
@@ -1423,6 +1486,15 @@ function renderResult(result) {
       : Number(result.coverage_target_pct).toFixed(1) + " %"],
     ["关节筛选", "始终开启 · 每点带 CONFIG 与关节解"],
     ["扫描面外法向（整车）", "[" + result.scan_face_axis_vehicle.map((value) => Number(value).toFixed(3)).join(", ") + "]"],
+    ["目标面方向", Array.isArray(result.target_directions) && result.target_directions.length
+      ? result.target_directions.map((name) => (name === "upper" ? "主面 + 冲压侧面（背面不扫）" : name)).join(" + ")
+      : "主面 + 冲压侧面（背面不扫）"],
+    ["最大视点点数", result.max_points === null || result.max_points === undefined
+      ? "不限制"
+      : Number(result.max_points).toFixed(0) + " 点（"
+        + ({ target_bound: "先到覆盖率目标", budget_bound: "先到点数上限",
+             exhausted: "候选池已无新增覆盖" }[result.budget && result.budget.verdict]
+           || "未知") + "）"],
     ["目标面面积", (Number(result.target_face_mm2) / 1e6).toFixed(4) + " m²"],
     ["配准 RMS / 最大误差", result.registration_rms_error_mm.toFixed(3) + " / " + result.registration_max_error_mm.toFixed(3) + " mm"],
     ...(result.relocalised
@@ -1535,6 +1607,7 @@ function syncSetupFromResult(result) {
   $("fastNoOcclusion").disabled = !wasFast;
   if (result.coverage_target_pct !== undefined) {
     showCoverageTarget(result.coverage_target_pct);
+  showMaxPoints(result.max_points);
   }
   renderAdvancedReadout();
   if (Number.isFinite(Number(result.uframe))) {
@@ -2234,6 +2307,7 @@ function currentSetup() {
     route_style: $("routeStyle").value,
     coverage_target_pct: coverageTargetInput(),
     stroke_corner_cost: strokeCornerCostInput(),
+    max_points: maxPointsInput(),
     plan_mode: $("planMode").value,
     model_names: {
       part: state.models.part ? state.models.part.sourceName : "",
@@ -2366,6 +2440,7 @@ async function loadSelectedSetup() {
     if ($("planMode") && saved.plan_mode) $("planMode").value = saved.plan_mode;
     if (saved.coverage_target_pct !== undefined) {
       showCoverageTarget(saved.coverage_target_pct);
+    showMaxPoints(saved.max_points);
     }
     if ($("strokeCornerCost") && saved.stroke_corner_cost !== undefined
         && saved.stroke_corner_cost !== null) {
@@ -2452,6 +2527,7 @@ async function applyServerDefaults() {  try {
     // `null` means the selection runs until nothing new is covered.
     if (defaults.coverage_target_pct !== undefined) {
       showCoverageTarget(defaults.coverage_target_pct);
+  showMaxPoints(defaults.max_points);
     }
     if (defaults.stroke_corner_cost !== undefined && defaults.stroke_corner_cost !== null) {
       $("strokeCornerCost").value = String(defaults.stroke_corner_cost);

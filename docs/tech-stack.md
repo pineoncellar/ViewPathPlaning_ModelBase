@@ -177,7 +177,7 @@ src/scanweb/             本机浏览器工位界面
 |---|---|---|
 | 可复现表面采样 | 每格一点、等面积份额，显式播种（trimesh 3.12.7 从全局 numpy 随机态抽样，不播种两次结果不同） | [geometry.py](../src/scanplan/geometry.py)、[target_surface.py](../src/scanplan/target_surface.py) |
 | 目标面分割 | 镜像配对 → 中面 PCA → 局部片法向 `n·m` 的符号传播，拓扑定面而不是朝向定面 | [sheet_split.py](../src/scanplan/sheet_split.py) |
-| 光线求交与遮挡 | Embree BVH，分块查询（`DEFAULT_CHUNK = 250_000`）压峰值内存 | [raycast.py](../src/scanplan/raycast.py) |
+| 光线求交与遮挡 | Embree BVH，分块查询压峰值内存：Embree 走 `DEFAULT_CHUNK = 250_000`，纯 Python 退化路径走 `FALLBACK_CHUNK = 20_000`（后者要为每个"射线 × 三角面"候选各留一份内存）。**退化三角面（零面积）的法向是零向量**，沿它打出的射线没有方向，trimesh 宽相位会算出 inf/NaN 包围盒并让 `rtree` 抛 "minimums more than maximums"——2026-11-05 那次网页运行就是被 110 825 个面里的 4 个碎片打断的。这类射线现在按"未命中"处理（`_usable` 过滤），不参与求交也不影响其它射线 | [raycast.py](../src/scanplan/raycast.py) |
 | 单点位姿有效性 | 视场（随距离缩放的矩形）、量程、入射角、遮挡、本体包络、跟踪器六条判据 | [scanner_model.py](../src/scanplan/scanner_model.py) |
 | 候选生成 | 每个瞄准格点铺"距离 × 倾角 × 滚转"阶梯后去重；滚转必要是因为视场是矩形 | [candidates.py](../src/scanplan/candidates.py) |
 | 候选×样本覆盖集 | `scipy.sparse.csr_matrix`，每行是一个候选位姿可达的样本及入射角 | [coverage.py](../src/scanplan/coverage.py) |

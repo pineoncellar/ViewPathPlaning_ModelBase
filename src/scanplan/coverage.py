@@ -42,7 +42,8 @@ REASONS = ("never_in_view", "blocked_by_part", "blocked_by_fixture", "blocked_by
            "blocked_by_tracker", "only_poses_that_collide", "unreachable_joint_limit",
            "candidate_found")
 _COUNTER_KEYS = ("rejected_inside_part", "inside_part_unchecked", "rejected_clearance",
-                 "rejected_tracker", "rejected_kinematics", "rejected_no_points", "rays")
+                 "rejected_part_clearance", "rejected_tracker", "rejected_kinematics",
+                 "rejected_no_points", "rays")
 
 
 @dataclass
@@ -127,6 +128,18 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
                  if poses else np.zeros((0, 3)))
     tracker_ok = (np.asarray(visible(positions), dtype=bool) if visible is not None
                   else np.ones(len(poses), dtype=bool))
+    # One vectorised query for the whole pool: the fixture keep-out is a pose property, and
+    # a viewpoint that sits within it can never be delivered - not even when the body sphere
+    # itself would fit.
+    fixture_clearance = (station.fixture_clearance_mm(positions) if len(positions)
+                         else np.zeros(0))
+    # How close the head gets to the part itself. A pose that reached the far side of the
+    # sheet through an internal hole is inside its own near range of the metal it passed;
+    # so is one grazing the sheet to see a distant region at a glancing angle. Both are
+    # refusals here rather than at export time, because neither can measure anything.
+    part_clearance = (station.part_clearance_mm(positions, limit_mm=model.part_limit_mm)
+                      if len(positions) and model.part_limit_mm > 0.0
+                      else np.full(len(positions), np.inf))
     # One vectorised parity query for the whole pool, before the per-pose work: the reference
     # point of a pose that sits INSIDE the sheet cannot be flown, and the pose would otherwise
     # earn coverage by seeing samples through the material it is buried in. Three rays per
@@ -149,10 +162,13 @@ def evaluate(poses: Sequence[ScannerPose], samples: SampleSet, station: Station,
         if buried[index]:
             counters["rejected_inside_part"] += 1
             rejected = "inside_part"
-        elif not model.body_fits(
-                pose.position,
+        elif not model.part_fits(part_clearance[index]):
+            counters["rejected_part_clearance"] += 1
+            rejected = "part_clearance"
+        elif not model.clearances_fit(
                 station.body_clearance_mm(pose.position,
-                                          limit_mm=model.body_limit_mm)[0]):
+                                          limit_mm=model.body_limit_mm)[0],
+                fixture_clearance[index]):
             counters["rejected_clearance"] += 1
             rejected = "clearance"
         elif not tracker_ok[index]:

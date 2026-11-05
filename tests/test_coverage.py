@@ -119,11 +119,47 @@ def test_body_clearance_rejects_a_pose_before_any_ray_is_cast(clamped_plate,
     # inside the 5 mm gap between the plate and the clamp's pad: geometrically ideal,
     # physically impossible for a 45 mm scanner body
     in_the_gap = pose_above(x_mm=70.0, y_mm=0.0, z_mm=0.7 + CLAMP_GAP_MM / 2.0)
+    # The part keep-out (shipped at 120 mm) would refuse this pose first and for its own
+    # reason; this test is about the body/fixture gate, so it is switched off here.
+    no_part_floor = replace(cfg, scanner=replace(cfg.scanner, min_part_clearance_mm=0.0))
     result = evaluate([in_the_gap], head_on_samples(60.0), clamped_plate.station,
-                      model_placeholder, cfg)
+                      ScannerModel(no_part_floor.scanner), no_part_floor)
     assert result.counters["rejected_clearance"] == 1
     assert result.counters["rays"] == 0
     assert len(result.sets[0]) == 0
+
+
+def test_the_fixture_keep_out_rejects_a_pose_the_body_test_would_accept(
+        clamped_plate, model_placeholder, cfg):
+    """80 mm above the clamp arm: the 45 mm body sphere fits, the 100 mm keep-out does not."""
+    pose = pose_above(x_mm=70.0, z_mm=120.0)
+    probe = pose.position[None, :]
+    assert 40.0 < float(clamped_plate.station.body_clearance_mm(probe)[0]) < 100.0
+    assert float(clamped_plate.station.fixture_clearance_mm(probe)[0]) < 100.0
+    # Same isolation as above: the part floor would answer first, about its own question.
+    no_part_floor = replace(cfg, scanner=replace(cfg.scanner, min_part_clearance_mm=0.0))
+    result = evaluate([pose], head_on_samples(60.0), clamped_plate.station,
+                      ScannerModel(no_part_floor.scanner), no_part_floor)
+    assert result.counters["rejected_clearance"] == 1
+    assert result.counters["rays"] == 0
+    assert len(result.sets[0]) == 0
+
+
+def test_a_pose_closer_than_the_near_range_to_the_part_is_rejected(clamped_plate, cfg):
+    """94 mm above the panel with the footprint below it: what viewpoint 35 was on 11-05."""
+    from dataclasses import replace as _replace
+
+    strict = _replace(cfg, scanner=_replace(cfg.scanner, min_part_clearance_mm=120.0))
+    model = ScannerModel(strict.scanner)
+    pose = pose_above(x_mm=0.0, y_mm=0.0, z_mm=0.7 + 94.0)
+    result = evaluate([pose], head_on_samples(60.0), clamped_plate.station, model, strict)
+    assert result.counters["rejected_part_clearance"] == 1
+    assert result.counters["rays"] == 0
+    assert len(result.sets[0]) == 0
+    # the same pose at a normal standoff passes the same gate
+    far = pose_above(x_mm=0.0, y_mm=0.0, z_mm=0.7 + 260.0)
+    accepted = evaluate([far], head_on_samples(60.0), clamped_plate.station, model, strict)
+    assert accepted.counters["rejected_part_clearance"] == 0
 
 
 def test_the_tracker_gate_empties_the_set_and_is_counted(clamped_plate,
@@ -263,8 +299,9 @@ def test_the_counters_record_what_was_rejected(clamped_plate, model_placeholder,
     result = evaluate(ladder_poses(), head_on_samples(60.0), clamped_plate.station,
                       model_placeholder, cfg)
     assert set(result.counters) == {"rejected_inside_part", "inside_part_unchecked",
-                                    "rejected_clearance", "rejected_tracker",
-                                    "rejected_kinematics", "rejected_no_points", "rays"}
+                                    "rejected_clearance", "rejected_part_clearance",
+                                    "rejected_tracker", "rejected_kinematics",
+                                    "rejected_no_points", "rays"}
     assert result.counters["rays"] > 0
     assert result.counters["rejected_clearance"] == 0
     # None of these poses sits in the sheet, and the counter has to say so rather than be

@@ -852,10 +852,16 @@ def build_path(strokes: Sequence[Stroke], *, cfg: PlannerConfig, station: Statio
         # point's roll (a spin about the same axis keeps the sight line), and when even that
         # cannot help, leave the move and name it - the speed ladder already flies anything
         # over 60 deg at the slowest bucket, so "slow down" is not a promise, it is the default.
+        rails = _rail_lookup(points, solutions)
         eased = ease_over_cap_j6(
             points, solutions, kin, getattr(cfg.robot, "j6_max_step_deg", None),
-            verify=lambda a, b: _joint_move(a, b, cfg, station, model,
-                                            visible=visible, kin=kin)[0])
+            # The verifier is handed joint values only, so the rail of each end comes from
+            # this table: a re-rolled corner keeps its own carriage reading, and a move
+            # checked at rail 0 is a move checked somewhere else in the cell.
+            verify=lambda a, b: _joint_move(
+                a, b, cfg, station, model, visible=visible, kin=kin,
+                track_first=rails.get(tuple(np.round(np.asarray(a, dtype=float), 6)), 0.0),
+                track_second=rails.get(tuple(np.round(np.asarray(b, dtype=float), 6))))[0])
         plan.violations.extend(eased)
         # AGAIN, because `ease_over_cap_j6` replaces a point with a FRESHLY solved solution and
         # a fresh solve is placed at the roomiest equivalent reading, not at the continuous
@@ -1181,10 +1187,10 @@ def _travel(points: Sequence[PathPoint]) -> float:
 def _segment_margin(first: PathPoint, second: PathPoint, cfg: PlannerConfig,
                     station: Station, model: ScannerModel, *, visible=None
                     ) -> tuple[float, bool]:
-    """Smallest body clearance along one short move, and whether the tracker held.
+    """Smallest body/fixture margin along one short move, and whether the tracker held.
 
     Sampled at the cheap step: a transition is not a scan, so what matters is that the
-    head fits everywhere on it, not what it can see.
+    head fits and stays out of the fixture keep-out everywhere on it, not what it can see.
     """
     start = np.asarray(first.position, dtype=float)
     end = np.asarray(second.position, dtype=float)
@@ -1197,7 +1203,7 @@ def _segment_margin(first: PathPoint, second: PathPoint, cfg: PlannerConfig,
 
 def _positions_margin(positions, station: Station, model: ScannerModel, *, visible=None
                       ) -> tuple[float, bool]:
-    """Smallest body clearance over a set of TCP positions, and whether the tracker held.
+    """Smallest body/fixture margin over a set of TCP positions, and whether the tracker held.
 
     Separate from `_segment_margin` because a joint move does not sweep a straight line: the
     positions have to come from forward kinematics along the joint path, and then the same
@@ -1211,8 +1217,12 @@ def _positions_margin(positions, station: Station, model: ScannerModel, *, visib
     # connector is a straight (or joint-interpolated) line between two legal poses and it can
     # cross the sheet in between - the fixture/base gate could not see that, so a straight
     # `L` move was written through the part on the 2026-11-03 rail run.
-    margin = float(station.body_clearance_mm(stacked, limit_mm=model.body_limit_mm).min()
-                   - model.body_limit_mm)
+    body = float(station.body_clearance_mm(stacked,
+                                           limit_mm=model.body_limit_mm).min())
+    # The fixture keep-out applies to the WHOLE swept path, not only to the endpoints: a
+    # connector that is legal at both ends can still cut a corner through a clamp.
+    fixture = float(station.fixture_clearance_mm(stacked).min())
+    margin = model.clearance_margin(body, fixture)
     seen = True if visible is None else bool(np.all(visible(stacked)))
     return margin, seen
 
@@ -1401,7 +1411,8 @@ def _step_cost(first, second, j6_weight: float = 1.0,
 
 
 def _joint_move(first, second, cfg: PlannerConfig, station: Station, model: ScannerModel,
-                *, visible=None, kin=None) -> tuple[bool, float, str]:
+                *, visible=None, kin=None, track_first: float = 0.0,
+                track_second: float | None = None) -> tuple[bool, float, str]:
     """Whether a single joint move from `first` to `second` is deliverable.
 
     This is the primary connector primitive and the reason the plan got simpler. A joint move
@@ -1417,13 +1428,20 @@ def _joint_move(first, second, cfg: PlannerConfig, station: Station, model: Scan
       path has to be sampled through forward kinematics.
     `tracker_blocked` - a transition still has to look like one, because the measurement must
       not be interrupted by the arm covering the tracker.
+
+    `track_first` / `track_second` are the carriage readings of the two ends. They are not
+    optional decoration: the rail is one of the interpolated axes, so leaving them out
+    measures the move at rail 0, which on a 3.3 m rail is a different place in the cell.
     """
     from_deg = np.asarray(first, dtype=float).reshape(6)
     to_deg = np.asarray(second, dtype=float).reshape(6)
     if _j5_crossover(from_deg, to_deg):
         return False, float("inf"), "j5_crossover"
     positions = kin.sweep_points(from_deg, to_deg,
-                                 step_deg=float(cfg.stroke.joint_step_deg))
+                                 step_deg=float(cfg.stroke.joint_step_deg),
+                                 track_first=float(track_first),
+                                 track_second=None if track_second is None
+                                 else float(track_second))
     if positions is None:
         return False, float("inf"), "unverified"
     margin, seen = _positions_margin(positions, station, model, visible=visible)
@@ -1435,13 +1453,17 @@ def _joint_move(first, second, cfg: PlannerConfig, station: Station, model: Scan
 
 
 def _chain_route(first_joints, corners, entry_joints, cfg: PlannerConfig, station: Station,
-                 model: ScannerModel, *, visible=None, kin=None):
+                 model: ScannerModel, *, visible=None, kin=None,
+                 track_first: float = 0.0, track_last: float | None = None):
     """Walk a fallback route hop by hop, or give up.
 
     Greedy on purpose: this is the route the joint move already refused, so spending a
     dynamic programme on it would cost more than the sweep it saves. What is not greedy is
     the verification - every hop is checked, including the last one into the entry, because
     the whole reason a segment check exists is a move that looked fine at both ends.
+
+    Every hop carries its own carriage readings: the corner's rail comes from the solution
+    that will be written for it, so the hop is measured where the arm will actually be.
 
     Returns (solutions, ok). `solutions` is what the exporter must write, so the joints that
     were verified are the joints that get delivered.
@@ -1451,6 +1473,7 @@ def _chain_route(first_joints, corners, entry_joints, cfg: PlannerConfig, statio
     if first_joints is None:
         return [], False
     held = np.asarray(first_joints, dtype=float).reshape(6)
+    held_track = float(track_first)
     chosen: list = []
     for corner in corners:
         options = kin.solutions(corner.position, corner.axis, corner.roll_deg)
@@ -1460,8 +1483,9 @@ def _chain_route(first_joints, corners, entry_joints, cfg: PlannerConfig, statio
             held, item.joints_deg, float(cfg.robot.j6_weight)))
         landed = None
         for item in ordered:
-            ok, _margin, _reason = _joint_move(held, item.joints_deg, cfg, station, model,
-                                               visible=visible, kin=kin)
+            ok, _margin, _reason = _joint_move(
+                held, item.joints_deg, cfg, station, model, visible=visible, kin=kin,
+                track_first=held_track, track_second=float(_rail_of(item, held_track)))
             if ok:
                 landed = item
                 break
@@ -1469,12 +1493,37 @@ def _chain_route(first_joints, corners, entry_joints, cfg: PlannerConfig, statio
             return [], False
         chosen.append(landed)
         held = np.asarray(landed.joints_deg, dtype=float).reshape(6)
+        held_track = float(_rail_of(landed, held_track))
     if entry_joints is not None:
-        ok, _margin, _reason = _joint_move(held, entry_joints, cfg, station, model,
-                                           visible=visible, kin=kin)
+        ok, _margin, _reason = _joint_move(
+            held, entry_joints, cfg, station, model, visible=visible, kin=kin,
+            track_first=held_track,
+            track_second=None if track_last is None else float(track_last))
         if not ok:
             return [], False
     return chosen, True
+
+
+def _rail_of(solution, fallback: float) -> float:
+    """A solution's carriage reading, or the reading it would inherit."""
+    value = getattr(solution, "track_mm", None)
+    return float(fallback) if value is None else float(value)
+
+
+def _rail_lookup(points, solutions) -> dict[tuple, float]:
+    """`joints -> carriage reading`, for the checks that are handed joint values only.
+
+    `ease_over_cap_j6` calls its verifier with six numbers, because that is all a move needs
+    to be defined - but a move's swept TCP also depends on the rail. Building the table here
+    keeps that verifier contract unchanged while still measuring the hop where the arm is.
+    """
+    table: dict[tuple, float] = {}
+    for point, solution in zip(points, solutions, strict=False):
+        if solution is None:
+            continue
+        key = tuple(np.round(np.asarray(solution.joints_deg, dtype=float), 6))
+        table.setdefault(key, float(getattr(point, "track_mm", 0.0) or 0.0))
+    return table
 
 
 @dataclass
@@ -1549,7 +1598,9 @@ class ConnectorChain:
             return None
         ok, margin, reason = _joint_move(ctx.start_joints, ctx.end_joints, cfg,
                                          ctx.station, ctx.model,
-                                         visible=ctx.visible, kin=ctx.kin)
+                                         visible=ctx.visible, kin=ctx.kin,
+                                         track_first=float(ctx.start_track),
+                                         track_second=float(ctx.end_track))
         if ok:
             return ConnectorResult(level=LEVEL_JOINT, margin_mm=margin)
         _note_failure(ctx.plan, reason)
@@ -1579,7 +1630,9 @@ class ConnectorChain:
                 corners, margin = found
                 solutions, ok = _chain_route(ctx.start_joints, corners, ctx.end_joints,
                                              cfg, ctx.station, ctx.model,
-                                             visible=ctx.visible, kin=ctx.kin)
+                                             visible=ctx.visible, kin=ctx.kin,
+                                             track_first=float(ctx.start_track),
+                                             track_last=float(ctx.end_track))
                 if ok:
                     return ConnectorResult(level=LEVEL_ONE_CORNER, corners=list(corners),
                                            joints=list(solutions), margin_mm=margin)
@@ -1592,7 +1645,9 @@ class ConnectorChain:
                                              kin=ctx.kin)
         solutions, chain_ok = _chain_route(ctx.start_joints, corners, ctx.end_joints, cfg,
                                            ctx.station, ctx.model, visible=ctx.visible,
-                                           kin=ctx.kin)
+                                           kin=ctx.kin,
+                                           track_first=float(ctx.start_track),
+                                           track_last=float(ctx.end_track))
         # The hard gate refuses on CLEARANCE and on joint feasibility. It does not refuse on
         # `rate`: how much rotation one millimetre of flight can absorb is a modelling
         # assumption whose constant (`max_rot_deg_per_mm`) was only ever bounded from below
@@ -1714,8 +1769,8 @@ def _record(plan: PathPlan, same: bool, margin: float, rotation: float, rate: fl
                 f"{_LIFT_FACTORS[-1] * cfg.stroke.retract_clearance_mm:g} mm of lift")
     if margin <= 0.0:
         plan.violations.append(
-            f"the connector into stroke {entry.stroke_id} keeps {margin:.1f} mm of body "
-            f"clearance on every route tried, up to "
+            f"the connector into stroke {entry.stroke_id} keeps {margin:.1f} mm of "
+            f"clearance (body or fixture keep-out) on every route tried, up to "
             f"{_LIFT_FACTORS[-1] * cfg.stroke.retract_clearance_mm:g} mm of lift")
 
 
@@ -1799,7 +1854,9 @@ def _lateral_corner(previous: PathPoint, entry: PathPoint,
         corners, margin = found
         solutions, ok = _chain_route(ctx.start_joints, corners, ctx.end_joints, ctx.cfg,
                                      ctx.station, ctx.model, visible=ctx.visible,
-                                     kin=ctx.kin)
+                                     kin=ctx.kin,
+                                     track_first=float(ctx.start_track),
+                                     track_last=float(ctx.end_track))
         if not ok:
             _note_failure(ctx.plan, "lateral_joint")
             continue

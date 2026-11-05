@@ -135,6 +135,13 @@ def test_body_clearance_counts_the_part_and_clearance_mm_does_not(station):
     assert 1.5 < float(station.body_clearance_mm(probe)[0]) < 2.6
 
 
+def test_fixture_clearance_ignores_the_base(clamped_plate):
+    """The keep-out is about the CLAMP, not the floor: 5 mm off the base is fine to fly."""
+    probe = np.array([[0.0, 0.0, -55.0]])
+    assert float(clamped_plate.station.clearance_mm(probe)[0]) < 10.0
+    assert float(clamped_plate.station.fixture_clearance_mm(probe)[0]) > 50.0
+
+
 def test_body_clearance_still_answers_on_a_station_built_by_hand(station):
     """A Station assembled in code has no part cloud; it is sampled from the mesh on demand."""
     from scanplan.scene import Station

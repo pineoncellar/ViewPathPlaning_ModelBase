@@ -53,12 +53,19 @@ class SampleSet:
 
 @dataclass(frozen=True)
 class TargetSet:
-    """What must be measured, and what was exempted and why."""
+    """What must be measured, and what was exempted and why.
+
+    `directions` names the surface directions the target was assembled from, in the order
+    they were added. One entry is the ordinary single-face run; more than one means the site
+    asked for extra sides on top of the main face, and each of them contributed samples with
+    its own normals, so the candidate ladder aims at them from their own side.
+    """
 
     face: str
     samples: SampleSet
     exempt: SampleSet
     face_area_mm2: float
+    directions: tuple[str, ...] = ()
 
 
 def face_mesh(part, mask) -> trimesh.Trimesh:
@@ -165,6 +172,66 @@ def build_target(part, split: SheetSplit, face: str, station: Station,
         exempt=_with_reasons(exempt, "fixture_contact"),
         face_area_mm2=face_area,
     )
+
+
+def merge_targets(targets, *, face: str | None = None, dedupe_mm: float = 0.5) -> TargetSet:
+    """The union of several targets: every sample of every direction, counted once.
+
+    A sheet's side walls belong to whichever face they were formed from, so scanning one
+    side leaves the flanges that face another way uncovered. The fix is not a different
+    planner stage but a bigger target: samples carry their own normals, and both the
+    candidate ladder and the stroke seeds aim along the normal of the point they aim at.
+    Merging here is therefore all that "also scan these sides" has to mean.
+
+    Overlapping samples are dropped by position, because a flange seen from two directions
+    is one piece of metal: counting it twice would quietly inflate the uncovered area and
+    make the coverage figure disagree with the part.
+    """
+    kept = [item for item in targets if len(item.samples.points)]
+    if not kept:
+        raise ValueError("none of the assembled targets has any sample")
+    if len(kept) == 1:
+        only = kept[0]
+        return TargetSet(face=face or only.face, samples=only.samples,
+                         exempt=only.exempt, face_area_mm2=only.face_area_mm2,
+                         directions=only.directions or (only.face,))
+
+    # Both sets are deduplicated in ONE pass. Doing them separately would let a point that
+    # one direction sampled as target and another exempted as clamped appear in both, which
+    # would count the same metal as required and as exempt at the same time.
+    blocks = [(item.samples, "target") for item in kept]
+    blocks += [(item.exempt, "fixture_contact") for item in kept if len(item.exempt.points)]
+    points = np.vstack([block.points for block, _ in blocks])
+    normals = np.vstack([block.normals for block, _ in blocks])
+    areas = np.concatenate([block.area_mm2 for block, _ in blocks])
+    kinds = np.concatenate([np.full(len(block.points), kind, dtype=object)
+                            for block, kind in blocks])
+    steps = max(1, int(round(dedupe_mm * 10.0)))
+    cells = np.round(points * 10.0 / steps).astype(np.int64)
+    _, first = np.unique(cells, axis=0, return_index=True)
+    first = np.sort(first)
+    points, normals, areas, kinds = points[first], normals[first], areas[first], kinds[first]
+
+    def pick(kind: str) -> SampleSet:
+        chosen = kinds == kind
+        return SampleSet(points=points[chosen], normals=normals[chosen],
+                         area_mm2=areas[chosen],
+                         total_area_mm2=float(areas[chosen].sum()),
+                         reasons=np.full(int(chosen.sum()), kind, dtype=object))
+
+    samples = pick("target")
+    exempt = pick("fixture_contact")
+    directions: list[str] = []
+    for item in kept:
+        for name in item.directions or (item.face,):
+            if name not in directions:
+                directions.append(name)
+    # The merged target's area is the area of the samples it holds, not the sum of the faces
+    # they came from: a flange counted by two directions is one piece of metal, and coverage
+    # is measured against this number, so it has to be the union.
+    return TargetSet(face=face or kept[0].face, samples=samples, exempt=exempt,
+                     face_area_mm2=float(samples.total_area_mm2 + exempt.total_area_mm2),
+                     directions=tuple(directions))
 
 
 def _select(samples: SampleSet, mask: np.ndarray) -> SampleSet:

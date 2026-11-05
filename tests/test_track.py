@@ -141,6 +141,34 @@ def test_a_straight_move_carries_the_carriage_with_it():
     assert moving.track_mm == pytest.approx(1400.0)
 
 
+def test_a_joint_move_is_swept_where_the_carriage_will_be():
+    """The swept TCP of a `J` move depends on the rail, and the check has to say so.
+
+    Interpolating six joints with the carriage held at 0 measures a different place in the
+    cell: on the 2026-11-05 run the move between points 24 and 25 keeps 187 mm from the
+    clamp at rail 0 and 15 mm at the commanded 306 mm - the gate called a grazing move
+    clear. `KinematicGate.sweep_points` must therefore carry the readings through.
+    """
+    from scanplan.kinematics import KinematicGate
+
+    gate = KinematicGate(replace(load_config().robot, enabled=True))
+    start = JOINTS
+    end = (20.0, 10.0, -20.0, 0.0, -60.0, 0.0)
+    frozen = gate.sweep_points(start, end, step_deg=5.0, track_first=0.0, track_second=0.0)
+    moving = gate.sweep_points(start, end, step_deg=5.0, track_first=0.0, track_second=1000.0)
+    assert frozen is not None and moving is not None
+    assert len(frozen) == len(moving)
+    # The carriage slides the whole arm along +X, so the two sweeps differ by the rail travel
+    # interpolated at each sample, and by nothing else.
+    steps = np.linspace(0.0, 1000.0, len(moving) + 1)[1:]
+    assert np.allclose(np.asarray(moving) - np.asarray(frozen),
+                       np.column_stack([steps, np.zeros_like(steps), np.zeros_like(steps)]),
+                       atol=1e-6)
+    # omitting them is the same as asking about a carriage parked at zero
+    assert np.allclose(np.asarray(gate.sweep_points(start, end, step_deg=5.0)),
+                       np.asarray(frozen), atol=1e-9)
+
+
 def test_the_rail_band_is_exactly_the_travel_it_has():
     """No margin at either end: 0 and 3300 are usable, anything outside is not."""
     robot = _robot()

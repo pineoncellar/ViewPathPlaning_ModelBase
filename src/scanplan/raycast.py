@@ -31,6 +31,11 @@ from collections.abc import Mapping
 import numpy as np
 
 DEFAULT_CHUNK = 250_000
+# The pure-Python intersector materialises one (ray, triangle) candidate pair per overlap
+# and needs ~24 bytes for each. On the 2026-11-05 part (110 825 faces) a 250 000-ray batch
+# asked for 2.26 GiB in a single allocation and died; 20 000 rays bound the same query to
+# about 190 MB. Embree allocates nothing comparable, so it keeps the large batch.
+FALLBACK_CHUNK = 20_000
 
 
 def _fallback_intersector_class():
@@ -115,10 +120,29 @@ def _as_rays(origins, directions) -> tuple[np.ndarray, np.ndarray]:
     return origins, directions
 
 
+def _usable(origins, directions) -> np.ndarray:
+    """Which rays the intersector can be asked about at all.
+
+    A degenerate triangle - a zero-area sliver, which CAD tessellators do emit - carries
+    the zero vector as its `face_normals` entry, so a ray cast along that normal has no
+    direction. trimesh's broad phase bounds a ray by dividing through its dominant
+    direction component, so such a ray yields inf/nan corners and `rtree` refuses the box
+    with "coordinates must not have minimums more than maximums". That is what aborted the
+    2026-11-05 web run on a part with 4 zero-area triangles out of 110 825.
+
+    Such a ray has no answer, so it is reported as a MISS: `inf` distance and no triangle.
+    Callers already treat a miss as "nothing in the way", which is the safe reading for a
+    sliver that carries no surface.
+    """
+    return (np.isfinite(origins).all(axis=1)
+            & np.isfinite(directions).all(axis=1)
+            & (np.abs(directions).max(axis=1) > 0.0))
+
+
 class RayCaster:
     """Nearest-hit queries against one mesh, in chunks so memory stays bounded."""
 
-    def __init__(self, mesh, chunk: int = DEFAULT_CHUNK):
+    def __init__(self, mesh, chunk: int | None = None):
         if _INTERSECTOR_CLASS is None:
             raise RuntimeError(
                 "ray casting needs `rtree`, which is missing from this environment; "
@@ -127,6 +151,8 @@ class RayCaster:
                 "~1600x faster Embree backend) or `uv add rtree`."
             )
         self.mesh = mesh
+        if chunk is None:
+            chunk = DEFAULT_CHUNK if EMBREE_AVAILABLE else FALLBACK_CHUNK
         self.chunk = max(1, int(chunk))
         self._intersector = _INTERSECTOR_CLASS(mesh)
 
@@ -139,18 +165,21 @@ class RayCaster:
         if count == 0:
             return distance, triangle
 
-        for start in range(0, count, self.chunk):
-            stop = min(start + self.chunk, count)
+        # Only the usable rays are cast; the rest keep the pre-filled miss answer. See
+        # `_usable` for why a zero-direction ray would otherwise abort the whole run.
+        pending = np.flatnonzero(_usable(origins, directions))
+        for start in range(0, len(pending), self.chunk):
+            rows = pending[start:start + self.chunk]
             index_tri, index_ray, locations = self._intersector.intersects_id(
-                origins[start:stop], directions[start:stop],
+                origins[rows], directions[rows],
                 multiple_hits=False, return_locations=True,
             )
             if len(index_ray) == 0:
                 continue
             hits = np.asarray(locations, dtype=float).reshape(-1, 3)
-            rows = start + np.asarray(index_ray, dtype=np.int64)
-            distance[rows] = np.linalg.norm(hits - origins[rows], axis=1)
-            triangle[rows] = np.asarray(index_tri, dtype=np.int64)
+            hit_rows = rows[np.asarray(index_ray, dtype=np.int64)]
+            distance[hit_rows] = np.linalg.norm(hits - origins[hit_rows], axis=1)
+            triangle[hit_rows] = np.asarray(index_tri, dtype=np.int64)
         return distance, triangle
 
 
@@ -164,16 +193,17 @@ class RayCaster:
         """
         origins, directions = _as_rays(origins, directions)
         count = np.zeros(len(origins), dtype=np.int64)
-        for start in range(0, len(origins), self.chunk):
-            stop = min(start + self.chunk, len(origins))
+        pending = np.flatnonzero(_usable(origins, directions))
+        for start in range(0, len(pending), self.chunk):
+            rows = pending[start:start + self.chunk]
             _index_tri, index_ray = self._intersector.intersects_id(
-                origins[start:stop], directions[start:stop],
+                origins[rows], directions[rows],
                 multiple_hits=True, return_locations=False,
             )
             if len(index_ray) == 0:
                 continue
-            count[start:stop] += np.bincount(np.asarray(index_ray, dtype=np.int64),
-                                             minlength=stop - start)
+            count[rows] += np.bincount(np.asarray(index_ray, dtype=np.int64),
+                                       minlength=len(rows))
         return count
 
 

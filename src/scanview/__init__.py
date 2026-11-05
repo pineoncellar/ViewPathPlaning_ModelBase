@@ -41,13 +41,16 @@ from .payload import (
 
 def write_run_outputs(folder, *, part, fixture, base, viewpoints, target_points,
                       target_covered, coverage_sets, chosen, tracker=None,
-                      scanner=None, max_faces: int = DEFAULT_MAX_FACES,
+                      scanner=None, robot=None, max_faces: int = DEFAULT_MAX_FACES,
                       stats: dict | None = None) -> dict[str, Path]:
     """Write the page and its sample sidecar for a finished planning run.
 
     `coverage_sets[i]` is the target indices pose `i` can measure and `chosen` lists the
     delivered poses in the order `viewpoints` is in; together they produce the per-sample
     bitmask the page uses to answer "who sees this point".
+
+    `robot` is only used to draw joint moves as the arcs they really are; without it the
+    page draws them as straight lines, which understates how far the head actually travels.
     """
     folder = Path(folder)
     points = target_points
@@ -58,13 +61,13 @@ def write_run_outputs(folder, *, part, fixture, base, viewpoints, target_points,
         VIEWER_FILE_NAME: write_viewer(
             folder / VIEWER_FILE_NAME, part=part, fixture=fixture, base=base,
             viewpoints=viewpoints, target_points=points, target_covered=target_covered,
-            target_mask=mask, tracker=tracker, scanner=scanner, max_faces=max_faces,
-            stats=stats),
+            target_mask=mask, tracker=tracker, scanner=scanner, robot=robot,
+            max_faces=max_faces, stats=stats),
     }
 
 
 def write_viewer_from_run(viewer_path, *, part, fixture, base, viewpoints,
-                          samples_path=None, tracker=None, scanner=None,
+                          samples_path=None, tracker=None, scanner=None, robot=None,
                           max_faces: int = DEFAULT_MAX_FACES, title: str | None = None,
                           stats: dict | None = None) -> Path:
     """Re-render a page from a delivered viewpoint set, with its samples if they exist.
@@ -78,7 +81,8 @@ def write_viewer_from_run(viewer_path, *, part, fixture, base, viewpoints,
     return write_viewer(viewer_path, part=part, fixture=fixture, base=base,
                         viewpoints=viewpoints, target_points=points,
                         target_covered=covered, target_mask=mask, tracker=tracker,
-                        scanner=scanner, max_faces=max_faces, title=title, stats=stats)
+                        scanner=scanner, robot=robot, max_faces=max_faces, title=title,
+                        stats=stats)
 
 
 def render_run(viewpoints_path, out_dir, *, config=None, station=None, part=None,
@@ -116,7 +120,8 @@ def render_run(viewpoints_path, out_dir, *, config=None, station=None, part=None
             Path(out_dir) / VIEWER_FILE_NAME, part=meshes[0], fixture=meshes[1],
             base=meshes[2], viewpoints=viewpoints, samples_path=samples_path,
             tracker=tracker_from_description(description, cfg.tracker, part=meshes[0]),
-            scanner=cfg.scanner, max_faces=max_faces, stats=_report_stats(source))
+            scanner=cfg.scanner, robot=cfg.robot, max_faces=max_faces,
+            stats=_report_stats(source))
 
     try:
         return writer(samples)

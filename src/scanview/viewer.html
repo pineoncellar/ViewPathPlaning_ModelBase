@@ -38,25 +38,34 @@
   button { background: #1c2530; color: #c9d3de; border: 1px solid #2b3440; border-radius: 6px;
     padding: 4px 9px; font-size: 11px; font-family: inherit; cursor: pointer; }
   button:hover { background: #263241; color: #fff; }
-  #info { right: 14px; bottom: 14px; width: 306px; padding: 11px 13px; display: none; }
-  #info h2 { margin: 0 0 7px; font-size: 12px; color: #6cb6ff; }
-  #info table { width: 100%; border-collapse: collapse; }
-  #info td { padding: 1px 0; color: #8b98a8; vertical-align: top; }
-  #info td:last-child { text-align: right; color: #e6edf3;
-    font-variant-numeric: tabular-nums; }
-  #info .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px;
-    padding-top: 8px; border-top: 1px solid #2b3440; }
+  /* The selected viewpoint sits in the free strip at the top CENTRE, between the title
+     block on the left and the 显示 panel on the right: it is the number a reviewer reads
+     first, and it must not cover the part, which is what a corner panel does. */
+  #info { top: 14px; left: 50%; transform: translateX(-50%); display: none;
+    padding: 7px 12px 8px; max-width: calc(100vw - 500px); min-width: 250px; }
+  #info h2 { display: inline-block; margin: 0 10px 0 0; }
+  #info h2 { font-size: 12px; color: #6cb6ff; }
+  #info table { display: inline-flex; flex-wrap: wrap; gap: 1px 14px;
+    vertical-align: top; }
+  #info tr { display: inline-flex; gap: 6px; align-items: baseline; }
+  #info td { padding: 0; color: #8b98a8; white-space: nowrap; }
+  #info td:last-child { color: #e6edf3; font-variant-numeric: tabular-nums; }
+  #info .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px;
+    padding-top: 7px; border-top: 1px solid #2b3440; }
   #info .chips button { padding: 2px 7px; }
   #info .note { color: #78838f; line-height: 1.6; margin-top: 6px; }
-  #legend { left: 14px; bottom: 14px; padding: 8px 12px; color: #97a3b2; line-height: 1.8; }
-  .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
-    margin-right: 6px; vertical-align: -1px; }
   #hint { left: 50%; bottom: 14px; transform: translateX(-50%); padding: 5px 13px;
     color: #7c8794; white-space: nowrap; }
   #error { position: absolute; inset: 0; display: none; place-items: center; padding: 40px;
     text-align: center; line-height: 1.7; color: #e3b341; font-size: 13px; }
+  @media (max-width: 820px) {
+    /* Too narrow for a strip between the two panels: dock it bottom-left, stopping short
+       of the 显示 panel and the hint bar rather than covering either. */
+    #info { top: auto; bottom: 52px; left: 14px; right: 190px; transform: none;
+      max-width: none; min-width: 0; }
+  }
   @media (max-width: 760px) {
-    #legend, #hint { display: none; }
+    #hint { display: none; }
     #tools { width: 150px; }
   }
 </style>
@@ -92,7 +101,7 @@
       <option value="off">关闭</option>
     </select>
   </label>
-  <div class="note">单击视点看它的视场锥，单击采样点看谁扫到它。亮色路径是扫描段（带），暗灰段是过渡/退刀；单击路径可从那里开始播放。</div>
+  <div class="note">单击视点看它的视场锥，单击采样点看谁扫到它。亮色路径是扫描段（带），暗灰段是过渡/退刀——<b>J 移动画的是关节插值的真实弧线</b>，不是两端之间的直线；单击路径可从那里开始播放。</div>
   <div class="btnrow">
     <button id="btn-fit">适配</button>
     <button id="btn-iso">等轴</button>
@@ -121,21 +130,6 @@
   <h2 id="info-title"></h2>
   <table id="info-body"></table>
   <div id="info-extra"></div>
-</div>
-
-<div id="legend" class="panel">
-  <div><span class="sw" style="background:#88a8c8"></span>零件</div>
-  <div><span class="sw" style="background:#c2ae86"></span>夹具 / 底座</div>
-  <div><span class="sw" style="background:#1d4ed8"></span>视点（跟踪器可见）</div>
-  <div><span class="sw" style="background:#f0a03a"></span>视点（跟踪器不可见）</div>
-  <div><span class="sw" style="background:#f07ae8"></span>当前选中视点及其视场</div>
-  <div><span class="sw" style="background:#8fa3a0"></span>全部视点的视场矩形</div>
-  <div><span class="sw" style="background:#2ecf74"></span>已覆盖采样</div>
-  <div><span class="sw" style="background:#e5484d"></span>未覆盖采样</div>
-  <div><span class="sw" style="background:#4ddcf0"></span>选中视点扫到的采样 / 能扫到所选采样的视点</div>
-  <div><span class="sw" style="background:#ffcf6b"></span>扫描路径（带）</div>
-  <div><span class="sw" style="background:#738599"></span>过渡 / 退刀路径</div>
-  <div><span class="sw" style="background:#1adbdf"></span>回放中已扫过的采样</div>
 </div>
 
 <div id="hint" class="panel">左键拖动旋转 · 滚轮缩放 · 右键或 Shift 拖动平移 · 单击视点看它的视场锥</div>
@@ -271,6 +265,13 @@
   // The delivered records ARE the program order, so consecutive pairs are the moves the
   // robot makes. A pair inside one stroke (same stroke_id, both scanning) is a sweep and
   // is drawn bright; everything else is a connector and is drawn dim.
+  //
+  // A `J` move does NOT fly the straight line between its two ends: the joints interpolate
+  // and the TCP arcs. DATA.sweeps carries the forward-kinematics walk of exactly those
+  // moves, so the picture shows the route the controller will take - which on the
+  // 2026-11-05 run is the difference between a line 36 mm from the clamp and an arc that
+  // keeps 187 mm. Where the planner had nothing to walk, the chord stands.
+  var transitionPoints = (DATA.sweeps && DATA.sweeps.length) ? DATA.sweeps : [];
   var scanPathSegments = [];
   var movePathSegments = [];
   for (var pathIndex = 0; pathIndex < VP.length - 1; pathIndex += 1) {
@@ -279,8 +280,15 @@
     var sameStroke = pathFrom.stroke_id !== null && pathFrom.stroke_id !== undefined
       && pathFrom.stroke_id === pathTo.stroke_id;
     var sweeps = sameStroke && pathFrom.role === "coverage" && pathTo.role === "coverage";
-    pushSegment(sweeps ? scanPathSegments : movePathSegments,
-                pathFrom.position, pathTo.position);
+    var route = transitionPoints[pathIndex];
+    if (route && route.length > 1) {
+      for (var hop = 0; hop < route.length - 1; hop += 1) {
+        pushSegment(sweeps ? scanPathSegments : movePathSegments, route[hop], route[hop + 1]);
+      }
+    } else {
+      pushSegment(sweeps ? scanPathSegments : movePathSegments,
+                  pathFrom.position, pathTo.position);
+    }
   }
   var scanPathBuffer = upload(gl.ARRAY_BUFFER, toFloats(scanPathSegments));
   var movePathBuffer = upload(gl.ARRAY_BUFFER, toFloats(movePathSegments));
@@ -856,10 +864,14 @@
     var best = -1, bestDepth = Infinity;
     for (var i = 0; i < VP.length - 1; i += 1) {
       var a = VP[i].position, b = VP[i + 1].position;
+      // Sample the drawn line, which for a joint move is the arc, not the chord: clicking
+      // the bulge the robot actually travels has to select that move too.
+      var route = transitionPoints.length && transitionPoints[i];
       for (var step = 1; step <= 3; step += 1) {
         var t = step / 4;
-        var hit = project(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
-                          a[2] + (b[2] - a[2]) * t);
+        var probe = route ? alongRoute(route, t)
+          : [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+        var hit = project(probe[0], probe[1], probe[2]);
         if (!hit) continue;
         var dx = hit.x - cursor.x, dy = hit.y - cursor.y;
         if (dx * dx + dy * dy > limit) continue;
@@ -910,15 +922,17 @@
     if (index < 0) { panel.style.display = "none"; return; }
     var v = VP[index];
     document.getElementById("info-title").textContent = "视点 " + v.id;
+    // Compact rows: the strip has to fit between the two side panels, so the two coverage
+    // figures and the two incidence figures share a row each rather than taking four.
     fillRows([
       ["位置 / mm", v.position.map(function (n) { return formatNumber(n, 1); }).join(", ")],
       ["光轴", v.axis.map(function (n) { return formatNumber(n, 3); }).join(", ")],
       ["滚转", formatNumber(v.roll_deg, 1) + "°"],
-      ["覆盖点数", Number(v.n_points || 0).toLocaleString()],
-      ["覆盖面积", formatNumber(v.area_mm2, 1) + " mm²"],
-      ["入射角 均值", formatNumber(v.mean_incidence_deg, 2) + "°"],
-      ["入射角 最大", formatNumber(v.max_incidence_deg, 2) + "°"],
-      ["跟踪器可见", v.tracker_ok ? "是" : "否"],
+      ["覆盖", Number(v.n_points || 0).toLocaleString() + " 点 / "
+        + formatNumber(v.area_mm2, 1) + " mm²"],
+      ["入射角 均值/最大", formatNumber(v.mean_incidence_deg, 2) + "° / "
+        + formatNumber(v.max_incidence_deg, 2) + "°"],
+      ["跟踪器", v.tracker_ok ? "可见" : "不可见"],
       ["来源", v.source || "-"]
     ]);
     panel.style.display = "block";
@@ -1037,6 +1051,30 @@
     return unit([mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)]);
   }
 
+  // Position at fraction t along a joint move's own polyline, so playback rides the arc the
+  // controller flies rather than a chord that may pass through something.
+  function alongRoute(route, t) {
+    if (!route || route.length < 2) return null;
+    var lengths = [];
+    var total = 0;
+    for (var i = 0; i < route.length - 1; i += 1) {
+      var step = Math.hypot(route[i + 1][0] - route[i][0],
+                            route[i + 1][1] - route[i][1],
+                            route[i + 1][2] - route[i][2]);
+      lengths.push(step);
+      total += step;
+    }
+    if (total <= 1e-9) return route[route.length - 1];
+    var want = clamp(t, 0, 1) * total;
+    for (var k = 0; k < lengths.length; k += 1) {
+      if (want <= lengths[k]) {
+        return lerpPoint(route[k], route[k + 1], lengths[k] > 1e-12 ? want / lengths[k] : 1);
+      }
+      want -= lengths[k];
+    }
+    return route[route.length - 1];
+  }
+
   function poseAt(index, t) {
     if (!VP.length) return null;
     var last = VP.length - 1;
@@ -1044,7 +1082,9 @@
     var from = VP[i];
     var to = VP[Math.min(i + 1, last)];
     var span = i < last ? t : 0;
-    var position = lerpPoint(from.position, to.position, span);
+    var route = i < last && transitionPoints.length ? transitionPoints[i] : null;
+    var position = span > 0 && route ? alongRoute(route, span)
+      : lerpPoint(from.position, to.position, span);
     var axis = lerpDirection(from.axis, to.axis, span);
     var startFrame = viewFrame(from);
     var endFrame = i < last ? viewFrame(to) : null;

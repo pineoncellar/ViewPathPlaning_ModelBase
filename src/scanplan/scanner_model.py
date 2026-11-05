@@ -6,6 +6,7 @@ A point counts as covered by a pose only when ALL hold:
   3. incidence angle within the limit;
   4. line of sight clear of part, fixture and base;
   5. the scanner body fits, including the safety clearance;
+  5b. the pose keeps the fixture keep-out (`fixture_clearance_mm`);
   6. the tracker can see the scanner.
 
 The body test uses a convex envelope on purpose: it can only ever call a fitting
@@ -66,6 +67,8 @@ class ScannerModel:
         self.cos_incidence_limit = float(np.cos(np.deg2rad(params.max_incidence_deg)))
         self.min_distance_mm, self.max_distance_mm = params.range_mm
         self.body_limit_mm = params.body_sphere_r_mm + params.body_clearance_mm
+        self.fixture_limit_mm = float(params.fixture_clearance_mm)
+        self.part_limit_mm = float(params.min_part_clearance_mm)
 
     def footprint_mm(self, distance_mm):
         """The measuring footprint at the given distance, capped at the datasheet value.
@@ -126,6 +129,36 @@ class ScannerModel:
     def body_fits(self, position_mm, clearance_mm) -> bool:
         """Condition 5: is there room for the scanner body at this position?"""
         return bool(clearance_mm > self.body_limit_mm)
+
+    def fixture_fits(self, fixture_clearance_mm) -> bool:
+        """Condition 5b: is this position clear of the fixture keep-out?"""
+        return bool(fixture_clearance_mm > self.fixture_limit_mm)
+
+    def part_fits(self, part_clearance_mm) -> bool:
+        """Condition 5c: is the head further from the part than its own near range?
+
+        A pose that reaches the far side of the sheet through an internal hole is closer to
+        the metal than the near range by construction, and so is one that grazes the sheet
+        to see a distant region. Neither is a measurement the microscope can make, so the
+        distance - not the sight line - is what rules them out.
+        """
+        if self.part_limit_mm <= 0.0:
+            return True
+        return bool(part_clearance_mm > self.part_limit_mm)
+
+    def clearance_margin(self, body_clearance_mm, fixture_clearance_mm) -> float:
+        """The smaller of the two keep-out margins; negative means a violation.
+
+        One number rather than two booleans, because every caller - candidate rejection,
+        stroke growth and connector search - needs the same "how close did it get" answer,
+        and the connector's lift ladder compares one route with another by it.
+        """
+        return float(min(float(body_clearance_mm) - self.body_limit_mm,
+                         float(fixture_clearance_mm) - self.fixture_limit_mm))
+
+    def clearances_fit(self, body_clearance_mm, fixture_clearance_mm) -> bool:
+        """Conditions 5 and 5b together."""
+        return self.clearance_margin(body_clearance_mm, fixture_clearance_mm) > 0.0
 
 
 def measure_mask(model: ScannerModel, pose: ScannerPose, points, normals, obstacles, *,

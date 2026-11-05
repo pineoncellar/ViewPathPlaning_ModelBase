@@ -167,6 +167,34 @@ def test_the_body_check_adds_the_safety_clearance_on_top_of_the_radius():
     assert model.body_fits(position, clearance_mm=55.0) is False
 
 
+def test_the_fixture_keep_out_is_a_separate_hundred_millimetre_gate(model_placeholder):
+    """A pose can clear the 45 mm body sphere and still be inside the clamp keep-out."""
+    assert model_placeholder.fixture_limit_mm == 100.0
+    assert model_placeholder.clearances_fit(1000.0, 100.01) is True
+    assert model_placeholder.clearances_fit(1000.0, 100.0) is False
+    assert model_placeholder.clearances_fit(1000.0, 80.0) is False
+    assert model_placeholder.clearances_fit(45.0, 200.0) is False
+    assert model_placeholder.clearance_margin(1000.0, 80.0) == pytest.approx(-20.0)
+
+
+def test_a_pose_inside_its_own_near_range_of_the_part_is_refused():
+    """The rule that keeps the head out of a hole: never scan from closer than the near range.
+
+    A pose that reached the far side of the sheet through an internal hole is inside its
+    near range of the metal it passed, and so is one grazing the sheet to see a distant
+    region at a glancing angle. Neither can measure anything, and both were delivered on
+    the 2026-11-05 run (viewpoint 35, 94 mm above the panel with its footprint below it).
+    """
+    params = replace(load_config().scanner, min_part_clearance_mm=120.0)
+    model = ScannerModel(params)
+    assert model.part_limit_mm == 120.0
+    assert model.part_fits(120.0) is False
+    assert model.part_fits(119.9) is False
+    assert model.part_fits(127.0) is True
+    # 0 is off, which is what every run recorded before 2026-11-05 used
+    assert ScannerModel(replace(params, min_part_clearance_mm=0.0)).part_fits(1.0) is True
+
+
 def test_the_pose_frame_is_the_scanner_frame(model_placeholder):
     pose = ScannerPose(position=np.array([0.0, 0.0, 300.0]),
                        axis=np.array([0.0, 0.0, -1.0]), roll_deg=0.0)

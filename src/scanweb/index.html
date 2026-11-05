@@ -91,7 +91,8 @@
               <button class="secondary-button" id="pickAxis" type="button">在模型上点选扫描面</button>
               <span id="axisBadge" class="recommend-badge">尚未导入零件</span>
             </div>
-            <p class="inline-hint">整车轴：X 前−后+，Y 左−、右+，Z 下−上+。自动推荐会统计模型主平整面的面积；推荐结果可随时手动修改。</p>
+            <p class="inline-hint">整车轴：X 前−后+，Y 左−、右+，Z 下−上+。自动推荐会统计模型主平整面的面积；推荐结果可随时手动修改。
+              <b>扫描范围</b>：这个方向的那一面板料，加上由它冲压出来的翻边与立壁（按拓扑归属，不是按朝向），<b>背面不扫</b>；冲裁断面与夹持区也不算目标。</p>
 
             <details class="advanced-config" id="advancedConfig">
               <summary class="advanced-summary">
@@ -161,6 +162,14 @@
                   </div>
                 </div>
                 <p class="inline-hint">选择阶段给一条扫描带算几个转角，单点固定算 1。这是<b>唯一决定「扫」和「停」比例</b>的旋钮：一个停点只盖一个视场，一条带要多付一个停点去换长度，所以按真实的 2.0 算，短于约两个视场的带会输给盖住同样面积的两个单点——算术没错，但那不是买扫描台的目的。<b>2.0</b> 是真实转角数；<b>1.5</b> 是带的远端只算半个转角；<b>1.0</b> 是一条带按一个位姿计价，凡是能扫的地方都优先扫。<b>1.0</b> 时点数会明显变少、带明显变多，但它是偏好不是事实——可达性和能不能交付由关节门和连接器决定，不受这个数影响。命令行对应 <code>--stroke-corner-cost</code>，报告里 <code>stroke_plan</code> 块会记录实际生效的值和「几条带 + 几个停点」。</p>
+
+                <div class="form-row">
+                  <div><label class="field-label" for="maxPoints">最大视点点数</label>
+                    <input class="text-input error-limit-input" id="maxPoints" type="number" min="1" step="1" placeholder="留空 = 不限制">
+                  </div>
+                </div>
+                <p class="inline-hint">程序点数的<b>硬上限</b>：选择阶段每选一个停点或一条扫描带都会检查，超了就停手，并把「因为上限没交付」的点数写进报告的 <code>budget</code> 块。留空表示不设上限（配置里的 <code>max_points: null</code>），选到没有新增覆盖为止。
+                  和「覆盖率目标」是两条不同的刹车：目标按面积算够就停，点数上限按程序里的停点数算够就停。<b>侧面（翻边、立壁）本来就更难扫、单位面积要更多视点</b>，所以想看某一面到底能扫多好时，先把上限放大；想控制现场程序长度时，把它压到程序能接受的点数。</p>
 
                 <p class="inline-hint">关节限位筛选<b>始终开启</b>：每个候选位姿都要先过逆解，各轴离限位至少 5°，J5 必须落在 ±125 内且远离 0（腕奇异），否则该位姿不进选择、扫描带在半路越界就停止生长。结果里固定有一行 <code>关节筛选：始终开启</code>，报告里有 <code>kinematics</code> 块（J5 直方图、分支直方图、最坏单轴步长、无解点数）。</p>
               </div>

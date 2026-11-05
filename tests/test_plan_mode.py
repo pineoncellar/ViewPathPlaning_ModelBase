@@ -262,7 +262,8 @@ def test_the_report_block_records_the_mode_and_the_numbers_it_stands_for():
     settings = block["plan_mode_settings"]
     assert settings["side_scan_azimuths"] == 3
     assert settings["side_scan_wall_deg"] == 45.0
-    assert settings["side_scan_max_seeds"] == 96
+    assert settings["side_scan_max_seeds"] == 192
+    assert settings["side_scan_spacing_mm"] == 40.0
     assert settings["stroke_corner_cost"] == 1.0
     assert settings["joint_span_fraction"] == pytest.approx(0.98)
     assert "banded" in block["caveat"]

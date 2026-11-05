@@ -133,6 +133,36 @@ def test_the_report_coverage_and_the_viewpoint_set_agree(clamped_plate, quick_cf
         >= result.selection.covered.sum()
 
 
+def test_an_extra_axis_adds_the_surface_that_faces_it(clamped_plate, quick_cfg):
+    """`extra_axes` is how "also scan these sides" is spelled.
+
+    The main face of a blank is one topological side; the surface facing the other way is
+    a different set of triangles, so it can only be measured if it is added to the target.
+    Adding it must grow the target area and be visible in the report, because otherwise the
+    coverage figure would describe a target nobody can check.
+    """
+    main = plan(clamped_plate.station, quick_cfg, face="upper")
+    both = plan(clamped_plate.station, quick_cfg, face="upper",
+                extra_axes=[np.array([0.0, 0.0, -1.0])])
+    assert both.report["target_face_mm2"] > main.report["target_face_mm2"]
+    assert both.report["definition"]["directions"] == ["upper", "-Z"]
+    assert len(both.report["definition"]["directions"]) == 2
+    assert len(both.target.samples.points) > len(main.target.samples.points)
+
+
+def test_a_duplicate_extra_axis_adds_nothing(clamped_plate, quick_cfg):
+    """Naming the main face again must not double-count the part's own area."""
+    once = plan(clamped_plate.station, quick_cfg, face="upper")
+    twice = plan(clamped_plate.station, quick_cfg, face="upper",
+                 extra_axes=[np.array([0.0, 0.0, 1.0])])
+    # Position-based de-duplication, so a handful of edge samples that the two draws land
+    # 0.5 mm apart survive; anything above a percent would mean the area was counted twice.
+    assert twice.report["target_face_mm2"] == pytest.approx(once.report["target_face_mm2"],
+                                                            rel=0.01)
+    assert len(twice.target.samples.points) == pytest.approx(
+        len(once.target.samples.points), rel=0.01)
+
+
 def test_the_report_states_that_robot_reachability_is_not_modelled(clamped_plate, quick_cfg):
     scope = plan(clamped_plate.station, quick_cfg, face="upper").report["scope"].lower()
     assert "robot" in scope and "not" in scope and "roboguide" in scope

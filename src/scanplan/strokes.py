@@ -312,19 +312,31 @@ class StrokeBuilder:
         return measure_mask(self.model, pose, self.points, self.normals, self.obstacles,
                             occlusion_tol_mm=self.cfg.occlusion_tol_mm)
 
-    def fits_at(self, positions) -> tuple[bool, float]:
-        """Condition 5 over a set of positions: `(all fit, smallest margin in mm)`.
+    def fits_at(self, positions, *, scan: bool = True) -> tuple[bool, float]:
+        """Conditions 5/5b over a set of positions: `(all fit, smallest margin in mm)`.
 
-        `body_clearance_mm`, not `clearance_mm`: the part counts here. A band is a straight
+        Both the body sphere and the fixture keep-out count, and the answer is the smaller
+        of the two margins. `body_clearance_mm`, not `clearance_mm`: the part counts here.
+        A band is a straight
         line at a constant pose, so on a curved or stepped panel it can walk back into the
         sheet it is scanning - and a gate that only looked at the fixture and the base let it
         (measured on the 2026-11-03 run: three delivered bands ended 0.4, 10 and 3 mm off the
         part with a 45 mm body sphere).
         """
         positions = np.asarray(positions, dtype=float).reshape(-1, 3)
-        clearance = self.station.body_clearance_mm(positions,
-                                                   limit_mm=self.model.body_limit_mm)
-        margin = float(clearance.min() - self.model.body_limit_mm)
+        body = self.station.body_clearance_mm(positions,
+                                              limit_mm=self.model.body_limit_mm)
+        fixture = self.station.fixture_clearance_mm(positions)
+        margin = self.model.clearance_margin(float(body.min()), float(fixture.min()))
+        if scan and self.model.part_limit_mm > 0.0:
+            # `min_part_clearance_mm` is about SCANNING from here: a pose that measures
+            # from inside its own near range has ducked into a hole or is grazing the sheet
+            # on its way to somewhere else. A transition point is a different question -
+            # a retract corner 50 mm off the part collides with nothing - so this gate is
+            # asked only where the head is meant to be measuring.
+            part = self.station.part_clearance_mm(
+                positions, limit_mm=self.model.part_limit_mm).min()
+            margin = min(margin, float(part) - self.model.part_limit_mm)
         return bool(margin > 0.0), margin
 
     def tracker_sees(self, positions) -> bool:
@@ -341,7 +353,8 @@ class StrokeBuilder:
         count = max(1, int(np.ceil(length / self.params.check_step_mm)))
         fractions = np.linspace(0.0, 1.0, count + 1)[:, None]
         positions = start[None, :] * (1.0 - fractions) + end[None, :] * fractions
-        fits, margin = self.fits_at(positions)
+        # A transition, not a measurement: the part keep-out does not apply to it.
+        fits, margin = self.fits_at(positions, scan=False)
         if not fits:
             return False, margin
         return self.tracker_sees(positions), margin

@@ -64,6 +64,27 @@ def test_the_page_defaults_come_from_the_shipped_configuration():
         "stroke.repair_budget_share"}
 
 
+def test_the_page_can_cap_the_program_points():
+    """`max_points` is the page's hard ceiling on delivered points, and blank means none.
+
+    It is a different brake from the coverage target: one stops when enough AREA is covered,
+    the other when enough POINTS have been delivered, so both have to reach the planner as
+    the values they claim to be - and a fractional or negative number must be refused rather
+    than rounded into a different plan.
+    """
+    from scanweb import _delivery_config, _max_points
+
+    assert _delivery_config({}).target.max_points is None, "the shipped config has no ceiling"
+    assert _delivery_config({"max_points": 80}).target.max_points == 80
+    assert _delivery_config({"max_points": "80"}).target.max_points == 80
+    assert _delivery_config({"max_points": None}).target.max_points is None
+    assert _delivery_config({"max_points": ""}).target.max_points is None
+    assert _delivery_config({"max_points": "null"}).target.max_points is None
+    for bad in (0, -5, 12.5, "abc"):
+        with pytest.raises(ValueError, match="正整数"):
+            _max_points(bad)
+
+
 def test_preview_registration_reports_exact_measured_transform():
     result = _preview_registration(valid_payload())
 

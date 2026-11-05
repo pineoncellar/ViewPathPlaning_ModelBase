@@ -42,6 +42,16 @@
     "tilted side-scan family, and this profile has to use the aim grid alone to stay comparable",
     "with the 405-point baseline it was measured against."
   ],
+  "scanner": {
+    "_comment": [
+      "Both obstacle-avoidance floors are off here. `fixture_clearance_mm` 100 and",
+      "`min_part_clearance_mm` 120 are site rules added on 2026-11-04/05, and a profile whose",
+      "whole purpose is to reproduce the 2026-10-20 numbers cannot carry them: they remove",
+      "poses the baseline used, so leaving them on would move every figure it is compared with."
+    ],
+    "fixture_clearance_mm": 0.0,
+    "min_part_clearance_mm": 0.0
+  },
   "target": {
     "coverage_target_pct": null,
     "delivery_mode": "path"

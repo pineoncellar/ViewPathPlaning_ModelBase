@@ -1,4 +1,4 @@
-﻿"""Orchestrate the planning stage end to end.
+"""Orchestrate the planning stage end to end.
 
 Order: load and align the station, split the sheet, sample the target, generate
 candidates, evaluate coverage, select, then export the viewpoint set and the
@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+
+import numpy as np
 
 from ..candidates import generate
 from ..config import PlannerConfig
@@ -46,7 +48,7 @@ from ..scene import Station, casters_for
 from ..selection import Selection, select
 from ..sheet_split import SheetSplit, split_sheet
 from ..strokes import StrokeCoverage, combine
-from ..target_surface import TargetSet, build_target
+from ..target_surface import TargetSet, build_target, merge_targets
 from ..tracker import Tracker, visible_mask
 from .delivery import _finish_stroke_plan, _group_selection, _stroke_builder
 from .outputs import write_outputs
@@ -81,6 +83,7 @@ class PlanResult:
 
 def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
          tracker: Tracker | None = None, split: SheetSplit | None = None,
+         extra_axes=None,
          log: Callable[[str], None] | None = None,
          progress: ProgressHook | None = None) -> PlanResult:
     """Plan the scan of one face of the blank, and report what was missed.
@@ -88,6 +91,12 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
     `face` defaults to the configuration; `"auto"` plans both faces and keeps the one
     with the higher coverage, which is the only reliable way to answer "which side is
     up", and records both figures in `face_candidates`.
+
+    `extra_axes` adds surfaces that face directions other than the main one: each entry is
+    a unit vector in the station frame, and the samples facing it join the target the
+    selection has to cover. That is what "also scan these sides" is - a sheet's flanges
+    face away from its main face, so scanning the main face alone leaves them uncovered
+    however good the selection is.
 
     `progress(stage, fraction, detail)` is optional and reports where the run actually
     is. The bands below are the run's real stages, not a time estimate; a caller that
@@ -125,7 +134,8 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
             face_rep(0.0, f"planning the {option} face")
             try:
                 candidates[option] = _plan_face(station, cfg, split, option, tracker,
-                                               checks, started, log, progress=face_rep)
+                                               checks, started, log, progress=face_rep,
+                                               extra_axes=extra_axes)
             except ValueError as error:
                 say(f"  {option} face cannot be planned: {error}")
         if not candidates:
@@ -145,7 +155,60 @@ def plan(station: Station, cfg: PlannerConfig, *, face: str | None = None,
     face_rep = reporter.band("segmentation", 0.10, 1.0)
     face_rep(0.0, f"planning the {requested} face")
     return _plan_face(station, cfg, split, requested, tracker, checks, started, log,
-                      progress=face_rep)
+                      progress=face_rep, extra_axes=extra_axes)
+
+
+def _with_extra_axes(target: TargetSet, station: Station, cfg: PlannerConfig, face: str,
+                     extra_axes, *, say: Callable[[str], None]) -> TargetSet:
+    """Add the samples that face each extra direction to the target.
+
+    Each direction is split on its own, because "which side of the blank is this triangle
+    on" is only answerable relative to a through-thickness direction. A direction that
+    cannot be split (a degenerate axis, a part with no area facing it) is reported and
+    skipped rather than failing the run: the main face is still a plan.
+    """
+    axes = [np.asarray(axis, dtype=float).reshape(3) for axis in (extra_axes or [])]
+    if not axes:
+        return target
+    extras: list[TargetSet] = []
+    from ..geometry import unit
+
+    for axis in axes:
+        direction = unit(axis)
+        if not np.isfinite(direction).all() or float(np.linalg.norm(direction)) < 0.5:
+            say(f"  extra scan direction {axis!r} is not a unit vector - skipped")
+            continue
+        try:
+            extra_split = split_sheet(station.part, band_deg=cfg.target.band_deg,
+                                      knn=cfg.target.knn, seed=cfg.seed,
+                                      through_axis=direction)
+            extra = build_target(station.part, extra_split, "upper", station, cfg)
+        except (ValueError, IndexError) as error:
+            say(f"  extra scan direction {np.round(direction, 3).tolist()} cannot be "
+                f"sampled: {error}")
+            continue
+        if len(extra.samples.points) == 0:
+            continue
+        label = _axis_label(direction)
+        say(f"  extra scan direction {label}: {len(extra.samples.points)} samples, "
+            f"{extra.face_area_mm2:.0f} mm2")
+        # Name the direction, not the side: every extra target is an "upper" face of its
+        # own split, so without this the report could not say which sides were added.
+        extras.append(replace(extra, directions=(label,)))
+    if not extras:
+        return target
+    merged = merge_targets([target, *extras], face=face)
+    say(f"  target assembled from {len(merged.directions)} direction(s): "
+        f"{len(merged.samples.points)} samples, {merged.samples.total_area_mm2:.0f} mm2")
+    return merged
+
+
+def _axis_label(direction: np.ndarray) -> str:
+    """A unit direction as `+X`/`-Y`/`-Z` when it is a vehicle axis, else as rounded numbers."""
+    axis = int(np.argmax(np.abs(direction)))
+    if abs(float(direction[axis])) > 0.99:
+        return ("+" if direction[axis] > 0 else "-") + "XYZ"[axis]
+    return "[" + ",".join(f"{value:.2f}" for value in direction) + "]"
 
 
 def _pose_tie(coverage: CoverageResult, kin) -> list[float] | None:
@@ -168,7 +231,8 @@ def _pose_tie(coverage: CoverageResult, kin) -> list[float] | None:
 def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: str,
                tracker: Tracker | None, checks: dict, started: float,
                log: Callable[[str], None] | None,
-               progress: ProgressReporter | None = None) -> PlanResult:
+               progress: ProgressReporter | None = None,
+               extra_axes=None) -> PlanResult:
     """Plan one named face, from target sampling through to the report."""
     say = log or (lambda message: print(message, flush=True))
     base = progress if progress is not None else ProgressReporter()
@@ -178,6 +242,7 @@ def _plan_face(station: Station, cfg: PlannerConfig, split: SheetSplit, face: st
     target = build_target(station.part, split, face, station, cfg, log=log)
     if len(target.samples.points) == 0:
         raise ValueError(f"the {face} target face produced no samples to scan")
+    target = _with_extra_axes(target, station, cfg, face, extra_axes, say=say)
     target_rep(1.0, f"{len(target.samples.points)} target samples")
 
     gate = None

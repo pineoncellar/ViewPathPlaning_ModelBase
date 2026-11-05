@@ -212,6 +212,29 @@ def test_a_band_that_dives_into_the_plate_is_refused(bench, cfg):
     assert fits is False and margin < 0.0
 
 
+def test_a_band_that_enters_the_fixture_keep_out_is_refused(clamped_plate, cfg):
+    """The keep-out applies along the whole band, not only at its first point.
+
+    120 mm above the plate the 45 mm scanner body easily clears the clamp arm, but the
+    arm's top face is only 80 mm below the band, which is inside the 100 mm site keep-out.
+    """
+    samples = grid_samples(-100.0, 100.0, -40.0, 40.0, PLATE_TOP_MM, 10.0)
+    # The part keep-out would answer this band first and for its own reason (120 mm above
+    # the plate is inside the near range); this test is about the clamp keep-out.
+    model = ScannerModel(replace(cfg.scanner, min_part_clearance_mm=0.0))
+    builder = StrokeBuilder(samples, clamped_plate.station, model, cfg)
+    step = cfg.stroke.check_step_mm
+    safe = Stroke(start=np.array([-150.0, 0.0, 120.0]),
+                  end=np.array([-100.0, 0.0, 120.0]),
+                  axis=np.array([0.0, 0.0, -1.0]))
+    through = Stroke(start=np.array([-150.0, 0.0, 120.0]),
+                     end=np.array([60.0, 0.0, 120.0]),
+                     axis=np.array([0.0, 0.0, -1.0]))
+    assert builder.fits_at(safe.check_positions_mm(step))[0] is True
+    fits, margin = builder.fits_at(through.check_positions_mm(step))
+    assert fits is False and margin < 0.0
+
+
 def test_a_pose_change_becomes_a_reorientation_and_a_translation_does_not(bench, cfg):
     model = ScannerModel(cfg.scanner)
     rolled_back = replace(cfg, stroke=replace(cfg.stroke, connector_level=2))
@@ -543,6 +566,22 @@ def test_a_stroke_run_reports_the_path_and_never_covers_less(clamped_plate, cfg)
     # are what make the motion between points checkable, and that does not stop being true
     # because the strokes lost.
     assert result.path is not None
+    # Obstacle avoidance: every leg of the delivered sequence keeps the 100 mm fixture
+    # keep-out, not only the viewpoints. Sampling the straight legs is enough here because
+    # no limb model was supplied, so the connector never takes the joint-move route.
+    sampled = []
+    for first, second in zip(result.path.points, result.path.points[1:]):
+        start = np.asarray(first.position, dtype=float)
+        end = np.asarray(second.position, dtype=float)
+        count = max(1, int(np.ceil(np.linalg.norm(end - start) / quick.stroke.check_step_mm)))
+        fractions = np.linspace(0.0, 1.0, count + 1)[:, None]
+        sampled.append(start[None, :] * (1.0 - fractions) + end[None, :] * fractions)
+    on_path = np.vstack(sampled) if sampled else np.zeros((0, 3))
+    if len(on_path):
+        assert float(clamped_plate.station.fixture_clearance_mm(on_path).min()) \
+            > quick.scanner.fixture_clearance_mm
+    approach = result.report["approach"]["poses"]
+    assert approach["min_fixture_clearance_mm"] > approach["fixture_clearance_required_mm"]
     program = result.report["program"]
     assert program["turns"] == len(result.viewpoints)
     assert program["motion"] == quick.motion.type

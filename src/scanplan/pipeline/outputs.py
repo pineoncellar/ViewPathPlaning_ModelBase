@@ -66,6 +66,10 @@ def write_outputs(result: PlanResult, out_dir, *, write_3d: bool = True,
             chosen=chosen,
             tracker=result.tracker,
             scanner=result.config.scanner,
+            # Joint moves are drawn as the arcs they are: with the head rotating, the TCP
+            # can stand 135 mm off the straight line between two delivered points, which
+            # is exactly the difference between "cuts through the clamp" and "goes round".
+            robot=result.config.robot,
             max_faces=max_faces,
             stats={"face": result.report.get("face"),
                    "coverage_pct": result.report.get("coverage_pct")},

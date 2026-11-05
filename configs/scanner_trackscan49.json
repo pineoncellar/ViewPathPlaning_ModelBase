@@ -29,6 +29,8 @@
     "max_incidence_deg": 45.0,
     "body_sphere_r_mm": 45.0,
     "body_clearance_mm": 0.0,
+    "fixture_clearance_mm": 100.0,
+    "min_part_clearance_mm": 120.0,
     "distances_mm": [250.0, 300.0, 380.0],
     "tilts_deg": [0.0, 30.0, -30.0],
     "rolls_deg": [0.0, 90.0],

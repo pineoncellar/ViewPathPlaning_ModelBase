@@ -76,6 +76,40 @@ def test_empty_input_returns_empty_arrays(flat_plate):
     assert distance.shape == (0,) and triangle.shape == (0,)
 
 
+def test_a_degenerate_face_does_not_abort_the_whole_query(flat_plate):
+    """A zero-area triangle hands out a zero-length normal, i.e. a ray with no direction.
+
+    trimesh's broad phase divides by that direction to bound the ray, the box comes out
+    non-finite and `rtree` raises "coordinates must not have minimums more than
+    maximums" - which killed the 2026-11-05 web run on a part with 4 slivers in 110 825
+    faces, during the winding repair, before a single viewpoint existed. Such a ray has no
+    answer, so it must read as a miss and leave the other rays' answers untouched.
+    """
+    import trimesh
+
+    sliver = trimesh.Trimesh(
+        vertices=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
+        faces=np.array([[0, 1, 2]], dtype=np.int64), process=False)
+    assert np.allclose(sliver.face_normals, 0.0)
+
+    caster = RayCaster(flat_plate)
+    origins = np.array([[5.0, 5.0, 10.0], [5.0, 5.0, 10.0]])
+    directions = np.array([sliver.face_normals[0], [0.0, 0.0, -1.0]])
+    distance, triangle = caster.nearest(origins, directions)
+    assert np.isinf(distance[0]) and triangle[0] == -1      # the sliver's ray: a miss
+    assert pytest.approx(float(distance[1]), abs=1e-6) == 10.0 - 0.7
+    assert triangle[1] >= 0
+
+    counts = caster.hit_count(origins, directions)
+    assert counts[0] == 0 and counts[1] >= 1
+
+
+def test_a_non_finite_ray_is_a_miss_not_an_exception(flat_plate):
+    distance, triangle = RayCaster(flat_plate).nearest(
+        np.array([[np.nan, 0.0, 10.0]]), np.array([[0.0, 0.0, -1.0]]))
+    assert np.isinf(distance[0]) and triangle[0] == -1
+
+
 def test_mismatched_input_lengths_are_refused(flat_plate):
     with pytest.raises(ValueError, match="same length"):
         RayCaster(flat_plate).nearest(np.zeros((2, 3)), np.zeros((3, 3)))

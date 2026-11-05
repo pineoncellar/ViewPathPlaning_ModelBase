@@ -42,7 +42,7 @@ def approach_block(*, config: PlannerConfig, station: Station, target: TargetSet
                  "is derived from it here"),
         **_geometry(station),
     }
-    block["poses"] = _poses(station, viewpoints, path)
+    block["poses"] = _poses(config, station, viewpoints, path)
     block["target"] = _target(target)
     return block
 
@@ -66,7 +66,7 @@ def _geometry(station: Station) -> dict:
     }
 
 
-def _poses(station: Station, viewpoints, path) -> dict:
+def _poses(config: PlannerConfig, station: Station, viewpoints, path) -> dict:
     """Height and tilt of every delivered pose, and the bedroom the head has near the base."""
     positions, axes = _delivered(viewpoints, path)
     if len(positions) == 0:
@@ -76,6 +76,8 @@ def _poses(station: Station, viewpoints, path) -> dict:
     upward = axes[:, 2] if len(axes) else np.zeros(0)
     clearance = station.clearance_mm(positions) if len(positions) else np.zeros(0)
     body = station.body_clearance_mm(positions) if len(positions) else np.zeros(0)
+    fixture = station.fixture_clearance_mm(positions) if len(positions) else np.zeros(0)
+    part = station.part_clearance_mm(positions) if len(positions) else np.zeros(0)
     return {
         "available": True,
         "total": int(len(positions)),
@@ -94,6 +96,14 @@ def _poses(station: Station, viewpoints, path) -> dict:
         # the sheet it was scanning while this block showed several hundred millimetres.
         "min_body_clearance_mm": round(float(body.min()), 1),
         "min_fixture_base_clearance_mm": round(float(clearance.min()), 1),
+        # The obstacle keep-out the planner enforces on every delivered point and every
+        # sampled leg between them; a value below `fixture_clearance_mm` is a defect.
+        "min_fixture_clearance_mm": round(float(fixture.min()), 1),
+        "fixture_clearance_required_mm": round(float(config.scanner.fixture_clearance_mm), 1),
+        # The head never comes closer to the part than its own near range: that is what
+        # keeps it out of an internal hole and off the sheet it is measuring.
+        "min_part_clearance_mm": round(float(part.min()), 1),
+        "part_clearance_required_mm": round(float(config.scanner.min_part_clearance_mm), 1),
         "note": ("looking_up counts the OPTICAL axis, so a side wall scanned almost "
                  "horizontally is not a violation; below_* count the scanner origin"),
     }

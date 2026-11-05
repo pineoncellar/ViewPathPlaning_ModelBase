@@ -157,9 +157,20 @@ class _StubStation:
         """The same box stands in for the part: the stub has no separate mesh."""
         return self.clearance_mm(positions)
 
+    def fixture_clearance_mm(self, positions):
+        """Far from the keep-out: these tests probe the body gate, not the fixture one."""
+        return np.full(len(np.asarray(positions, dtype=float).reshape(-1, 3)), 1000.0)
+
 
 class _StubModel:
     body_limit_mm = 45.0
+    fixture_limit_mm = 100.0
+    part_limit_mm = 0.0
+
+    def clearance_margin(self, body_clearance_mm, fixture_clearance_mm,
+                         part_clearance_mm=None):
+        return float(min(body_clearance_mm - self.body_limit_mm,
+                         fixture_clearance_mm - self.fixture_limit_mm))
 
 
 class _StubSolution:
@@ -191,7 +202,8 @@ class _StubKin:
         return SimpleNamespace(ok=True, reason="", joints_deg=self.joints,
                                track_mm=track_start if track_end is None else track_end)
 
-    def sweep_points(self, start, end, step_deg):
+    def sweep_points(self, start, end, step_deg, *, track_first=0.0, track_second=None):
+        """The swept TCP of a joint move; the rail readings are accepted and ignored here."""
         return np.asarray([[60.0, 60.0, 0.0], [60.0, 60.0, 0.0]])
 
 
@@ -319,7 +331,7 @@ def test_the_tidy_chain_falls_back_to_the_joint_move_rather_than_dropping_the_sw
     kin = _StubKin()
     # The joint move is modelled as sweeping somewhere else entirely - which is exactly the
     # point of it: the TCP does not travel the straight line the joints interpolate along.
-    kin.sweep_points = lambda start, end, step_deg: np.asarray([[600.0, 0.0, 0.0]])
+    kin.sweep_points = lambda start, end, step_deg, **rail: np.asarray([[600.0, 0.0, 0.0]])
     result = connector_policy(cfg.stroke.connector).connect(
         previous, entry, _context(cfg, station, kin))
     assert result is not None

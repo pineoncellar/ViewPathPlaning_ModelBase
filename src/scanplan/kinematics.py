@@ -912,15 +912,24 @@ class KinematicGate:
         return self.robot.follow(joints_start, position, rotation, step_mm=step_mm,
                                  track_start=track_start, track_end=track_end)
 
-    def sweep_points(self, first, second, *, step_deg: float = 5.0):
+    def sweep_points(self, first, second, *, step_deg: float = 5.0,
+                     track_first: float = 0.0, track_second: float | None = None):
         """TCP positions along a joint move, or None when the gate is off.
 
         None means UNVERIFIED, not "clear": a caller must not treat the absence of a check
         as a pass. That distinction is why this returns None rather than an empty array.
+
+        The rail readings belong here, not at the caller's discretion. A `J` instruction
+        interpolates every axis INCLUDING the carriage, so a move that travels 300 mm of
+        rail sweeps the TCP along the rail as well; walking it at rail 0 measures a pose
+        the program never visits. Measured on the 2026-11-05 run: points 24 -> 25 keep
+        187 mm from the clamp with the rail frozen and 15 mm with the commanded 306 mm of
+        travel - i.e. the check said clear about a move that grazes the fixture.
         """
         if self.robot is None:
             return None
-        return self.robot.sweep_points(first, second, step_deg=step_deg)
+        return self.robot.sweep_points(first, second, step_deg=step_deg,
+                                       track_first=track_first, track_second=track_second)
 
     def solutions(self, position, axis, roll_deg: float) -> list[Solution]:
         """Every feasible solution at this pose, best J5 room first (cached).

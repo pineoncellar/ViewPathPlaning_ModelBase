@@ -34,8 +34,9 @@ from typing import Any
 import numpy as np
 import trimesh
 
-from scanplan.config import ScannerParams, load_config
+from scanplan.config import RobotParams, ScannerParams, load_config
 from scanplan.geometry import scanner_frame, unit
+from scanplan.kinematics import Robot
 from scanplan.scanner_model import ScannerModel
 from scanplan.tracker import Tracker
 
@@ -45,6 +46,9 @@ TARGET_FILE_NAME = "target_samples.npz"
 _TEMPLATE_NAME = "viewer.html"
 _PLACEHOLDER_SCENE = "__SCENE_JSON__"
 _PLACEHOLDER_TITLE = "__TITLE__"
+# Joint resolution used only to DRAW a joint move. The clearance gate samples at the
+# configured `stroke.joint_step_deg` (5 by default); this is finer so the curve looks smooth.
+_SWEEP_STEP_DEG = 2.0
 
 
 def write_viewer(path, *, part, viewpoints, fixture=None, base=None,
@@ -52,6 +56,7 @@ def write_viewer(path, *, part, viewpoints, fixture=None, base=None,
                  target_mask: np.ndarray | None = None,
                  tracker: Tracker | None = None,
                  scanner: ScannerParams | None = None,
+                 robot: RobotParams | None = None,
                  max_faces: int = DEFAULT_MAX_FACES, title: str | None = None,
                  stats: dict[str, Any] | None = None) -> Path:
     """Write the single-file 3D view and return its path.
@@ -65,7 +70,8 @@ def write_viewer(path, *, part, viewpoints, fixture=None, base=None,
                             target_points=target_points,
                             target_covered=target_covered, target_mask=target_mask,
                             tracker=tracker,
-                            scanner=scanner, max_faces=max_faces, title=title, stats=stats)
+                            scanner=scanner, robot=robot, max_faces=max_faces,
+                            title=title, stats=stats)
     document = (_template().replace(_PLACEHOLDER_TITLE, escape(str(payload["title"])))
                 .replace(_PLACEHOLDER_SCENE, _json_for_script(payload)))
     target.write_text(document, encoding="utf-8")
@@ -76,6 +82,7 @@ def build_payload(*, part, viewpoints, fixture=None, base=None, target_points=No
                   target_covered=None, target_mask: np.ndarray | None = None,
                   tracker: Tracker | None = None,
                   scanner: ScannerParams | None = None,
+                  robot: RobotParams | None = None,
                   max_faces: int = DEFAULT_MAX_FACES, title: str | None = None,
                   stats: dict[str, Any] | None = None) -> dict:
     """Everything the page needs, as plain JSON-ready data.
@@ -90,6 +97,7 @@ def build_payload(*, part, viewpoints, fixture=None, base=None, target_points=No
         meshes["base"] = mesh_payload(base, max_faces)
 
     params = scanner if scanner is not None else load_config().scanner
+    robot_params = robot if robot is not None else load_config().robot
     records = [_viewpoint_payload(record, params) for record in _coerce(viewpoints)]
     centre, radius = _fit(part, records, tracker)
 
@@ -101,6 +109,10 @@ def build_payload(*, part, viewpoints, fixture=None, base=None, target_points=No
         "stats": _clean_stats(stats),
         "meshes": meshes,
         "viewpoints": records,
+        # One entry per consecutive pair, or null when that move really is a straight line.
+        # A `J` instruction does not fly the chord between its two ends - see
+        # `_transition_sweeps` - so the page must not draw one.
+        "sweeps": _transition_sweeps(records, robot_params),
         "scanner": {
             "standoff_mm": float(params.standoff_mm),
             "fov_at_standoff_mm": [float(v) for v in params.fov_at_standoff_mm],
@@ -254,7 +266,74 @@ def _viewpoint_payload(record, params: ScannerParams) -> dict:
         "max_incidence_deg": _number(_field(record, "max_incidence_deg")),
         "tracker_ok": bool(_field(record, "tracker_ok", True)),
         "source": str(_field(record, "source", "") or ""),
+        # The instruction that REACHES this point, and the joints it is reached with: the
+        # pair decides whether the move into it is a straight line or an arc.
+        "motion": str(_field(record, "motion", "") or ""),
+        "joints_deg": _joints(_field(record, "joints_deg")),
+        "track_mm": _number(_field(record, "track_mm")),
     }
+
+
+def _joints(values) -> list[float] | None:
+    if values is None:
+        return None
+    try:
+        numbers = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+    return numbers if len(numbers) == 6 else None
+
+
+def _transition_sweeps(records: list[dict], robot_params: RobotParams | None) -> list:
+    """The TCP polyline of every JOINT move, one entry per consecutive pair.
+
+    A `J` instruction interpolates the six axes, so the TCP arcs between its two ends. The
+    page used to draw the straight chord instead, and on the 2026-11-05 run that made a
+    safe transfer look like a collision: points 24 and 25 are 572 mm apart and their chord
+    passes 36 mm from the clamp, while the commanded arc bulges 135 mm off that chord and
+    keeps 187 mm - i.e. the motion already goes AROUND the fixture. Drawing the chord hid
+    the very thing a reviewer opens this page to check.
+
+    The polyline is the same forward-kinematics walk the clearance gate verifies, so the
+    picture cannot claim a route the planner did not check. The resolution is finer than
+    the gate's 5 degrees purely so the curve does not look faceted.
+
+    Anything that cannot be answered - no joints, no robot model, an inverse-kinematics
+    error - yields `null` for that pair and the page falls back to the chord, which is the
+    honest answer for a straight-line move and a visible gap only for a move nobody checked.
+    """
+    if not records:
+        return []
+    robot = None
+    if robot_params is not None:
+        try:
+            robot = Robot(robot_params)
+        except (TypeError, ValueError, AttributeError):
+            robot = None
+    sweeps: list = []
+    for before, after in zip(records, records[1:]):
+        if robot is None or after.get("motion") != "J":
+            sweeps.append(None)
+            continue
+        start, end = before.get("joints_deg"), after.get("joints_deg")
+        if start is None or end is None:
+            sweeps.append(None)
+            continue
+        rail = before.get("track_mm") or 0.0
+        rail_end = after.get("track_mm")
+        try:
+            walked = robot.sweep_points(np.asarray(start, dtype=float),
+                                        np.asarray(end, dtype=float), step_deg=_SWEEP_STEP_DEG,
+                                        track_first=float(rail),
+                                        track_second=None if rail_end is None
+                                        else float(rail_end))
+        except (TypeError, ValueError, ArithmeticError):
+            sweeps.append(None)
+            continue
+        points = [list(before["position"])]
+        points.extend(_round(point) for point in np.asarray(walked, dtype=float).reshape(-1, 3))
+        sweeps.append(points)
+    return sweeps
 
 
 def _target_payload(points, covered, mask=None) -> dict | None:
